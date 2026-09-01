@@ -100,6 +100,26 @@ def test_idempotent_inbox_insert_returns_same_row_and_rejects_collision(callback
     assert len(db.get_inbox_messages("11111111", limit=100)) == 1
 
 
+def test_fresh_callback_schema_accepts_2_4_1_inbox_insert_after_rollback(callback_db):
+    """The additive origin column must not break old-server INSERT statements."""
+    with db.SessionLocal() as session:
+        session.connection().exec_driver_sql(
+            "INSERT INTO inbox (sender_id, receiver_id, message, status, created_at) "
+            "VALUES ('22222222', '11111111', 'old server message', 'pending', "
+            "CURRENT_TIMESTAMP)"
+        )
+        session.commit()
+        row = (
+            session.connection()
+            .exec_driver_sql(
+                "SELECT message, origin, assignment_id, idempotency_key, claim_token FROM inbox"
+            )
+            .one()
+        )
+
+    assert tuple(row) == ("old server message", "legacy", None, None, None)
+
+
 def test_legacy_inbox_migration_preserves_rows_and_is_idempotent(tmp_path, monkeypatch):
     database_file = tmp_path / "legacy.sqlite"
     with sqlite3.connect(database_file) as conn:
@@ -122,10 +142,16 @@ def test_legacy_inbox_migration_preserves_rows_and_is_idempotent(tmp_path, monke
     db._migrate_inbox_callback_schema()
 
     with sqlite3.connect(database_file) as conn:
+        # A rolled-back 2.4.1 process still omits every V1 column. The migration
+        # default must keep that old write shape valid as well as preserving rows.
+        conn.execute(
+            "INSERT INTO inbox (sender_id, receiver_id, message, status) "
+            "VALUES ('33333333', '11111111', 'post-rollback message', 'pending')"
+        )
         columns = [row[1] for row in conn.execute("PRAGMA table_info(inbox)")]
-        row = conn.execute(
-            "SELECT message, origin, assignment_id, idempotency_key FROM inbox"
-        ).fetchone()
+        rows = conn.execute(
+            "SELECT message, origin, assignment_id, idempotency_key FROM inbox ORDER BY id"
+        ).fetchall()
         indexes = {
             index[1]: index[2] for index in conn.execute("PRAGMA index_list(inbox)").fetchall()
         }
@@ -134,7 +160,10 @@ def test_legacy_inbox_migration_preserves_rows_and_is_idempotent(tmp_path, monke
     assert columns.count("idempotency_key") == 1
     assert columns.count("claim_token") == 1
     assert columns.count("claimed_at") == 1
-    assert row == ("legacy message", "legacy", None, None)
+    assert rows == [
+        ("legacy message", "legacy", None, None),
+        ("post-rollback message", "legacy", None, None),
+    ]
     assert indexes["uq_inbox_idempotency_key"] == 1
 
 

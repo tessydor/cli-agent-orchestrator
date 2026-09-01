@@ -200,10 +200,20 @@ No production install or restart was performed while implementing V1.
 
 Stop new assignments, preserve the SQLite database and retained reports, and
 reinstall the previous known-good commit with `--reinstall`; then restart through
-the same operator-controlled mechanism. The schema changes are additive, so the
-older server ignores the callback table and extra inbox columns. Before rollback,
-manually recover captured but unpasted reports because the older server does not
-understand callback reconciliation or its retention exemptions.
+the same operator-controlled mechanism. The schema changes are additive: V1 does
+not drop or rewrite an older table or column, and both upgraded and freshly
+created inbox tables give the additive `origin` column a database-side `legacy`
+default so a 2.4.1-shaped inbox insert remains valid. The older server ignores the
+callback table and extra inbox columns, so no destructive down migration is
+required.
+
+Rollback is storage-compatible, but it is not transparent while V1 callback work
+is in flight. Before rollback, drain callbacks or manually recover every captured,
+retryable, `DELIVERING`, or manual-recovery report. The older server neither
+reconciles callback state nor understands its retention exemptions; installed V1
+triggers may therefore reject an old-server cleanup or terminal deletion that
+would remove protected callback evidence. Preserve the database and retained
+reports for operator recovery rather than dropping V1 schema objects.
 
 ## V1 limitations
 

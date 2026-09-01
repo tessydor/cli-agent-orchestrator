@@ -5610,7 +5610,8 @@ async def get_inbox_messages_endpoint(
     Args:
         terminal_id: Terminal ID to get messages for
         limit: Maximum number of messages to return (default: 10, max: 100)
-        status_param: Optional filter by message status ('pending', 'delivered', 'failed')
+        status_param: Optional filter by message status
+            ('pending', 'delivering', 'delivered', 'failed')
 
     Returns:
         List of inbox messages with sender_id, message, created_at, status
@@ -5624,7 +5625,10 @@ async def get_inbox_messages_endpoint(
             except ValueError:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Invalid status: {status_param}. Valid values: pending, delivered, failed",
+                    detail=(
+                        f"Invalid status: {status_param}. Valid values: "
+                        "pending, delivering, delivered, failed"
+                    ),
                 )
 
         # Get messages using existing database function

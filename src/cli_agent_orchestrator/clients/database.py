@@ -89,7 +89,14 @@ class InboxModel(Base):
     # Origin and assignment linkage let successful assigned-worker completion
     # delivery suppress only an equivalent explicit final callback.  Legacy and
     # unrelated intermediate messages remain independent inbox rows.
-    origin = Column(String, nullable=False, default=InboxMessageOrigin.LEGACY.value)
+    origin = Column(
+        String,
+        nullable=False,
+        default=InboxMessageOrigin.LEGACY.value,
+        # Keep a freshly created V1 database writable by a rolled-back 2.4.1
+        # server, whose INSERT statements do not name this additive column.
+        server_default=InboxMessageOrigin.LEGACY.value,
+    )
     assignment_id = Column(String, nullable=True)
     # Nullable for legacy/explicit rows.  SQLite permits multiple NULLs in a
     # unique index, while server-generated callbacks use a stable non-NULL key.
