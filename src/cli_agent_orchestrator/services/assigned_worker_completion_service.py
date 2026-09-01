@@ -63,12 +63,31 @@ _DELIVERY_TERMINAL_STATES = frozenset(
 class AssignedWorkerCompletionService:
     """Capture and deliver successful assigned-worker terminal completions."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        retry_initial_delay: float = 1.0,
+        retry_max_delay: float = 60.0,
+    ) -> None:
+        if retry_initial_delay <= 0:
+            raise ValueError("retry_initial_delay must be positive")
+        if retry_max_delay < retry_initial_delay:
+            raise ValueError("retry_max_delay must be at least retry_initial_delay")
         self._registry: Optional[PluginRegistry] = None
         self._worker_locks: dict[str, threading.RLock] = {}
         self._worker_locks_guard = threading.Lock()
         self._known_workers: set[str] = set()
         self._capture_barriers: dict[str, threading.Event] = {}
+        self._retry_initial_delay = retry_initial_delay
+        self._retry_max_delay = retry_max_delay
+        self._retry_lifecycle_guard = threading.Lock()
+        self._retry_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._retry_wakeup: Optional[asyncio.Event] = None
+        self._retry_scheduler_task: Optional[asyncio.Task[None]] = None
+        # These maps are accessed only on ``_retry_loop``. One shared scheduler
+        # owns every deadline, avoiding one sleeping task per failed callback.
+        self._retry_due: dict[str, float] = {}
+        self._retry_delays: dict[str, float] = {}
 
     def _worker_lock(self, worker_terminal_id: str) -> threading.RLock:
         """Return a stable per-worker lock for status/delete/reconcile races."""
@@ -112,25 +131,226 @@ class AssignedWorkerCompletionService:
         if barrier is not None:
             barrier.set()
 
+    def start_retry_scheduler(self) -> None:
+        """Start the single event-woken retry scheduler on the running loop.
+
+        Production calls this through :meth:`run` before startup reconciliation,
+        so a transient failure in that first sweep can always schedule its next
+        attempt. Repeated starts on the same loop are idempotent.
+        """
+        loop = asyncio.get_running_loop()
+        with self._retry_lifecycle_guard:
+            existing = self._retry_scheduler_task
+            if existing is not None and not existing.done():
+                if self._retry_loop is not loop:
+                    raise RuntimeError("assigned-worker retry scheduler belongs to another loop")
+                return
+            self._retry_loop = loop
+            self._retry_wakeup = asyncio.Event()
+            self._retry_due.clear()
+            self._retry_delays.clear()
+            self._retry_scheduler_task = loop.create_task(self._retry_scheduler())
+
+    async def stop_retry_scheduler(self) -> None:
+        """Cancel retry work and release all in-memory deadlines at shutdown."""
+        loop = asyncio.get_running_loop()
+        with self._retry_lifecycle_guard:
+            if self._retry_loop is not None and self._retry_loop is not loop:
+                raise RuntimeError("cannot stop assigned-worker retry scheduler from another loop")
+            task = self._retry_scheduler_task
+            # Clear the published loop first. Threads finishing reconciliation
+            # after shutdown will then decline to enqueue more work.
+            self._retry_loop = None
+            self._retry_wakeup = None
+            self._retry_scheduler_task = None
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._retry_due.clear()
+        self._retry_delays.clear()
+
+    def _request_retry(self, worker_terminal_id: str) -> None:
+        """Thread-safely coalesce a delayed retry for one durable callback."""
+        with self._retry_lifecycle_guard:
+            loop = self._retry_loop
+            scheduler = self._retry_scheduler_task
+        if loop is None or scheduler is None or scheduler.done() or not loop.is_running():
+            return
+        try:
+            loop.call_soon_threadsafe(self._schedule_retry_on_loop, worker_terminal_id, loop)
+        except RuntimeError:
+            # The loop closed between the guarded read and call_soon_threadsafe.
+            # Durable RETRYABLE state remains for the next startup reconciliation.
+            logger.debug("Assigned-worker retry loop closed during scheduling")
+
+    def _schedule_retry_on_loop(
+        self,
+        worker_terminal_id: str,
+        expected_loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        """Install one deadline; duplicate failure signals share that deadline."""
+        with self._retry_lifecycle_guard:
+            if (
+                self._retry_loop is not expected_loop
+                or self._retry_scheduler_task is None
+                or self._retry_scheduler_task.done()
+            ):
+                return
+            wakeup = self._retry_wakeup
+        if worker_terminal_id in self._retry_due:
+            return
+        previous_delay = self._retry_delays.get(worker_terminal_id)
+        delay = (
+            self._retry_initial_delay
+            if previous_delay is None
+            else min(self._retry_max_delay, previous_delay * 2)
+        )
+        self._retry_delays[worker_terminal_id] = delay
+        self._retry_due[worker_terminal_id] = expected_loop.time() + delay
+        if wakeup is not None:
+            wakeup.set()
+
+    def _clear_retry_on_loop(
+        self,
+        worker_terminal_id: str,
+        expected_loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        with self._retry_lifecycle_guard:
+            if self._retry_loop is not expected_loop:
+                return
+            wakeup = self._retry_wakeup
+        self._retry_due.pop(worker_terminal_id, None)
+        self._retry_delays.pop(worker_terminal_id, None)
+        if wakeup is not None:
+            wakeup.set()
+
+    def _clear_requested_retry(self, worker_terminal_id: str) -> None:
+        """Drop a stale deadline once a callback reaches a non-retryable state."""
+        with self._retry_lifecycle_guard:
+            loop = self._retry_loop
+        if loop is None or not loop.is_running():
+            return
+        try:
+            loop.call_soon_threadsafe(self._clear_retry_on_loop, worker_terminal_id, loop)
+        except RuntimeError:
+            logger.debug("Assigned-worker retry loop closed during deadline cleanup")
+
+    async def _retry_scheduler(self) -> None:
+        """Wake only for a new failure or the nearest capped-backoff deadline."""
+        loop = asyncio.get_running_loop()
+        while True:
+            with self._retry_lifecycle_guard:
+                wakeup = self._retry_wakeup
+            if wakeup is None:
+                return
+
+            if not self._retry_due:
+                wakeup.clear()
+                # No await occurs between the empty check and clear, so the
+                # loop-owned scheduling callback cannot race through this gap.
+                if not self._retry_due:
+                    await wakeup.wait()
+                continue
+
+            next_due = min(self._retry_due.values())
+            timeout = max(0.0, next_due - loop.time())
+            wakeup.clear()
+            try:
+                await asyncio.wait_for(wakeup.wait(), timeout=timeout)
+                # A new/cleared deadline may be earlier; recompute from scratch.
+                continue
+            except TimeoutError:
+                pass
+
+            now = loop.time()
+            ready = sorted(
+                worker_id for worker_id, due_at in self._retry_due.items() if due_at <= now
+            )
+            for worker_terminal_id in ready:
+                self._retry_due.pop(worker_terminal_id, None)
+                try:
+                    await asyncio.to_thread(self.reconcile_worker, worker_terminal_id)
+                    record = await asyncio.to_thread(
+                        get_assigned_worker_callback,
+                        worker_terminal_id,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # A database/backend exception before RETRYABLE could be
+                    # persisted is still safe to re-run under the same capped
+                    # backoff and per-worker serialization.
+                    logger.exception(
+                        "Assigned-worker delayed retry failed for %s",
+                        worker_terminal_id,
+                    )
+                    self._schedule_retry_on_loop(worker_terminal_id, loop)
+                    continue
+
+                if (
+                    record is not None
+                    and record.delivery_state == CompletionDeliveryState.RETRYABLE
+                ):
+                    # Failure paths normally request this themselves. This check
+                    # closes any exception/order seam without creating a duplicate
+                    # deadline because scheduling is coalesced by worker id.
+                    self._schedule_retry_on_loop(worker_terminal_id, loop)
+                else:
+                    self._retry_delays.pop(worker_terminal_id, None)
+
+    def _mark_retryable(
+        self,
+        record: AssignedWorkerCallback,
+        error: str,
+        receiver_state: CompletionReceiverState = CompletionReceiverState.RETRYABLE_FAILURE,
+    ) -> Optional[AssignedWorkerCallback]:
+        """Persist retry state and wake the server-owned delayed scheduler."""
+        updated = mark_completion_retryable(record.assignment_id, error, receiver_state)
+        if updated is not None and updated.delivery_state == CompletionDeliveryState.RETRYABLE:
+            self._request_retry(updated.worker_terminal_id)
+        return updated
+
     async def run(self, registry: Optional[PluginRegistry] = None) -> None:
         """Consume status events; successful delivery requires no supervisor poll."""
         self._registry = registry
         queue = bus.subscribe("terminal.*.status")
+        self.start_retry_scheduler()
         logger.info("AssignedWorkerCompletionService started")
 
-        while True:
+        try:
+            # Startup reconciliation remains mandatory, but now runs only after
+            # the retry scheduler is able to retain any new transient failure.
+            # It is inside the outer finally so cancellation during this first
+            # database pass still tears down the scheduler.
             try:
-                event = await queue.get()
-                terminal_id = terminal_id_from_topic(event["topic"])
-                status = TerminalStatus(event["data"]["status"])
-                if status in (TerminalStatus.COMPLETED, TerminalStatus.ERROR):
-                    await asyncio.to_thread(self.handle_status_event, terminal_id, status)
+                await asyncio.to_thread(self.reconcile_pending)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                # One corrupt event/receiver cannot stop completion delivery for
-                # every other assigned worker.
-                logger.exception("Assigned-worker completion event handling failed")
+                logger.exception("Assigned-worker startup reconciliation failed")
+
+            while True:
+                terminal_id: Optional[str] = None
+                try:
+                    event = await queue.get()
+                    terminal_id = terminal_id_from_topic(event["topic"])
+                    status = TerminalStatus(event["data"]["status"])
+                    if status in (TerminalStatus.COMPLETED, TerminalStatus.ERROR):
+                        await asyncio.to_thread(self.handle_status_event, terminal_id, status)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # One corrupt event/receiver cannot stop completion delivery for
+                    # every other assigned worker. A known terminal gets a bounded
+                    # delayed retry even when the exception preceded durable state.
+                    logger.exception("Assigned-worker completion event handling failed")
+                    if terminal_id is not None:
+                        self._request_retry(terminal_id)
+        finally:
+            await self.stop_retry_scheduler()
 
     def mark_dispatched_and_reconcile(self, worker_terminal_id: str) -> None:
         """Persist accepted task dispatch and close the fast-completion race.
@@ -194,8 +414,8 @@ class AssignedWorkerCompletionService:
                     exc,
                     exc_info=True,
                 )
-                mark_completion_retryable(
-                    record.assignment_id,
+                self._mark_retryable(
+                    record,
                     f"Final report capture failed: {type(exc).__name__}: {exc}",
                     CompletionReceiverState.UNKNOWN,
                 )
@@ -298,8 +518,8 @@ class AssignedWorkerCompletionService:
             )
             return
         if receiver_state == CompletionReceiverState.RETRYABLE_FAILURE:
-            mark_completion_retryable(
-                record.assignment_id,
+            self._mark_retryable(
+                record,
                 receiver_error or "Completion receiver classification is retryable",
                 receiver_state,
             )
@@ -347,8 +567,8 @@ class AssignedWorkerCompletionService:
                 exc,
                 exc_info=True,
             )
-            mark_completion_retryable(
-                record.assignment_id,
+            self._mark_retryable(
+                record,
                 f"Completion enqueue failed: {type(exc).__name__}: {exc}",
             )
             return
@@ -365,6 +585,7 @@ class AssignedWorkerCompletionService:
                 acknowledged.delivery_state.value,
             )
             self._attempt_immediate_inbox_delivery(record.caller_id)
+            self._clear_requested_retry(record.worker_terminal_id)
 
     @staticmethod
     def _phase_checkpoint(
@@ -447,6 +668,7 @@ class AssignedWorkerCompletionService:
                     "Assigned-worker callback reconciliation failed for %s",
                     record.worker_terminal_id,
                 )
+                self._request_retry(record.worker_terminal_id)
 
     def register_persisted_assignments(self) -> None:
         """Prime restart barriers before status/inbox consumers can observe readiness.
@@ -542,8 +764,8 @@ class AssignedWorkerCompletionService:
                 return bool(updated and updated.lifecycle == AssignmentLifecycle.COMPLETED)
 
             if status == TerminalStatus.UNKNOWN:
-                mark_completion_retryable(
-                    record.assignment_id,
+                self._mark_retryable(
+                    record,
                     "Worker outcome is unknown; retirement deferred to preserve recovery handle",
                     CompletionReceiverState.UNKNOWN,
                 )
@@ -576,6 +798,31 @@ class AssignedWorkerCompletionService:
                 lifecycle=AssignmentLifecycle.FAILED,
             )
             self._release_capture_barrier(worker_terminal_id)
+
+    def record_dispatch_uncertain(self, worker_terminal_id: str, error: str) -> None:
+        """Fail closed when an input attempt began but acceptance is uncertain.
+
+        Unlike a provider-initialize exception or exhausted status-confirmation
+        retries, an exception during/after ``send_input`` is not positive proof
+        that the task never started. An unproven assignment therefore becomes a
+        retained manual-recovery record instead of being falsely failed/deleted.
+        """
+        with self._worker_lock(worker_terminal_id):
+            record = get_assigned_worker_callback(worker_terminal_id)
+            if record is None or record.lifecycle in (
+                AssignmentLifecycle.COMPLETED,
+                AssignmentLifecycle.FAILED,
+                AssignmentLifecycle.CANCELLED,
+                AssignmentLifecycle.UNRESOLVED,
+            ):
+                return
+            if record.lifecycle == AssignmentLifecycle.ASSIGNED:
+                mark_assignment_manual_recovery(record.assignment_id, error)
+                return
+            # DISPATCHED was already committed before a later reconciliation
+            # exception. Preserve that proof and ask the active server scheduler
+            # to re-evaluate the genuine provider state.
+            self._request_retry(worker_terminal_id)
 
 
 assigned_worker_completion_service = AssignedWorkerCompletionService()

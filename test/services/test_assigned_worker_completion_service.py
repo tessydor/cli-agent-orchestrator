@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from itertools import count
 from threading import Barrier
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy import create_engine
@@ -18,7 +19,7 @@ from cli_agent_orchestrator.models.assigned_worker import (
     CompletionDeliveryState,
     CompletionReceiverState,
 )
-from cli_agent_orchestrator.models.inbox import InboxMessageOrigin, MessageStatus
+from cli_agent_orchestrator.models.inbox import InboxMessageOrigin, MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import assigned_worker_completion_service as completion_mod
 from cli_agent_orchestrator.services import cleanup_service as cleanup_mod
@@ -74,6 +75,41 @@ def _assignment(worker_id: str, caller_id: str, sequence: int = 1):
     record = db.mark_assigned_worker_dispatched(worker_id)
     assert record is not None
     return record
+
+
+def _unproven_assignment(worker_id: str, caller_id: str, sequence: int = 1):
+    """Create a persisted route whose assigned input has not been accepted."""
+    db.create_terminal(
+        worker_id,
+        "cao-test",
+        f"window-{worker_id}",
+        "mock_cli",
+        caller_id=caller_id,
+        assignment_id=f"assignment-{sequence:04d}",
+        completion_id=f"completion-{sequence:04d}",
+    )
+    record = db.get_assigned_worker_callback(worker_id)
+    assert record is not None
+    assert record.lifecycle == AssignmentLifecycle.ASSIGNED
+    return record
+
+
+def _configure_real_terminal_retirement(monkeypatch, tmp_path, *, cleanup_succeeds: bool):
+    """Keep the real callback-aware delete path while isolating backend effects."""
+    backend = MagicMock()
+    backend.get_pane_working_directory.return_value = None
+    backend.get_history.return_value = "synthetic pre-dispatch transcript"
+    monkeypatch.setattr(terminal_mod, "get_backend", lambda: backend)
+    monkeypatch.setattr(terminal_mod, "get_herdr_inbox_service", lambda: None)
+    monkeypatch.setattr(terminal_mod.fifo_manager, "stop_reader", lambda _terminal: None)
+    monkeypatch.setattr(terminal_mod.status_monitor, "clear_terminal", lambda _terminal: None)
+    monkeypatch.setattr(
+        terminal_mod.provider_manager,
+        "cleanup_provider",
+        lambda _terminal: cleanup_succeeds,
+    )
+    monkeypatch.setattr(terminal_mod, "TERMINAL_LOG_DIR", tmp_path)
+    return backend
 
 
 def _service(monkeypatch, report: str = "final report") -> AssignedWorkerCompletionService:
@@ -679,6 +715,171 @@ def test_missing_backend_provider_deferral_still_classifies_worker_failure(
     assert record.last_error == "synthetic positive proof that the backend pane is absent"
 
 
+@pytest.mark.asyncio
+async def test_never_started_deferred_worker_is_failed_then_really_deleted(
+    callback_db, ids, monkeypatch, tmp_path
+):
+    """The input-not-accepted path may retire an ASSIGNED worker without lying."""
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    _unproven_assignment(worker, caller)
+    backend = _configure_real_terminal_retirement(
+        monkeypatch,
+        tmp_path,
+        cleanup_succeeds=True,
+    )
+    monkeypatch.setattr(terminal_mod, "send_input", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        terminal_mod,
+        "_confirm_worker_started_or_resubmit",
+        AsyncMock(return_value=False),
+    )
+    provider = AsyncMock()
+    provider.initialize.return_value = True
+    provider.shell_baseline = None
+
+    before = set(terminal_mod._deferred_init_tasks)
+    terminal_mod._schedule_deferred_init(
+        provider,
+        worker,
+        "perform the synthetic task",
+        OrchestrationType.ASSIGN,
+        None,
+    )
+    (task,) = set(terminal_mod._deferred_init_tasks) - before
+    await task
+
+    assert db.get_terminal_metadata(worker) is None
+    record = db.get_assigned_worker_callback(worker)
+    assert record is not None
+    assert record.lifecycle == AssignmentLifecycle.FAILED
+    assert record.delivery_state == CompletionDeliveryState.TERMINAL_ERROR
+    assert record.final_result is None
+    assert record.last_error is not None
+    assert "failed before dispatch" in record.last_error
+    messages = _messages(caller)
+    assert len(messages) == 1
+    assert messages[0].message == (
+        f"Worker {worker} received the assigned task but never started processing "
+        "(input not accepted after retries). It has been deleted — re-assign the task."
+    )
+    backend.kill_window.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_initialize_failure_is_failed_then_really_deleted(
+    callback_db, ids, monkeypatch, tmp_path
+):
+    """An initialize exception is proven pre-input failure and permits teardown."""
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    _unproven_assignment(worker, caller)
+    _configure_real_terminal_retirement(monkeypatch, tmp_path, cleanup_succeeds=True)
+    provider = AsyncMock()
+    provider.initialize.side_effect = RuntimeError("synthetic init failure")
+
+    before = set(terminal_mod._deferred_init_tasks)
+    terminal_mod._schedule_deferred_init(
+        provider,
+        worker,
+        "perform the synthetic task",
+        OrchestrationType.ASSIGN,
+        None,
+    )
+    (task,) = set(terminal_mod._deferred_init_tasks) - before
+    await task
+
+    assert db.get_terminal_metadata(worker) is None
+    record = db.get_assigned_worker_callback(worker)
+    assert record is not None
+    assert record.lifecycle == AssignmentLifecycle.FAILED
+    assert record.delivery_state == CompletionDeliveryState.TERMINAL_ERROR
+    assert record.final_result is None
+    assert _messages(caller)[0].message == (
+        f"Worker {worker} failed to initialize: RuntimeError('synthetic init failure'). "
+        "It has been deleted — re-assign the task."
+    )
+
+
+@pytest.mark.asyncio
+async def test_input_side_effect_exception_is_unresolved_and_never_deleted(
+    callback_db, ids, monkeypatch, tmp_path
+):
+    """An exception after paste may have started the task, so teardown fails closed."""
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    _unproven_assignment(worker, caller)
+    backend = _configure_real_terminal_retirement(
+        monkeypatch,
+        tmp_path,
+        cleanup_succeeds=True,
+    )
+
+    def uncertain_send(*_args, **_kwargs):
+        raise RuntimeError("synthetic post-paste uncertainty")
+
+    monkeypatch.setattr(terminal_mod, "send_input", uncertain_send)
+    provider = AsyncMock()
+    provider.initialize.return_value = True
+    provider.shell_baseline = None
+
+    before = set(terminal_mod._deferred_init_tasks)
+    terminal_mod._schedule_deferred_init(
+        provider,
+        worker,
+        "perform the synthetic task",
+        OrchestrationType.ASSIGN,
+        None,
+    )
+    (task,) = set(terminal_mod._deferred_init_tasks) - before
+    await task
+
+    assert db.get_terminal_metadata(worker) is not None
+    record = db.get_assigned_worker_callback(worker)
+    assert record is not None
+    assert record.lifecycle == AssignmentLifecycle.UNRESOLVED
+    assert record.delivery_state == CompletionDeliveryState.MANUAL_RECOVERY
+    assert record.final_result is None
+    assert "external side effect may have begun" in (record.last_error or "")
+    assert _messages(caller)[0].message == (
+        f"Worker {worker} encountered RuntimeError('synthetic post-paste uncertainty') "
+        "after initial input delivery began; task acceptance is unresolved. The worker "
+        "terminal/report recovery handle remains for manual recovery."
+    )
+    backend.kill_window.assert_not_called()
+
+
+def test_deferred_failure_delete_deferral_retains_failed_worker_and_reports_truth(
+    callback_db, ids, monkeypatch, tmp_path
+):
+    """Exact cfdee34 regression: a False delete result cannot claim deletion."""
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    _unproven_assignment(worker, caller)
+    _configure_real_terminal_retirement(monkeypatch, tmp_path, cleanup_succeeds=False)
+
+    terminal_mod._notify_caller_of_deferred_failure(
+        worker,
+        f"Worker {worker} failed to initialize. It has been deleted — re-assign.",
+        None,
+        delete_worker=True,
+    )
+
+    assert db.get_terminal_metadata(worker) is not None
+    record = db.get_assigned_worker_callback(worker)
+    assert record is not None
+    assert record.lifecycle == AssignmentLifecycle.FAILED
+    assert record.delivery_state == CompletionDeliveryState.TERMINAL_ERROR
+    assert record.final_result is None
+    messages = _messages(caller)
+    assert len(messages) == 1
+    assert messages[0].message == (
+        f"Worker {worker} failed to initialize. Cleanup was deferred; the worker "
+        "terminal/report recovery handle remains for retry or manual recovery."
+    )
+    assert "has been deleted" not in messages[0].message
+
+
 def test_retryable_enqueue_failure_retries_once_without_duplicate(callback_db, ids, monkeypatch):
     caller, worker = ids(), ids()
     _terminal(caller)
@@ -742,6 +943,226 @@ def test_retryable_receiver_classification_recovers_without_enqueueing_early(
     assert recovered.delivery_state == CompletionDeliveryState.ACKNOWLEDGED
     assert recovered.receiver_state == CompletionReceiverState.ACTIVE
     assert recovered.attempt_count == 1
+
+
+@pytest.mark.asyncio
+async def test_enqueue_failure_recovers_automatically_without_reconcile_poll_or_restart(
+    callback_db, ids, monkeypatch
+):
+    """A post-start enqueue failure wakes one delayed, idempotent server retry."""
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    _assignment(worker, caller)
+    service = AssignedWorkerCompletionService(
+        retry_initial_delay=0.01,
+        retry_max_delay=0.02,
+    )
+    monkeypatch.setattr(service, "_capture_final_result", lambda _worker: "automatic report")
+    monkeypatch.setattr(
+        service,
+        "_classify_receiver",
+        lambda _record: (CompletionReceiverState.ACTIVE, None),
+    )
+    monkeypatch.setattr(service, "_attempt_immediate_inbox_delivery", lambda _caller: None)
+    real_create = db.create_inbox_message
+    loop = asyncio.get_running_loop()
+    delivered = asyncio.Event()
+    create_calls = 0
+
+    def flaky_create(*args, **kwargs):
+        nonlocal create_calls
+        create_calls += 1
+        if create_calls == 1:
+            raise RuntimeError("database temporarily busy")
+        result = real_create(*args, **kwargs)
+        loop.call_soon_threadsafe(delivered.set)
+        return result
+
+    monkeypatch.setattr(completion_mod, "create_inbox_message", flaky_create)
+    service.start_retry_scheduler()
+    try:
+        await asyncio.to_thread(service.handle_status_event, worker, TerminalStatus.COMPLETED)
+        first = db.get_assigned_worker_callback(worker)
+        assert first is not None
+        assert first.delivery_state == CompletionDeliveryState.RETRYABLE
+
+        # Duplicate failure/event wakeups coalesce behind the same worker key.
+        for _ in range(10):
+            service._request_retry(worker)
+        await asyncio.wait_for(delivered.wait(), timeout=1)
+    finally:
+        await service.stop_retry_scheduler()
+
+    recovered = db.get_assigned_worker_callback(worker)
+    assert recovered is not None
+    assert recovered.delivery_state == CompletionDeliveryState.ACKNOWLEDGED
+    assert recovered.attempt_count == 2
+    assert create_calls == 2
+    assert len(_messages(caller)) == 1
+
+
+@pytest.mark.asyncio
+async def test_receiver_classification_failure_recovers_automatically_without_polling(
+    callback_db, ids, monkeypatch
+):
+    """Transient receiver discovery is retried without another status edge."""
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    _assignment(worker, caller)
+    service = AssignedWorkerCompletionService(
+        retry_initial_delay=0.01,
+        retry_max_delay=0.02,
+    )
+    monkeypatch.setattr(service, "_capture_final_result", lambda _worker: "classified report")
+    monkeypatch.setattr(service, "_attempt_immediate_inbox_delivery", lambda _caller: None)
+    classifications = iter(
+        (
+            (
+                CompletionReceiverState.RETRYABLE_FAILURE,
+                "receiver backend temporarily unavailable",
+            ),
+            (CompletionReceiverState.ACTIVE, None),
+        )
+    )
+    monkeypatch.setattr(service, "_classify_receiver", lambda _record: next(classifications))
+    real_create = db.create_inbox_message
+    loop = asyncio.get_running_loop()
+    delivered = asyncio.Event()
+
+    def signal_create(*args, **kwargs):
+        result = real_create(*args, **kwargs)
+        loop.call_soon_threadsafe(delivered.set)
+        return result
+
+    monkeypatch.setattr(completion_mod, "create_inbox_message", signal_create)
+    service.start_retry_scheduler()
+    try:
+        await asyncio.to_thread(service.handle_status_event, worker, TerminalStatus.COMPLETED)
+        assert _messages(caller) == []
+        await asyncio.wait_for(delivered.wait(), timeout=1)
+    finally:
+        await service.stop_retry_scheduler()
+
+    recovered = db.get_assigned_worker_callback(worker)
+    assert recovered is not None
+    assert recovered.delivery_state == CompletionDeliveryState.ACKNOWLEDGED
+    assert recovered.receiver_state == CompletionReceiverState.ACTIVE
+    assert recovered.attempt_count == 1
+    assert len(_messages(caller)) == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_scheduler_shutdown_cancels_deadlines_and_bounds_backoff(
+    callback_db, ids, monkeypatch
+):
+    """One shared scheduler caps delay and performs no work after shutdown."""
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    _assignment(worker, caller)
+    service = AssignedWorkerCompletionService(
+        retry_initial_delay=0.01,
+        retry_max_delay=0.02,
+    )
+    monkeypatch.setattr(service, "_capture_final_result", lambda _worker: "retained report")
+    monkeypatch.setattr(service, "_attempt_immediate_inbox_delivery", lambda _caller: None)
+    loop = asyncio.get_running_loop()
+    second_failure = asyncio.Event()
+    second_retry_requested = asyncio.Event()
+    classification_calls = 0
+    retry_requests = 0
+
+    def always_transient(_record):
+        nonlocal classification_calls
+        classification_calls += 1
+        if classification_calls == 2:
+            loop.call_soon_threadsafe(second_failure.set)
+        return CompletionReceiverState.RETRYABLE_FAILURE, "still transient"
+
+    monkeypatch.setattr(service, "_classify_receiver", always_transient)
+    real_request_retry = service._request_retry
+
+    def signal_retry_request(worker_id):
+        nonlocal retry_requests
+        retry_requests += 1
+        real_request_retry(worker_id)
+        if retry_requests == 2:
+            loop.call_soon_threadsafe(second_retry_requested.set)
+
+    monkeypatch.setattr(service, "_request_retry", signal_retry_request)
+    service.start_retry_scheduler()
+    scheduler = service._retry_scheduler_task
+    try:
+        await asyncio.to_thread(service.handle_status_event, worker, TerminalStatus.COMPLETED)
+        await asyncio.wait_for(second_failure.wait(), timeout=1)
+        await asyncio.wait_for(second_retry_requested.wait(), timeout=1)
+        # The deadline callback was queued before the test signal above.
+        await asyncio.sleep(0)
+        assert service._retry_scheduler_task is scheduler
+        assert len(service._retry_due) == 1
+        assert service._retry_delays[worker] <= 0.02
+    finally:
+        await service.stop_retry_scheduler()
+
+    calls_at_shutdown = classification_calls
+    await asyncio.sleep(0.05)
+    assert classification_calls == calls_at_shutdown
+    assert service._retry_scheduler_task is None
+    assert service._retry_due == {}
+    assert service._retry_delays == {}
+
+
+@pytest.mark.asyncio
+async def test_run_owns_startup_reconciliation_and_cleans_retry_scheduler(
+    callback_db, ids, monkeypatch
+):
+    """Process startup recovers RETRYABLE state without an external sweep call."""
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    _assignment(worker, caller)
+    before_restart = _service(monkeypatch, "startup-retained report")
+    monkeypatch.setattr(
+        before_restart,
+        "_classify_receiver",
+        lambda _record: (CompletionReceiverState.RETRYABLE_FAILURE, "pre-restart outage"),
+    )
+    before_restart.handle_status_event(worker, TerminalStatus.COMPLETED)
+    assert (
+        db.get_assigned_worker_callback(worker).delivery_state == CompletionDeliveryState.RETRYABLE
+    )
+
+    restarted = AssignedWorkerCompletionService(
+        retry_initial_delay=0.01,
+        retry_max_delay=0.02,
+    )
+    monkeypatch.setattr(
+        restarted,
+        "_classify_receiver",
+        lambda _record: (CompletionReceiverState.ACTIVE, None),
+    )
+    monkeypatch.setattr(restarted, "_attempt_immediate_inbox_delivery", lambda _caller: None)
+    real_create = db.create_inbox_message
+    loop = asyncio.get_running_loop()
+    delivered = asyncio.Event()
+
+    def signal_create(*args, **kwargs):
+        result = real_create(*args, **kwargs)
+        loop.call_soon_threadsafe(delivered.set)
+        return result
+
+    monkeypatch.setattr(completion_mod, "create_inbox_message", signal_create)
+    run_task = asyncio.create_task(restarted.run())
+    try:
+        await asyncio.wait_for(delivered.wait(), timeout=1)
+    finally:
+        run_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await run_task
+
+    assert restarted._retry_scheduler_task is None
+    assert db.get_assigned_worker_callback(worker).delivery_state == (
+        CompletionDeliveryState.ACKNOWLEDGED
+    )
+    assert len(_messages(caller)) == 1
 
 
 def test_multiple_workers_one_caller_each_deliver_once(callback_db, ids, monkeypatch):

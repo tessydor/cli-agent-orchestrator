@@ -370,8 +370,13 @@ def test_failure_reset_and_retry_policy_with_real_claims(
     assert db.get_inbox_messages(caller, limit=10)[0].status == expected_final
 
 
-def test_unresolved_delivering_claim_is_not_automatically_replayed(inbox_db, monkeypatch):
-    caller, message = _create_delivery_row(False)
+@pytest.mark.parametrize("server_callback", [False, True])
+def test_unresolved_delivering_claim_is_not_automatically_replayed(
+    inbox_db,
+    monkeypatch,
+    server_callback,
+):
+    caller, message = _create_delivery_row(server_callback)
     assert db.claim_inbox_message(message.id, "crash-boundary-claim") is not None
     monkeypatch.setattr(inbox_mod.status_monitor, "get_status", lambda _id: TerminalStatus.IDLE)
     send_input = MagicMock()

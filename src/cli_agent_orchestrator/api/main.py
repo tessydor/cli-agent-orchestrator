@@ -220,7 +220,6 @@ async def inbox_reconciliation_daemon(registry: PluginRegistry) -> None:
         await asyncio.sleep(INBOX_RECONCILE_INTERVAL)
         try:
             await asyncio.to_thread(inbox_service.reconcile_orphaned_messages, registry)
-            await asyncio.to_thread(assigned_worker_completion_service.reconcile_pending)
         except Exception:
             logger.exception("Inbox reconciliation daemon error")
 
@@ -1120,11 +1119,6 @@ async def lifespan(app: FastAPI):
     log_writer_task = asyncio.create_task(log_writer.run())
     inbox_service_task = asyncio.create_task(inbox_service.run(registry))
     assigned_completion_task = asyncio.create_task(assigned_worker_completion_service.run(registry))
-    # Crash recovery is server-owned.  It starts once per process and does not
-    # require (or generate) any supervisor status/inbox polling.
-    assigned_completion_reconcile_task = asyncio.create_task(
-        asyncio.to_thread(assigned_worker_completion_service.reconcile_pending)
-    )
     logger.info(
         "Event bus consumers started (StatusMonitor, LogWriter, InboxService, "
         "AssignedWorkerCompletionService)"
@@ -1199,7 +1193,6 @@ async def lifespan(app: FastAPI):
     log_writer_task.cancel()
     inbox_service_task.cancel()
     assigned_completion_task.cancel()
-    assigned_completion_reconcile_task.cancel()
     # Cancel approval bridge on shutdown
     if approval_bridge_task is not None:
         approval_bridge_task.cancel()
@@ -1216,7 +1209,6 @@ async def lifespan(app: FastAPI):
             log_writer_task,
             inbox_service_task,
             assigned_completion_task,
-            assigned_completion_reconcile_task,
             daemon_task,
             return_exceptions=True,
         )

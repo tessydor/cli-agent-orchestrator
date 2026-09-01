@@ -1298,13 +1298,11 @@ class TestInboxReconciliationDaemon:
             with pytest.raises(asyncio.CancelledError):
                 await inbox_reconciliation_daemon(registry)
 
-        assert mock_to_thread.await_count == 2
-        # Both recovery sweeps must run in order before the daemon sleeps again.
-        # These are bound methods on singletons, so fresh attribute accesses are
-        # distinct objects — compare them by value rather than identity.
+        assert mock_to_thread.await_count == 1
+        # Callback retry is event-woken inside AssignedWorkerCompletionService;
+        # this slower sweep remains responsible only for orphaned inbox rows.
         assert mock_to_thread.await_args_list == [
             call(inbox_service.reconcile_orphaned_messages, registry),
-            call(assigned_worker_completion_service.reconcile_pending),
         ]
 
 

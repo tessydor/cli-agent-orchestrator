@@ -54,7 +54,7 @@ Task lifecycle and delivery state are independent:
 | `ENQUEUED` | Legacy recovery state linking a committed callback inbox row. |
 | `ACKNOWLEDGED` | SQLite atomically accepted and linked the callback row. |
 | `SUPPRESSED_EXPLICIT` | An equivalent explicit final satisfies the callback. |
-| `RETRYABLE` | Capture, classification, or enqueue can be retried. |
+| `RETRYABLE` | Failure is retained for server retry. |
 | `MANUAL_RECOVERY` | Automation cannot prove a safe next transition. |
 | `TERMINAL_ERROR` | No automatic path remains; retain data for recovery. |
 
@@ -85,6 +85,16 @@ boundaries:
 | Legacy link, before acknowledgement | Verify and acknowledge that row. |
 | After acknowledgement, before wake | Inbox reconciliation sees `PENDING`. |
 
+After startup, capture, receiver-classification, and enqueue failures that enter
+`RETRYABLE` wake one completion-service-owned scheduler. It keeps at most one
+deadline per worker, uses exponential delays from one second up to a 60-second
+cap, and runs all deadlines through one shared task. Duplicate failure signals
+coalesce; there is no supervisor poll, callback-table sweep, or busy loop. A
+retry that remains transient schedules the next capped delay, while success or a
+terminal classification clears its deadline. Server shutdown cancels the shared
+task and clears its in-memory schedule; durable `RETRYABLE` rows are recovered by
+the mandatory startup reconciliation on the next process start.
+
 Callback equivalence selection, inbox insertion, callback linkage, and enqueue
 acknowledgement now share one `BEGIN IMMEDIATE` transaction. The explicit
 `send_message` insertion path uses that same serialization. Therefore either an
@@ -98,7 +108,8 @@ the row to `DELIVERED`, `FAILED`, or back to `PENDING`. A caught pre-paste send
 failure resets the callback for retry. A process crash after a paste but before
 claim resolution leaves `DELIVERING` as a deliberate manual-recovery boundary;
 it is not automatically replayed because CAO cannot know whether the external
-terminal side effect occurred.
+terminal side effect occurred. The completion retry scheduler only reconciles
+callback state and does not replay such inbox claims.
 
 ## Retention and deletion invariant
 
@@ -115,6 +126,18 @@ reason before provider cleanup or terminal-row deletion. If provider cleanup is
 deferred, the terminal row remains, but the worker no longer dangles in an
 unclassified state. A failed terminal retirement also defers deletion of its
 containing backend session and session environment.
+
+Deferred initialization failure and exhausted input-acceptance retries are a
+separate positive-proof path: the assigned task never crossed the dispatch gate.
+That path first persists `FAILED` / `TERMINAL_ERROR`, then uses normal terminal
+retirement. Its caller notification is composed only after retirement returns;
+it claims deletion only on a true result and otherwise says cleanup was deferred
+and the terminal/report recovery handle remains. Notification enqueue failure
+does not block an otherwise safe teardown. A worker parked on
+`WAITING_USER_ANSWER` is not classified or deleted by this path. Likewise, an
+exception after `send_input` begins cannot prove whether its external paste
+occurred; an unproven callback becomes `UNRESOLVED` / `MANUAL_RECOVERY` and is
+retained instead of being falsely classified as never dispatched.
 
 Captured callback rows, linked inbox evidence, and even unlinked server rows at
 the legacy insert-before-link crash boundary are exempt from age cleanup.
@@ -192,9 +215,11 @@ understand callback reconciliation or its retention exemptions.
 - Callback/report/evidence rows have no automatic pruning policy in V1. This
   favors audit and recovery but requires a future owner-approved retention
   policy for long-running installations.
-- The routing digest detects corruption and SQLite triggers reject route changes;
-  it is not a cryptographic defense against an administrator who can rewrite the
-  database schema, remove the triggers, and consistently forge every field.
+- The routing digest and route/result triggers detect or reject changes to their
+  covered immutable evidence. They do not cryptographically authenticate a
+  legitimate-looking, self-consistent mutation of mutable lifecycle/delivery
+  fields by a privileged database writer; such a raw SQL lifecycle transition
+  can be accepted without removing the route/result triggers.
 - Final extraction remains provider-specific and bounded by the provider's
   existing extraction rules. Extraction errors are retryable and block worker
   retirement rather than discarding the terminal.
