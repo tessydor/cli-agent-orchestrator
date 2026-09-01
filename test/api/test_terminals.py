@@ -1,17 +1,22 @@
 """Tests for terminal-related API endpoints including working directory and exit."""
 
+import hashlib
 from typing import Dict
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.api.main import app
+from cli_agent_orchestrator.clients import database as db
 from cli_agent_orchestrator.constants import (
     TERMINAL_GROUP_ELEMENT_MAX_LEN,
     TERMINAL_GROUP_MAX_ELEMENTS,
     TERMINAL_METADATA_MAX_BYTES,
 )
+from cli_agent_orchestrator.models.assigned_worker import AssignedWorkerIntegrityError
 from cli_agent_orchestrator.models.inbox import InboxMessageOrigin
 from cli_agent_orchestrator.models.terminal import Terminal
 
@@ -600,6 +605,54 @@ class TestAssignedWorkerCompletionCallbackEndpoint:
 
         assert response.status_code == 404
 
+    def test_raw_sql_result_tamper_fails_closed_without_report_readback(
+        self, client, tmp_path, monkeypatch
+    ):
+        engine = create_engine(
+            f"sqlite:///{tmp_path / 'manual-recovery-tamper.sqlite'}",
+            connect_args={"check_same_thread": False},
+        )
+        db.Base.metadata.create_all(bind=engine)
+        monkeypatch.setattr(
+            db,
+            "SessionLocal",
+            sessionmaker(autocommit=False, autoflush=False, bind=engine),
+        )
+        db.create_terminal("feedbeef", "cao-api", "caller", "mock_cli")
+        db.create_terminal(
+            "abcd1234",
+            "cao-api",
+            "worker",
+            "mock_cli",
+            caller_id="feedbeef",
+            assignment_id="assignment-api-integrity",
+            completion_id="completion-api-integrity",
+        )
+        db.mark_assigned_worker_dispatched("abcd1234")
+        report = "authentic API report"
+        db.capture_assigned_worker_completion(
+            "abcd1234",
+            report,
+            hashlib.sha256(report.encode()).hexdigest(),
+            "assigned-worker-callback:assignment-api-integrity",
+        )
+        with db.SessionLocal() as session:
+            session.connection().exec_driver_sql(
+                "DROP TRIGGER trg_assigned_worker_result_immutable"
+            )
+            session.connection().exec_driver_sql(
+                "UPDATE assigned_worker_callbacks SET final_result = 'tampered API report' "
+                "WHERE assignment_id = 'assignment-api-integrity'"
+            )
+            session.commit()
+
+        response = client.get("/assigned-workers/abcd1234/completion-callback")
+
+        assert response.status_code == 409
+        assert "integrity failure" in response.json()["detail"]
+        assert "tampered API report" not in response.text
+        engine.dispose()
+
 
 class TestCreateInboxMessageEndpoint:
     """Test POST /terminals/{receiver_id}/inbox/messages endpoint."""
@@ -670,6 +723,20 @@ class TestCreateInboxMessageEndpoint:
             )
 
             assert response.status_code == 404
+
+    def test_create_inbox_message_integrity_failure_is_conflict(self, client):
+        with patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create:
+            mock_create.side_effect = AssignedWorkerIntegrityError(
+                "Assigned-worker callback integrity failure"
+            )
+
+            response = client.post(
+                "/terminals/abcd1234/inbox/messages",
+                params={"sender_id": "sender1", "message": "hello"},
+            )
+
+            assert response.status_code == 409
+            assert "integrity failure" in response.json()["detail"]
 
     def test_create_inbox_message_server_error(self, client):
         """POST returns 500 on internal error."""

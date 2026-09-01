@@ -4,21 +4,23 @@ import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from sqlalchemy import and_, not_
+from sqlalchemy import and_
 
-from cli_agent_orchestrator.clients.database import InboxModel, SessionLocal, TerminalModel
+from cli_agent_orchestrator.clients.database import (
+    AssignedWorkerCallbackModel,
+    InboxModel,
+    SessionLocal,
+    TerminalModel,
+    list_protected_assigned_worker_callbacks,
+)
 from cli_agent_orchestrator.constants import (
     LOG_DIR,
     MEMORY_BASE_DIR,
     RETENTION_DAYS,
     TERMINAL_LOG_DIR,
 )
-from cli_agent_orchestrator.models.inbox import InboxMessageOrigin, MessageStatus
-from cli_agent_orchestrator.models.provider import ProviderType
-from cli_agent_orchestrator.providers.manager import provider_manager
-from cli_agent_orchestrator.services.fifo_reader import fifo_manager
+from cli_agent_orchestrator.models.inbox import InboxMessageOrigin
 from cli_agent_orchestrator.services.memory_format import parse_index_entry
-from cli_agent_orchestrator.services.status_monitor import status_monitor
 
 logger = logging.getLogger(__name__)
 
@@ -31,60 +33,49 @@ def cleanup_old_data():
             f"Starting cleanup of data older than {RETENTION_DAYS} days (before {cutoff_date})"
         )
 
-        # Clean up old terminals (stop FIFO readers and clear state first)
+        # Every terminal retirement goes through terminal_service so assigned
+        # workers capture/classify their outcome before any pane, log route, or
+        # DB recovery handle is removed.  Bulk ORM deletion is forbidden here.
         with SessionLocal() as db:
-            old_terminals = (
-                db.query(TerminalModel).filter(TerminalModel.last_active < cutoff_date).all()
-            )
-            retained_terminal_ids: set[str] = set()
-            for terminal in old_terminals:
-                fifo_manager.stop_reader(terminal.id)
-                status_monitor.clear_terminal(terminal.id)
-                # A stale Grok terminal can still own a private GROK_HOME. An
-                # explicit deferred cleanup is its retry handle, so retention
-                # housekeeping must not bulk-delete that row underneath it.
-                if (
-                    terminal.provider == ProviderType.GROK_CLI.value
-                    and provider_manager.cleanup_provider(terminal.id) is False
-                ):
-                    retained_terminal_ids.add(terminal.id)
+            old_terminal_ids = [
+                row[0]
+                for row in db.query(TerminalModel.id)
+                .filter(TerminalModel.last_active < cutoff_date)
+                .all()
+            ]
+        from cli_agent_orchestrator.services import terminal_service
+
+        deleted_terminals = 0
+        for terminal_id in old_terminal_ids:
+            try:
+                if terminal_service.delete_terminal(terminal_id):
+                    deleted_terminals += 1
+                else:
                     logger.warning(
-                        "Retaining stale Grok terminal %s while cleanup is deferred", terminal.id
+                        "Retention deferred terminal %s to preserve its recovery handle",
+                        terminal_id,
                     )
-            terminal_query = db.query(TerminalModel).filter(TerminalModel.last_active < cutoff_date)
-            if retained_terminal_ids:
-                deleted_terminals = terminal_query.filter(
-                    ~TerminalModel.id.in_(retained_terminal_ids)
-                ).delete()
-            else:
-                deleted_terminals = terminal_query.delete()
-            db.commit()
-            logger.info(f"Deleted {deleted_terminals} old terminals from database")
+            except Exception:
+                logger.warning("Retention failed to retire terminal %s", terminal_id, exc_info=True)
+        logger.info(f"Deleted {deleted_terminals} old terminals from database")
 
         # Clean up old inbox messages
         with SessionLocal() as db:
-            # A pending assigned-worker callback is a durable delivery promise,
-            # including an equivalent explicit final callback selected for
-            # suppression.  Retention must not delete it while a retained but
-            # temporarily unreachable receiver may still recover.  Once the row
-            # is DELIVERED (or otherwise leaves PENDING), normal age retention
-            # applies; the full final report remains in callback storage.
-            protected_callback = and_(
-                InboxModel.status == MessageStatus.PENDING.value,
-                InboxModel.assignment_id.isnot(None),
-                InboxModel.origin.in_(
-                    (
-                        InboxMessageOrigin.EXPLICIT.value,
-                        InboxMessageOrigin.SERVER_COMPLETION.value,
-                    )
-                ),
+            # Linked callback rows are retained as route/payload/delivery
+            # evidence for integrity validation and manual recovery. Unlinked
+            # server rows are retained too: they are the historical crash
+            # boundary after inbox insert and before callback linkage. SQLite
+            # triggers additionally protect linked evidence from every caller.
+            linked_callback_ids = db.query(AssignedWorkerCallbackModel.inbox_message_id).filter(
+                AssignedWorkerCallbackModel.inbox_message_id.isnot(None)
             )
             deleted_messages = (
                 db.query(InboxModel)
                 .filter(
                     and_(
                         InboxModel.created_at < cutoff_date,
-                        not_(protected_callback),
+                        ~InboxModel.id.in_(linked_callback_ids),
+                        InboxModel.origin != InboxMessageOrigin.SERVER_COMPLETION.value,
                     )
                 )
                 .delete(synchronize_session=False)
@@ -92,11 +83,25 @@ def cleanup_old_data():
             db.commit()
             logger.info(f"Deleted {deleted_messages} old inbox messages from database")
 
+        # An uncaptured assignment's append-only log/snapshot may be its only
+        # remaining report source. Preserve all file forms alongside the terminal
+        # recovery handle; integrity validation in this read fails cleanup closed.
+        protected_terminal_ids = {
+            callback.worker_terminal_id for callback in list_protected_assigned_worker_callbacks()
+        }
+        protected_log_names = {
+            f"{terminal_id}{suffix}"
+            for terminal_id in protected_terminal_ids
+            for suffix in (".log", ".scrollback", ".snapshot.json")
+        }
+
         # Clean up old terminal log files
         terminal_logs_deleted = 0
         if TERMINAL_LOG_DIR.exists():
             for pattern in ("*.log", "*.scrollback", "*.snapshot.json"):
                 for log_file in TERMINAL_LOG_DIR.glob(pattern):
+                    if log_file.name in protected_log_names:
+                        continue
                     if log_file.stat().st_mtime < cutoff_date.timestamp():
                         log_file.unlink()
                         terminal_logs_deleted += 1

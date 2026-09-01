@@ -2,9 +2,11 @@
 
 import asyncio
 import hashlib
+import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from itertools import count
+from threading import Barrier
 
 import pytest
 from sqlalchemy import create_engine
@@ -20,6 +22,7 @@ from cli_agent_orchestrator.models.inbox import InboxMessageOrigin, MessageStatu
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import assigned_worker_completion_service as completion_mod
 from cli_agent_orchestrator.services import cleanup_service as cleanup_mod
+from cli_agent_orchestrator.services import terminal_service as terminal_mod
 from cli_agent_orchestrator.services.assigned_worker_completion_service import (
     AssignedWorkerCompletionService,
 )
@@ -314,6 +317,51 @@ def test_completed_status_before_dispatch_gate_is_not_task_completion(
     assert record.final_result is None
 
 
+def test_restart_never_promotes_unproven_assignment_from_live_completed_status(
+    callback_db, ids, monkeypatch
+):
+    """Startup chrome cannot become a successful assigned-task report."""
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    db.create_terminal(
+        worker,
+        "cao-test",
+        f"window-{worker}",
+        "mock_cli",
+        caller_id=caller,
+        assignment_id="assignment-unproven-restart",
+        completion_id="completion-unproven-restart",
+    )
+    service = _service(monkeypatch, "startup chrome, not proven task output")
+    monkeypatch.setattr(service, "_detect_live_status", lambda _record: TerminalStatus.COMPLETED)
+
+    service.reconcile_worker(worker)
+
+    assert _messages(caller) == []
+    record = db.get_assigned_worker_callback(worker)
+    assert record is not None
+    assert record.lifecycle == AssignmentLifecycle.UNRESOLVED
+    assert record.delivery_state == CompletionDeliveryState.MANUAL_RECOVERY
+    assert record.final_result is None
+    assert "without durable dispatch proof" in (record.last_error or "")
+
+
+def test_restart_recovers_genuinely_persisted_dispatched_completion(callback_db, ids, monkeypatch):
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    _assignment(worker, caller)
+    service = _service(monkeypatch, "proven dispatched final result")
+    monkeypatch.setattr(service, "_detect_live_status", lambda _record: TerminalStatus.COMPLETED)
+
+    service.reconcile_worker(worker)
+
+    assert [message.sender_id for message in _messages(caller)] == [worker]
+    record = db.get_assigned_worker_callback(worker)
+    assert record is not None
+    assert record.lifecycle == AssignmentLifecycle.COMPLETED
+    assert record.final_result == "proven dispatched final result"
+
+
 def test_restart_before_enqueue_reconciles_captured_report(callback_db, ids, monkeypatch):
     caller, worker = ids(), ids()
     _terminal(caller)
@@ -353,28 +401,37 @@ def test_restart_after_enqueue_before_ack_reuses_exact_inbox_row(
     )
     assert captured is not None
     db.record_completion_delivery_attempt(assignment.assignment_id, CompletionReceiverState.ACTIVE)
-    inbox = db.create_inbox_message(
-        worker,
-        caller,
-        AssignedWorkerCompletionService._format_callback_message(captured),
-        origin=InboxMessageOrigin.SERVER_COMPLETION,
-        assignment_id=assignment.assignment_id,
-        idempotency_key=f"assigned-worker-completion:{assignment.completion_id}",
-    )
+    # Reproduce the two durable crash boundaries from the earlier phased
+    # implementation. New writes commit insert+link+ack atomically, but restart
+    # compatibility must adopt either historical shape without duplicating.
+    with db.SessionLocal() as session:
+        inbox_row = db.InboxModel(
+            sender_id=worker,
+            receiver_id=caller,
+            message=AssignedWorkerCompletionService._format_callback_message(captured),
+            status=MessageStatus.PENDING.value,
+            origin=InboxMessageOrigin.SERVER_COMPLETION.value,
+            assignment_id=assignment.assignment_id,
+            idempotency_key=f"assigned-worker-completion:{assignment.completion_id}",
+        )
+        session.add(inbox_row)
+        session.commit()
+        session.refresh(inbox_row)
+        inbox_id = inbox_row.id
     if link_before_restart:
         db.mark_completion_enqueued(
-            assignment.assignment_id, inbox.id, CompletionReceiverState.ACTIVE
+            assignment.assignment_id, inbox_id, CompletionReceiverState.ACTIVE
         )
 
     restarted = _service(monkeypatch, report)
     restarted.reconcile_pending()
 
     messages = _messages(caller)
-    assert [message.id for message in messages] == [inbox.id]
+    assert [message.id for message in messages] == [inbox_id]
     record = db.get_assigned_worker_callback(worker)
     assert record is not None
     assert record.delivery_state == CompletionDeliveryState.ACKNOWLEDGED
-    assert record.inbox_message_id == inbox.id
+    assert record.inbox_message_id == inbox_id
 
 
 def test_deleted_receiver_is_terminal_error_but_report_is_retained(callback_db, ids, monkeypatch):
@@ -450,10 +507,18 @@ def test_retention_never_deletes_a_pending_assigned_callback(
     caller, worker = ids(), ids()
     _terminal(caller)
     assignment = _assignment(worker, caller)
+    report = "durable callback"
+    captured = db.capture_assigned_worker_completion(
+        worker,
+        report,
+        hashlib.sha256(report.encode()).hexdigest(),
+        f"assigned-worker-callback:{assignment.assignment_id}",
+    )
+    assert captured is not None
     callback = db.create_inbox_message(
         worker,
         caller,
-        "durable callback",
+        AssignedWorkerCompletionService._format_callback_message(captured),
         origin=InboxMessageOrigin.SERVER_COMPLETION,
         assignment_id=assignment.assignment_id,
         idempotency_key=f"assigned-worker-completion:{assignment.completion_id}",
@@ -474,6 +539,144 @@ def test_retention_never_deletes_a_pending_assigned_callback(
     cleanup_mod.cleanup_old_data()
 
     assert [message.id for message in _messages(caller)] == [callback.id]
+
+
+def test_retention_preserves_unlinked_server_row_from_legacy_crash_boundary(
+    callback_db, ids, monkeypatch, tmp_path
+):
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    assignment = _assignment(worker, caller)
+    report = "durable report awaiting legacy linkage"
+    captured = db.capture_assigned_worker_completion(
+        worker,
+        report,
+        hashlib.sha256(report.encode()).hexdigest(),
+        f"assigned-worker-callback:{assignment.assignment_id}",
+    )
+    assert captured is not None
+    with db.SessionLocal() as session:
+        server_row = db.InboxModel(
+            sender_id=worker,
+            receiver_id=caller,
+            message=AssignedWorkerCompletionService._format_callback_message(captured),
+            status=MessageStatus.PENDING.value,
+            origin=InboxMessageOrigin.SERVER_COMPLETION.value,
+            assignment_id=assignment.assignment_id,
+            idempotency_key=f"assigned-worker-completion:{assignment.completion_id}",
+            created_at=datetime.now() - timedelta(days=30),
+        )
+        ordinary_row = db.InboxModel(
+            sender_id=worker,
+            receiver_id=caller,
+            message="expired ordinary message",
+            status=MessageStatus.PENDING.value,
+            origin=InboxMessageOrigin.LEGACY.value,
+            created_at=datetime.now() - timedelta(days=30),
+        )
+        session.add_all((server_row, ordinary_row))
+        session.commit()
+        session.refresh(server_row)
+        server_id = server_row.id
+
+    monkeypatch.setattr(cleanup_mod, "SessionLocal", db.SessionLocal)
+    monkeypatch.setattr(cleanup_mod, "RETENTION_DAYS", 7)
+    monkeypatch.setattr(cleanup_mod, "TERMINAL_LOG_DIR", tmp_path / "no-terminal-logs")
+    monkeypatch.setattr(cleanup_mod, "LOG_DIR", tmp_path / "no-server-logs")
+
+    cleanup_mod.cleanup_old_data()
+
+    assert [message.id for message in _messages(caller)] == [server_id]
+    retained = db.get_assigned_worker_callback(worker)
+    assert retained is not None
+    assert retained.delivery_state == CompletionDeliveryState.CAPTURED
+    assert retained.inbox_message_id is None
+
+
+def test_retention_preserves_uncaptured_dispatched_worker_report_handle(
+    callback_db, ids, monkeypatch, tmp_path
+):
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    _assignment(worker, caller)
+    with db.SessionLocal() as session:
+        session.query(db.TerminalModel).filter(db.TerminalModel.id == worker).update(
+            {db.TerminalModel.last_active: datetime.now() - timedelta(days=30)},
+            synchronize_session=False,
+        )
+        session.commit()
+
+    global_service = completion_mod.assigned_worker_completion_service
+    monkeypatch.setattr(
+        global_service,
+        "_detect_live_status",
+        lambda _record: TerminalStatus.COMPLETED,
+    )
+    monkeypatch.setattr(
+        global_service,
+        "_capture_final_result",
+        lambda _worker: (_ for _ in ()).throw(RuntimeError("transcript capture unavailable")),
+    )
+    monkeypatch.setattr(cleanup_mod, "SessionLocal", db.SessionLocal)
+    monkeypatch.setattr(cleanup_mod, "RETENTION_DAYS", 7)
+    terminal_log_dir = tmp_path / "terminal-logs"
+    terminal_log_dir.mkdir()
+    protected_paths = [
+        terminal_log_dir / f"{worker}.log",
+        terminal_log_dir / f"{worker}.scrollback",
+        terminal_log_dir / f"{worker}.snapshot.json",
+    ]
+    unrelated_path = terminal_log_dir / "deadbeef.log"
+    old_timestamp = (datetime.now() - timedelta(days=30)).timestamp()
+    for path in (*protected_paths, unrelated_path):
+        path.write_text("synthetic recovery evidence", encoding="utf-8")
+        os.utime(path, (old_timestamp, old_timestamp))
+    monkeypatch.setattr(cleanup_mod, "TERMINAL_LOG_DIR", terminal_log_dir)
+    monkeypatch.setattr(cleanup_mod, "LOG_DIR", tmp_path / "no-server-logs")
+
+    cleanup_mod.cleanup_old_data()
+
+    assert db.get_terminal_metadata(worker) is not None
+    record = db.get_assigned_worker_callback(worker)
+    assert record is not None
+    assert record.lifecycle == AssignmentLifecycle.DISPATCHED
+    assert record.delivery_state == CompletionDeliveryState.RETRYABLE
+    assert record.final_result is None
+    assert "capture failed" in (record.last_error or "").lower()
+    assert all(path.exists() for path in protected_paths)
+    assert not unrelated_path.exists()
+
+
+def test_missing_backend_provider_deferral_still_classifies_worker_failure(
+    callback_db, ids, monkeypatch
+):
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    _assignment(worker, caller)
+    monkeypatch.setattr(terminal_mod, "get_herdr_inbox_service", lambda: None)
+    monkeypatch.setattr(terminal_mod.fifo_manager, "stop_reader", lambda _terminal: None)
+    monkeypatch.setattr(terminal_mod.status_monitor, "clear_terminal", lambda _terminal: None)
+    monkeypatch.setattr(
+        terminal_mod.provider_manager,
+        "cleanup_provider",
+        lambda _terminal: False,
+    )
+
+    assert (
+        terminal_mod.delete_missing_terminal(
+            worker,
+            "synthetic positive proof that the backend pane is absent",
+        )
+        is False
+    )
+
+    assert db.get_terminal_metadata(worker) is not None
+    record = db.get_assigned_worker_callback(worker)
+    assert record is not None
+    assert record.lifecycle == AssignmentLifecycle.FAILED
+    assert record.delivery_state == CompletionDeliveryState.TERMINAL_ERROR
+    assert record.final_result is None
+    assert record.last_error == "synthetic positive proof that the backend pane is absent"
 
 
 def test_retryable_enqueue_failure_retries_once_without_duplicate(callback_db, ids, monkeypatch):
@@ -599,6 +802,12 @@ def test_report_integrity_and_manual_recovery_outlive_both_terminals(callback_db
     service = _service(monkeypatch, report)
     service.handle_status_event(worker, TerminalStatus.COMPLETED)
 
+    delivered = db.get_assigned_worker_callback(worker)
+    assert delivered is not None and delivered.inbox_message_id is not None
+    claim_token = "genuinely-delivered-before-delete"
+    assert db.claim_inbox_message(delivered.inbox_message_id, claim_token) is not None
+    assert db.resolve_inbox_claim(delivered.inbox_message_id, claim_token, MessageStatus.DELIVERED)
+
     db.delete_terminal(worker)
     db.delete_terminal(caller)
 
@@ -608,6 +817,140 @@ def test_report_integrity_and_manual_recovery_outlive_both_terminals(callback_db
     assert retained.final_result_sha256 == hashlib.sha256(report.encode("utf-8")).hexdigest()
     assert retained.result_reference == f"assigned-worker-callback:{retained.assignment_id}"
     assert retained.delivery_state == CompletionDeliveryState.ACKNOWLEDGED
+    assert retained.receiver_state == CompletionReceiverState.DELETED
+
+
+def test_queued_callback_becomes_deleted_receiver_manual_recovery(callback_db, ids, monkeypatch):
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    _assignment(worker, caller)
+    service = _service(monkeypatch, "retain this queued report")
+    service.handle_status_event(worker, TerminalStatus.COMPLETED)
+
+    queued = db.get_assigned_worker_callback(worker)
+    assert queued is not None and queued.inbox_message_id is not None
+    assert _messages(caller)[0].status == MessageStatus.PENDING
+
+    assert db.delete_terminal(caller) is True
+
+    retained = db.get_assigned_worker_callback(worker)
+    assert retained is not None
+    assert retained.delivery_state == CompletionDeliveryState.TERMINAL_ERROR
+    assert retained.receiver_state == CompletionReceiverState.DELETED
+    assert retained.final_result == "retain this queued report"
+    assert _messages(caller)[0].status == MessageStatus.FAILED
+
+
+def test_server_wins_then_equivalent_explicit_send_returns_same_callback_row(
+    callback_db, ids, monkeypatch
+):
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    _assignment(worker, caller)
+    service = _service(monkeypatch, "same final")
+    service.handle_status_event(worker, TerminalStatus.COMPLETED)
+    server = _messages(caller)[0]
+
+    explicit_result = db.create_inbox_message(
+        worker,
+        caller,
+        "same final\n\n"
+        f"[Message from terminal {worker}. Use send_message MCP tool for any follow-up work.]",
+        origin=InboxMessageOrigin.EXPLICIT,
+    )
+
+    assert explicit_result.id == server.id
+    assert [message.id for message in _messages(caller)] == [server.id]
+    assert server.origin == InboxMessageOrigin.SERVER_COMPLETION
+
+
+def test_concurrent_explicit_final_and_server_insert_commit_one_callback(
+    callback_db, ids, monkeypatch
+):
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    assignment = _assignment(worker, caller)
+    report = "same final"
+    captured = db.capture_assigned_worker_completion(
+        worker,
+        report,
+        hashlib.sha256(report.encode()).hexdigest(),
+        f"assigned-worker-callback:{assignment.assignment_id}",
+    )
+    assert captured is not None
+    gate = Barrier(2)
+
+    def explicit_send():
+        gate.wait(timeout=2)
+        return db.create_inbox_message(
+            worker,
+            caller,
+            report
+            + f"\n\n[Message from terminal {worker}. Use send_message MCP tool for any follow-up work.]",
+            origin=InboxMessageOrigin.EXPLICIT,
+        )
+
+    def server_send():
+        gate.wait(timeout=2)
+        return db.create_inbox_message(
+            worker,
+            caller,
+            AssignedWorkerCompletionService._format_callback_message(captured),
+            origin=InboxMessageOrigin.SERVER_COMPLETION,
+            assignment_id=assignment.assignment_id,
+            idempotency_key=f"assigned-worker-completion:{assignment.completion_id}",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        explicit_future = executor.submit(explicit_send)
+        server_future = executor.submit(server_send)
+        explicit_row = explicit_future.result(timeout=5)
+        server_row = server_future.result(timeout=5)
+
+    assert explicit_row.id == server_row.id
+    assert len(_messages(caller)) == 1
+    linked = db.get_assigned_worker_callback(worker)
+    assert linked is not None and linked.inbox_message_id == explicit_row.id
+
+
+def test_concurrent_non_equivalent_explicit_message_is_never_suppressed(callback_db, ids):
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    assignment = _assignment(worker, caller)
+    report = "final report"
+    captured = db.capture_assigned_worker_completion(
+        worker,
+        report,
+        hashlib.sha256(report.encode()).hexdigest(),
+        f"assigned-worker-callback:{assignment.assignment_id}",
+    )
+    assert captured is not None
+    gate = Barrier(2)
+
+    def create_explicit():
+        gate.wait(timeout=2)
+        return db.create_inbox_message(
+            worker,
+            caller,
+            "unrelated intermediate progress",
+            origin=InboxMessageOrigin.EXPLICIT,
+        )
+
+    def create_server():
+        gate.wait(timeout=2)
+        return db.create_inbox_message(
+            worker,
+            caller,
+            AssignedWorkerCompletionService._format_callback_message(captured),
+            origin=InboxMessageOrigin.SERVER_COMPLETION,
+            assignment_id=assignment.assignment_id,
+            idempotency_key=f"assigned-worker-completion:{assignment.completion_id}",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        rows = [executor.submit(create_explicit), executor.submit(create_server)]
+        [future.result(timeout=5) for future in rows]
+    assert len(_messages(caller)) == 2
 
 
 @pytest.mark.asyncio

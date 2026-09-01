@@ -7,6 +7,9 @@ therefore immutable, independently generated identifiers persisted at assignment
 creation time.
 """
 
+import hashlib
+import json
+import re
 from datetime import datetime
 from enum import Enum
 from typing import Optional
@@ -22,6 +25,7 @@ class AssignmentLifecycle(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    UNRESOLVED = "unresolved"
 
 
 class CompletionDeliveryState(str, Enum):
@@ -34,6 +38,7 @@ class CompletionDeliveryState(str, Enum):
     ACKNOWLEDGED = "acknowledged"
     SUPPRESSED_EXPLICIT = "suppressed_explicit"
     RETRYABLE = "retryable"
+    MANUAL_RECOVERY = "manual_recovery"
     TERMINAL_ERROR = "terminal_error"
 
 
@@ -55,6 +60,7 @@ class AssignedWorkerCallback(BaseModel):
     completion_id: str = Field(..., description="Immutable completion identity")
     worker_terminal_id: str
     caller_id: str
+    routing_digest: str = Field(..., description="Immutable digest of the persisted route")
     lifecycle: AssignmentLifecycle
     delivery_state: CompletionDeliveryState
     receiver_state: CompletionReceiverState
@@ -73,3 +79,61 @@ class AssignedWorkerCallback(BaseModel):
     acknowledged_at: Optional[datetime] = None
     terminal_error_at: Optional[datetime] = None
     last_error: Optional[str] = None
+
+
+class AssignedWorkerIntegrityError(ValueError):
+    """Raised when durable callback state fails integrity validation."""
+
+
+_EXPLICIT_SENDER_SUFFIX_RE = re.compile(
+    r"\n\n\[Message from terminal [a-f0-9]{8}\. "
+    r"Use send_message MCP tool for any follow-up work\.\]\s*$"
+)
+
+
+def callback_routing_digest(
+    assignment_id: str,
+    completion_id: str,
+    worker_terminal_id: str,
+    caller_id: str,
+) -> str:
+    """Return the deterministic digest anchoring immutable callback routing.
+
+    A canonical JSON object avoids delimiter ambiguity.  SQLite update triggers
+    prevent any of these values (including the digest) from changing after the
+    assignment row is created; read validation independently recomputes it.
+    """
+    payload = json.dumps(
+        {
+            "assignment_id": assignment_id,
+            "caller_id": caller_id,
+            "completion_id": completion_id,
+            "worker_terminal_id": worker_terminal_id,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def canonical_callback_text(value: str) -> str:
+    """Canonicalize only CAO's exact explicit-message transport suffix."""
+    value = value.replace("\r\n", "\n").replace("\r", "\n")
+    value = _EXPLICIT_SENDER_SUFFIX_RE.sub("", value)
+    return "\n".join(line.rstrip() for line in value.strip().split("\n"))
+
+
+def format_server_completion_message(
+    final_result: str,
+    worker_terminal_id: str,
+    assignment_id: str,
+    completion_id: str,
+) -> str:
+    """Build the stable server callback payload used for evidence validation."""
+    return (
+        f"{final_result}\n\n"
+        "[Server-generated assigned-worker completion callback: "
+        f"worker={worker_terminal_id}; assignment={assignment_id}; "
+        f"completion={completion_id}]"
+    )

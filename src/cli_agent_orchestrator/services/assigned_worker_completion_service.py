@@ -24,20 +24,20 @@ from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
     get_assigned_worker_callback,
     get_terminal_metadata,
-    list_explicit_callback_candidates,
+    list_protected_assigned_worker_callbacks,
     list_reconcilable_assigned_worker_callbacks,
     mark_assigned_worker_dispatched,
-    mark_completion_enqueued,
+    mark_assignment_manual_recovery,
     mark_completion_retryable,
     mark_completion_terminal_error,
     record_completion_delivery_attempt,
-    suppress_completion_for_explicit_callback,
 )
 from cli_agent_orchestrator.models.assigned_worker import (
     AssignedWorkerCallback,
     AssignmentLifecycle,
     CompletionDeliveryState,
     CompletionReceiverState,
+    format_server_completion_message,
 )
 from cli_agent_orchestrator.models.inbox import InboxMessageOrigin
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -50,31 +50,14 @@ from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 logger = logging.getLogger(__name__)
 
 _TERMINAL_ID_RE = re.compile(r"^[a-f0-9]{8}$")
-_EXPLICIT_SENDER_SUFFIX_RE = re.compile(
-    r"\n\n\[Message from terminal [a-f0-9]{8}\. "
-    r"Use send_message MCP tool for any follow-up work\.\]\s*$"
-)
 _DELIVERY_TERMINAL_STATES = frozenset(
     {
         CompletionDeliveryState.ACKNOWLEDGED,
         CompletionDeliveryState.SUPPRESSED_EXPLICIT,
+        CompletionDeliveryState.MANUAL_RECOVERY,
         CompletionDeliveryState.TERMINAL_ERROR,
     }
 )
-
-
-def _canonical_callback_text(value: str) -> str:
-    """Canonicalize only transport-added syntax for conservative equivalence.
-
-    No fuzzy/semantic comparison is used: an unrelated progress message must
-    never suppress the real final callback merely because it shares words with
-    the report.  We remove the exact MCP sender suffix, normalize line endings,
-    trim trailing horizontal whitespace, and otherwise require byte-equivalent
-    content.
-    """
-    value = value.replace("\r\n", "\n").replace("\r", "\n")
-    value = _EXPLICIT_SENDER_SUFFIX_RE.sub("", value)
-    return "\n".join(line.rstrip() for line in value.strip().split("\n"))
 
 
 class AssignedWorkerCompletionService:
@@ -322,22 +305,24 @@ class AssignedWorkerCompletionService:
             )
             return
 
+        # V1 correction writes enqueue+link+ack atomically, but rows committed
+        # by the earlier phased implementation may still be ENQUEUED after a
+        # crash. Verify and acknowledge that exact immutable link; do not create
+        # or paste a second row.
+        if (
+            record.delivery_state == CompletionDeliveryState.ENQUEUED
+            and record.inbox_message_id is not None
+        ):
+            acknowledged = acknowledge_completion_enqueued(
+                record.assignment_id, record.inbox_message_id
+            )
+            if acknowledged is not None:
+                self._attempt_immediate_inbox_delivery(record.caller_id)
+            return
+
         attempted = record_completion_delivery_attempt(record.assignment_id, receiver_state)
         if attempted is None or attempted.delivery_state in _DELIVERY_TERMINAL_STATES:
             return
-
-        final_canonical = _canonical_callback_text(record.final_result)
-        for candidate in list_explicit_callback_candidates(record.assignment_id):
-            if _canonical_callback_text(candidate.message) == final_canonical:
-                suppress_completion_for_explicit_callback(
-                    record.assignment_id, candidate.id, receiver_state
-                )
-                logger.info(
-                    "Suppressed server completion %s: equivalent explicit callback row %s exists",
-                    record.completion_id,
-                    candidate.id,
-                )
-                return
 
         callback_message = self._format_callback_message(record)
         idempotency_key = f"assigned-worker-completion:{record.completion_id}"
@@ -350,17 +335,11 @@ class AssignedWorkerCompletionService:
                 assignment_id=record.assignment_id,
                 idempotency_key=idempotency_key,
             )
-            # Tests and fault-injection harnesses can interrupt at either durable
-            # boundary.  The default hook is a no-op and production behavior is
-            # unchanged.
-            self._phase_checkpoint("inbox_committed", record, inbox_message.id)
-            linked = mark_completion_enqueued(
-                record.assignment_id, inbox_message.id, receiver_state
-            )
-            if linked is None:
-                return
-            self._phase_checkpoint("callback_linked", linked, inbox_message.id)
-            acknowledged = acknowledge_completion_enqueued(record.assignment_id, inbox_message.id)
+            # Equivalence selection, inbox insert, callback link, and durable
+            # acknowledgement now share one SQLite write transaction.  There is
+            # no enqueue/link gap for an explicit sender to race into.
+            self._phase_checkpoint("callback_committed", record, inbox_message.id)
+            acknowledged = get_assigned_worker_callback(record.worker_terminal_id)
         except Exception as exc:
             logger.warning(
                 "Completion enqueue for assignment %s is retryable: %s",
@@ -374,12 +353,16 @@ class AssignedWorkerCompletionService:
             )
             return
 
-        if acknowledged is not None:
+        if acknowledged is not None and acknowledged.delivery_state in (
+            CompletionDeliveryState.ACKNOWLEDGED,
+            CompletionDeliveryState.SUPPRESSED_EXPLICIT,
+        ):
             logger.info(
-                "Acknowledged assigned-worker completion %s as inbox row %s for caller %s",
+                "Committed assigned-worker completion %s as inbox row %s for caller %s (%s)",
                 record.completion_id,
                 inbox_message.id,
                 record.caller_id,
+                acknowledged.delivery_state.value,
             )
             self._attempt_immediate_inbox_delivery(record.caller_id)
 
@@ -393,11 +376,11 @@ class AssignedWorkerCompletionService:
     @staticmethod
     def _format_callback_message(record: AssignedWorkerCallback) -> str:
         """Build the server-generated callback while preserving the report verbatim."""
-        return (
-            f"{record.final_result}\n\n"
-            "[Server-generated assigned-worker completion callback: "
-            f"worker={record.worker_terminal_id}; assignment={record.assignment_id}; "
-            f"completion={record.completion_id}]"
+        return format_server_completion_message(
+            record.final_result or "",
+            record.worker_terminal_id,
+            record.assignment_id,
+            record.completion_id,
         )
 
     def _attempt_immediate_inbox_delivery(self, caller_id: str) -> None:
@@ -428,17 +411,28 @@ class AssignedWorkerCompletionService:
                 return
 
             status = self._detect_live_status(record)
-            # After a process restart, PROCESSING/COMPLETED proves the initial
-            # assigned input was accepted even if the dispatch-state commit was
-            # the interrupted operation.
-            if record.lifecycle == AssignmentLifecycle.ASSIGNED and status in (
-                TerminalStatus.PROCESSING,
-                TerminalStatus.COMPLETED,
-                TerminalStatus.ERROR,
-            ):
-                updated = mark_assigned_worker_dispatched(worker_terminal_id)
-                if updated is not None:
-                    record = updated
+            # Provider state after restart is not proof that the assigned prompt
+            # was accepted: startup chrome or a stale previous turn can also be
+            # PROCESSING/COMPLETED.  Only mark_dispatched_and_reconcile(), called
+            # after the real input send returns, may open the completion gate.
+            if record.lifecycle == AssignmentLifecycle.ASSIGNED:
+                if status == TerminalStatus.ERROR:
+                    self.record_worker_failure(
+                        worker_terminal_id,
+                        "Unproven assigned worker reached terminal ERROR after restart",
+                    )
+                elif status in (
+                    TerminalStatus.PROCESSING,
+                    TerminalStatus.COMPLETED,
+                ):
+                    mark_assignment_manual_recovery(
+                        record.assignment_id,
+                        "Restart observed live worker state without durable dispatch proof; "
+                        "terminal retained for manual recovery",
+                    )
+                return
+            if record.lifecycle == AssignmentLifecycle.UNRESOLVED:
+                return
             if status in (TerminalStatus.COMPLETED, TerminalStatus.ERROR):
                 self._handle_status_locked(record, status)
 
@@ -463,7 +457,7 @@ class AssignedWorkerCompletionService:
         the server starts accepting or delivering terminal input.
         """
         try:
-            records = list_reconcilable_assigned_worker_callbacks()
+            records = list_protected_assigned_worker_callbacks()
         except OperationalError as exc:
             # Some embedded/test hosts intentionally replace init_db with a
             # partial bootstrap.  A missing callback table means there are no
@@ -519,21 +513,41 @@ class AssignedWorkerCompletionService:
             if record.lifecycle == AssignmentLifecycle.COMPLETED:
                 self._drive_delivery(record)
                 return True
-            if record.lifecycle in (AssignmentLifecycle.FAILED, AssignmentLifecycle.CANCELLED):
+            if record.lifecycle in (
+                AssignmentLifecycle.FAILED,
+                AssignmentLifecycle.CANCELLED,
+            ):
                 return True
 
+            if record.lifecycle == AssignmentLifecycle.UNRESOLVED:
+                return False
+
             status = self._detect_live_status(record)
-            if (
-                record.lifecycle == AssignmentLifecycle.ASSIGNED
-                and status == TerminalStatus.COMPLETED
-            ):
-                updated = mark_assigned_worker_dispatched(worker_terminal_id)
-                if updated is not None:
-                    record = updated
+            if record.lifecycle == AssignmentLifecycle.ASSIGNED:
+                if status == TerminalStatus.ERROR:
+                    self.record_worker_failure(
+                        worker_terminal_id,
+                        "Unproven assigned worker reached ERROR before retirement",
+                    )
+                    return True
+                mark_assignment_manual_recovery(
+                    record.assignment_id,
+                    "Retirement requested without durable dispatch proof; terminal retained "
+                    "for manual recovery",
+                )
+                return False
             if status == TerminalStatus.COMPLETED:
                 self._handle_status_locked(record, status)
                 updated = get_assigned_worker_callback(worker_terminal_id)
                 return bool(updated and updated.lifecycle == AssignmentLifecycle.COMPLETED)
+
+            if status == TerminalStatus.UNKNOWN:
+                mark_completion_retryable(
+                    record.assignment_id,
+                    "Worker outcome is unknown; retirement deferred to preserve recovery handle",
+                    CompletionReceiverState.UNKNOWN,
+                )
+                return False
 
             lifecycle = (
                 AssignmentLifecycle.FAILED

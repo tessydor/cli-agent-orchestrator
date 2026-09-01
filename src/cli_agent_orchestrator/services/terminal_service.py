@@ -402,7 +402,14 @@ async def create_terminal(
                 extra_env=env_vars,
             )
             session_created = True  # only set after successful creation
-            delete_terminals_by_session(session_name)
+            delete_terminals_by_session(
+                session_name,
+                missing_backend=True,
+                reason=(
+                    "Stale terminal row belonged to a backend session that was absent before "
+                    "same-name session creation"
+                ),
+            )
 
             # Persist forwarded env only after the tmux session actually
             # exists; the failure path below clears it if a later step
@@ -1679,6 +1686,67 @@ def read_output_range(terminal_id: str, offset: int, length: int) -> str:
         raise
 
     return data.decode("utf-8", errors="replace")
+
+
+def delete_missing_terminal(
+    terminal_id: str,
+    reason: str,
+    registry: PluginRegistry | None = None,
+) -> bool:
+    """Retire a DB terminal after its backend pane is positively known missing.
+
+    This is the only bypass for a report handle that cannot physically be
+    retained.  The database transaction records an explicit FAILED/manual audit
+    before deleting the stale terminal row; it never fabricates success.
+    """
+    metadata = get_terminal_metadata(terminal_id)
+    if metadata is None:
+        return False
+    # The pane/session is already gone, so no later transcript capture is
+    # possible.  Persist that true failure before any provider cleanup that may
+    # defer and retain the terminal row.  This prevents an uncaptured assignment
+    # from dangling indefinitely merely because a private provider home is busy.
+    from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+        assigned_worker_completion_service,
+    )
+
+    assigned_worker_completion_service.record_worker_failure(terminal_id, reason)
+    svc = get_herdr_inbox_service()
+    if svc:
+        try:
+            svc.unregister_terminal(terminal_id)
+        except Exception:
+            logger.warning("Failed to unregister missing terminal %s", terminal_id, exc_info=True)
+    try:
+        fifo_manager.stop_reader(terminal_id)
+    except Exception:
+        logger.warning("Failed to stop FIFO for missing terminal %s", terminal_id, exc_info=True)
+    try:
+        status_monitor.clear_terminal(terminal_id)
+    except Exception:
+        logger.warning("Failed to clear status for missing terminal %s", terminal_id, exc_info=True)
+    if provider_manager.cleanup_provider(terminal_id) is False:
+        logger.warning(
+            "Missing terminal %s provider cleanup deferred; retaining DB recovery row",
+            terminal_id,
+        )
+        return False
+    deleted = db_delete_terminal(
+        terminal_id,
+        missing_backend=True,
+        reason=reason,
+    )
+    if deleted:
+        dispatch_plugin_event(
+            registry,
+            "post_kill_terminal",
+            PostKillTerminalEvent(
+                session_id=metadata["tmux_session"],
+                terminal_id=terminal_id,
+                agent_name=metadata.get("agent_profile"),
+            ),
+        )
+    return deleted
 
 
 def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) -> bool:

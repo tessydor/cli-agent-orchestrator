@@ -18,6 +18,7 @@ class MessageStatus(str, Enum):
     """Message status enumeration."""
 
     PENDING = "pending"
+    DELIVERING = "delivering"
     DELIVERED = "delivered"
     FAILED = "failed"
 
@@ -48,4 +49,10 @@ class InboxMessage(BaseModel):
     )
     idempotency_key: str | None = Field(
         None, description="Server-side deduplication key for idempotent producers"
+    )
+    claim_token: str | None = Field(
+        None, description="Opaque token held by the one durable delivery claimant"
+    )
+    claimed_at: datetime | None = Field(
+        None, description="Timestamp of the current or most recent delivery claim"
     )

@@ -81,6 +81,7 @@ from cli_agent_orchestrator.graph.providers import GraphProvider, get_provider
 # Import the sinks package for its import-time @register_sink side effects
 # ("okf", "obsidian", "graphml"); get_sink resolves by name from the registry.
 from cli_agent_orchestrator.graph.sinks import get_sink
+from cli_agent_orchestrator.models.assigned_worker import AssignedWorkerIntegrityError
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import (
     InboxMessageOrigin,
@@ -5543,7 +5544,16 @@ async def get_assigned_worker_completion_callback_endpoint(
     It is read-scoped because the final report can contain the same sensitive
     material as terminal output.
     """
-    record = await asyncio.to_thread(get_assigned_worker_callback, worker_terminal_id)
+    try:
+        record = await asyncio.to_thread(get_assigned_worker_callback, worker_terminal_id)
+    except AssignedWorkerIntegrityError as exc:
+        # Never serialize a report or route whose durable evidence failed
+        # validation.  The detail identifies the assignment but does not expose
+        # the potentially tampered report bytes.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
     if record is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -5568,6 +5578,8 @@ async def create_inbox_message_endpoint(
             message,
             origin=InboxMessageOrigin.EXPLICIT,
         )
+    except AssignedWorkerIntegrityError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -5645,6 +5657,8 @@ async def get_inbox_messages_endpoint(
     except HTTPException:
         # Re-raise HTTPException (validation errors)
         raise
+    except AssignedWorkerIntegrityError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
