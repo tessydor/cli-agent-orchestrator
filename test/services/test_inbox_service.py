@@ -8,12 +8,22 @@ import pytest
 
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.constants import INBOX_RECONCILE_GRACE_SECONDS
-from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
+from cli_agent_orchestrator.models.inbox import (
+    InboxMessage,
+    InboxMessageOrigin,
+    MessageStatus,
+)
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.inbox_service import InboxService
 
 
-def _make_message(id=1, receiver_id="term-1", message="hello", status=MessageStatus.PENDING):
+def _make_message(
+    id=1,
+    receiver_id="term-1",
+    message="hello",
+    status=MessageStatus.PENDING,
+    **kwargs,
+):
     return InboxMessage(
         id=id,
         sender_id="sender-1",
@@ -21,6 +31,7 @@ def _make_message(id=1, receiver_id="term-1", message="hello", status=MessageSta
         message=message,
         status=status,
         created_at=datetime.now(),
+        **kwargs,
     )
 
 
@@ -56,6 +67,32 @@ class TestDeliverPending:
 
         mock_term_svc.send_input.assert_called_once_with("term-1", "hello")
         mock_update.assert_called_once_with(1, MessageStatus.DELIVERED)
+
+    @patch(
+        "cli_agent_orchestrator.services.assigned_worker_completion_service."
+        "assigned_worker_completion_service.wait_for_capture_before_input",
+        return_value=False,
+    )
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_completed_assigned_worker_waits_for_durable_report_capture(
+        self,
+        mock_get,
+        mock_monitor,
+        mock_term_svc,
+        mock_update,
+        mock_wait_for_capture,
+    ):
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.COMPLETED
+
+        InboxService().deliver_pending("term-1")
+
+        mock_wait_for_capture.assert_called_once_with("term-1")
+        mock_term_svc.send_input.assert_not_called()
+        mock_update.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
@@ -157,6 +194,36 @@ class TestDeliverPending:
             ]
         )
         assert mock_update.call_count == 2
+
+    @pytest.mark.parametrize(
+        "origin",
+        [InboxMessageOrigin.SERVER_COMPLETION, InboxMessageOrigin.EXPLICIT],
+    )
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_assigned_callback_send_error_remains_pending_for_retry(
+        self,
+        mock_get,
+        mock_monitor,
+        mock_term_svc,
+        mock_update,
+        origin,
+    ):
+        mock_get.return_value = [_make_message(origin=origin, assignment_id="assignment-one")]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_term_svc.send_input.side_effect = RuntimeError("backend temporarily unavailable")
+
+        InboxService().deliver_pending("term-1")
+
+        mock_update.assert_has_calls(
+            [
+                call(1, MessageStatus.DELIVERED),
+                call(1, MessageStatus.PENDING),
+            ]
+        )
+        assert call(1, MessageStatus.FAILED) not in mock_update.call_args_list
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")

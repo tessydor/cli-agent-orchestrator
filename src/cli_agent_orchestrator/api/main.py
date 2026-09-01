@@ -44,6 +44,7 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.cli.commands.init import seed_default_skills
 from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
+    get_assigned_worker_callback,
     get_inbox_messages,
     get_terminal_metadata,
     init_db,
@@ -81,7 +82,11 @@ from cli_agent_orchestrator.graph.providers import GraphProvider, get_provider
 # ("okf", "obsidian", "graphml"); get_sink resolves by name from the registry.
 from cli_agent_orchestrator.graph.sinks import get_sink
 from cli_agent_orchestrator.models.flow import Flow
-from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
+from cli_agent_orchestrator.models.inbox import (
+    InboxMessageOrigin,
+    MessageStatus,
+    OrchestrationType,
+)
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.memory import (
     MemoryKey,
@@ -114,6 +119,9 @@ from cli_agent_orchestrator.services import (
     terminal_service,
 )
 from cli_agent_orchestrator.services.agent_step import StepExecutionError, run_agent_step
+from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+    assigned_worker_completion_service,
+)
 from cli_agent_orchestrator.services.cleanup_service import (
     cleanup_expired_memories,
     cleanup_old_data,
@@ -211,6 +219,7 @@ async def inbox_reconciliation_daemon(registry: PluginRegistry) -> None:
         await asyncio.sleep(INBOX_RECONCILE_INTERVAL)
         try:
             await asyncio.to_thread(inbox_service.reconcile_orphaned_messages, registry)
+            await asyncio.to_thread(assigned_worker_completion_service.reconcile_pending)
         except Exception:
             logger.exception("Inbox reconciliation daemon error")
 
@@ -1077,6 +1086,11 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("OTel telemetry init failed; continuing", exc_info=True)
     init_db()
+    # Prime unfinished assigned-worker capture barriers before any status or
+    # inbox consumer starts.  Without this synchronous restart step, a cached
+    # COMPLETED event could race ahead of background reconciliation and allow
+    # queued input to replace the only extractable final report.
+    assigned_worker_completion_service.register_persisted_assignments()
     _seed_default_skills_at_startup()
     _reconcile_memory_at_startup()
     registry = PluginRegistry()
@@ -1104,7 +1118,16 @@ async def lifespan(app: FastAPI):
     status_monitor_task = asyncio.create_task(status_monitor.run())
     log_writer_task = asyncio.create_task(log_writer.run())
     inbox_service_task = asyncio.create_task(inbox_service.run(registry))
-    logger.info("Event bus consumers started (StatusMonitor, LogWriter, InboxService)")
+    assigned_completion_task = asyncio.create_task(assigned_worker_completion_service.run(registry))
+    # Crash recovery is server-owned.  It starts once per process and does not
+    # require (or generate) any supervisor status/inbox polling.
+    assigned_completion_reconcile_task = asyncio.create_task(
+        asyncio.to_thread(assigned_worker_completion_service.reconcile_pending)
+    )
+    logger.info(
+        "Event bus consumers started (StatusMonitor, LogWriter, InboxService, "
+        "AssignedWorkerCompletionService)"
+    )
 
     # Start ApprovalBridge when AG-UI surface is enabled
     approval_bridge_task: Optional[asyncio.Task] = None
@@ -1174,6 +1197,8 @@ async def lifespan(app: FastAPI):
     status_monitor_task.cancel()
     log_writer_task.cancel()
     inbox_service_task.cancel()
+    assigned_completion_task.cancel()
+    assigned_completion_reconcile_task.cancel()
     # Cancel approval bridge on shutdown
     if approval_bridge_task is not None:
         approval_bridge_task.cancel()
@@ -1189,6 +1214,8 @@ async def lifespan(app: FastAPI):
             status_monitor_task,
             log_writer_task,
             inbox_service_task,
+            assigned_completion_task,
+            assigned_completion_reconcile_task,
             daemon_task,
             return_exceptions=True,
         )
@@ -5488,8 +5515,8 @@ async def delete_terminal(
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=(
-                    f"cleanup deferred for terminal '{terminal_id}'; "
-                    "retry delete after residual Grok processes exit"
+                    f"cleanup deferred for terminal '{terminal_id}'; retry after "
+                    "the retained completion report or provider cleanup can be confirmed"
                 ),
             )
         return {"success": True}
@@ -5502,6 +5529,27 @@ async def delete_terminal(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to delete terminal: {str(e)}",
         )
+
+
+@app.get("/assigned-workers/{worker_terminal_id}/completion-callback")
+async def get_assigned_worker_completion_callback_endpoint(
+    worker_terminal_id: TerminalId,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_ADMIN)),
+) -> Dict:
+    """Read a retained assigned-worker report and its delivery audit state.
+
+    The callback row deliberately outlives both terminal rows, so this endpoint
+    remains a manual-recovery path after either the worker or receiver is deleted.
+    It is read-scoped because the final report can contain the same sensitive
+    material as terminal output.
+    """
+    record = await asyncio.to_thread(get_assigned_worker_callback, worker_terminal_id)
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Assigned-worker callback for '{worker_terminal_id}' not found",
+        )
+    return cast(Dict, jsonable_encoder(record.model_dump()))
 
 
 @app.post("/terminals/{receiver_id}/inbox/messages")
@@ -5518,6 +5566,7 @@ async def create_inbox_message_endpoint(
             sender_id,
             receiver_id,
             message,
+            origin=InboxMessageOrigin.EXPLICIT,
         )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))

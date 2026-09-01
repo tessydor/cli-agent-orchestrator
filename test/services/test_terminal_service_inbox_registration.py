@@ -202,10 +202,17 @@ def delete_mocks():
             provider_manager=p("provider_manager"),
             db_delete_terminal=p("db_delete_terminal"),
             dispatch_plugin_event=p("dispatch_plugin_event"),
+            assigned_completion=stack.enter_context(
+                patch(
+                    "cli_agent_orchestrator.services.assigned_worker_completion_service."
+                    "assigned_worker_completion_service"
+                )
+            ),
         )
 
         m.get_terminal_metadata.return_value = None
         m.db_delete_terminal.return_value = True
+        m.assigned_completion.prepare_terminal_retirement.return_value = True
 
         service = MagicMock()
         m.get_herdr_inbox_service.return_value = service

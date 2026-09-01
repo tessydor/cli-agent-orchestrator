@@ -112,15 +112,20 @@ class TestCreateTerminal:
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
 
-        result = await create_terminal(
-            "codex",
-            "developer",
-            new_session=True,
-            defer_init=True,
-            initial_message="Review the current change",
-            initial_message_orchestration_type=OrchestrationType.SEND_MESSAGE,
-            model="gpt-5.1-codex",
-        )
+        with patch(
+            "cli_agent_orchestrator.services.assigned_worker_completion_service."
+            "assigned_worker_completion_service"
+        ) as mock_completion_service:
+            result = await create_terminal(
+                "codex",
+                "developer",
+                new_session=True,
+                caller_id="feedbeef",
+                defer_init=True,
+                initial_message="Review the current change",
+                initial_message_orchestration_type=OrchestrationType.ASSIGN,
+                model="gpt-5.1-codex",
+            )
 
         assert result.status == TerminalStatus.UNKNOWN
         assert mock_provider_manager.create_provider.call_args.kwargs["model"] == ("gpt-5.1-codex")
@@ -129,9 +134,15 @@ class TestCreateTerminal:
             mock_provider,
             "test1234",
             "Review the current change",
-            OrchestrationType.SEND_MESSAGE,
+            OrchestrationType.ASSIGN,
             None,
         )
+        persisted = mock_db_create.call_args.kwargs
+        assert persisted["caller_id"] == "feedbeef"
+        assert len(persisted["assignment_id"]) == 32
+        assert len(persisted["completion_id"]) == 32
+        assert persisted["assignment_id"] != persisted["completion_id"]
+        mock_completion_service.register_assignment.assert_called_once_with("test1234")
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")

@@ -12,6 +12,7 @@ from cli_agent_orchestrator.constants import (
     TERMINAL_GROUP_MAX_ELEMENTS,
     TERMINAL_METADATA_MAX_BYTES,
 )
+from cli_agent_orchestrator.models.inbox import InboxMessageOrigin
 from cli_agent_orchestrator.models.terminal import Terminal
 
 
@@ -564,6 +565,42 @@ class TestDeleteTerminalEndpoint:
             assert "Failed to delete terminal" in response.json()["detail"]
 
 
+class TestAssignedWorkerCompletionCallbackEndpoint:
+    """Manual recovery view for retained completion reports."""
+
+    def test_returns_report_after_terminal_retirement(self, client):
+        record = MagicMock()
+        record.model_dump.return_value = {
+            "assignment_id": "assignment-one",
+            "completion_id": "completion-one",
+            "worker_terminal_id": "abcd1234",
+            "caller_id": "feedbeef",
+            "lifecycle": "completed",
+            "delivery_state": "terminal_error",
+            "receiver_state": "deleted",
+            "final_result": "retained final report",
+            "final_result_sha256": "abc123",
+        }
+        with patch(
+            "cli_agent_orchestrator.api.main.get_assigned_worker_callback",
+            return_value=record,
+        ) as get_callback:
+            response = client.get("/assigned-workers/abcd1234/completion-callback")
+
+        assert response.status_code == 200
+        assert response.json()["final_result"] == "retained final report"
+        get_callback.assert_called_once_with("abcd1234")
+
+    def test_missing_assignment_returns_404(self, client):
+        with patch(
+            "cli_agent_orchestrator.api.main.get_assigned_worker_callback",
+            return_value=None,
+        ):
+            response = client.get("/assigned-workers/abcd1234/completion-callback")
+
+        assert response.status_code == 404
+
+
 class TestCreateInboxMessageEndpoint:
     """Test POST /terminals/{receiver_id}/inbox/messages endpoint."""
 
@@ -595,6 +632,7 @@ class TestCreateInboxMessageEndpoint:
                 "sender1",
                 "abcd1234",
                 "hello",
+                origin=InboxMessageOrigin.EXPLICIT,
             )
             mock_inbox.deliver_pending.assert_called_once_with("abcd1234", registry=ANY)
 

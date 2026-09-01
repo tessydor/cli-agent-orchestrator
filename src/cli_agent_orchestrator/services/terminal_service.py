@@ -23,6 +23,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from datetime import datetime
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
@@ -261,6 +262,8 @@ async def create_terminal(
         TimeoutError: If provider initialization times out
     """
     terminal_id: Optional[str] = None
+    assignment_id: Optional[str] = None
+    completion_id: Optional[str] = None
     session_created = False  # tracks whether THIS call created the tmux session
     # harness-control#186: tracks whether THIS call created a new WINDOW in an
     # already-existing session (the `new_session=False` branch below — what
@@ -334,6 +337,13 @@ async def create_terminal(
 
         # Step 1: Generate unique identifiers
         terminal_id = generate_terminal_id()
+
+        # Assigned workers get durable identities before any task delivery.  The
+        # database insert below commits these in the same transaction as the
+        # terminal row, so a successful assign can never lose its callback route.
+        if initial_message_orchestration_type == OrchestrationType.ASSIGN and caller_id is not None:
+            assignment_id = uuid.uuid4().hex
+            completion_id = uuid.uuid4().hex
 
         if not session_name:
             session_name = generate_session_name()
@@ -440,6 +450,11 @@ async def create_terminal(
 
         # Step 3c: Persist terminal metadata to database after restrictions
         # are resolved so API reads and snapshots report the actual launch policy.
+        callback_identity = (
+            {"assignment_id": assignment_id, "completion_id": completion_id}
+            if assignment_id is not None and completion_id is not None
+            else {}
+        )
         db_create_terminal(
             terminal_id,
             session_name,
@@ -452,7 +467,18 @@ async def create_terminal(
             group=group,
             metadata=metadata,
             working_directory=resolved_working_directory,
+            **callback_identity,
         )
+        if assignment_id is not None:
+            # Register immediately after the atomic terminal/assignment commit.
+            # StatusMonitor can then install a completion-capture barrier before
+            # publishing COMPLETED, preventing a queued inbox turn from replacing
+            # the final response before the server has durably copied it.
+            from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+                assigned_worker_completion_service,
+            )
+
+            assigned_worker_completion_service.register_assignment(terminal_id)
 
         # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
         # backends (tmux). Event-inbox backends (herdr) deliver via their own
@@ -585,6 +611,25 @@ async def create_terminal(
     except Exception as e:
         # Cleanup on failure: clean up FIFO reader, status monitor, provider, and session
         logger.error(f"Failed to create terminal: {e}")
+        if terminal_id is not None and assignment_id is not None:
+            try:
+                from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+                    assigned_worker_completion_service,
+                )
+
+                assigned_worker_completion_service.record_worker_failure(
+                    terminal_id,
+                    f"Assigned worker creation failed: {type(e).__name__}: {e}",
+                )
+            except Exception:
+                # The original creation failure remains authoritative; recovery
+                # can still inspect a callback row left in NOT_READY if this
+                # best-effort terminal-state write itself failed.
+                logger.warning(
+                    "Could not persist assigned-worker creation failure for %s",
+                    terminal_id,
+                    exc_info=True,
+                )
         try:
             if terminal_id is not None:
                 fifo_manager.stop_reader(terminal_id)
@@ -976,6 +1021,19 @@ def _schedule_deferred_init(
                         True,  # delete_worker
                     )
                     return
+
+                # The accepted-task edge is durable and is the gate that keeps
+                # startup/stale COMPLETED chrome from becoming a false callback.
+                # Reconcile immediately after the write to close the race where
+                # a very fast worker completed before DISPATCHED was committed.
+                from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+                    assigned_worker_completion_service,
+                )
+
+                await asyncio.to_thread(
+                    assigned_worker_completion_service.mark_dispatched_and_reconcile,
+                    terminal_id,
+                )
         except TerminalInputBlockedError as e:
             # The worker initialized but is parked on an interactive prompt
             # (WAITING_USER_ANSWER). It is alive and can be driven via
@@ -1626,6 +1684,21 @@ def read_output_range(terminal_id: str, offset: int, length: int) -> str:
 def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) -> bool:
     """Delete terminal and kill its tmux window."""
     try:
+        # Retirement is ordered after successful-completion capture.  A caller
+        # deleting a worker immediately after it finishes must not destroy the
+        # only extractable copy of its final report while the status event is
+        # still queued.  Non-assigned workers are a fast no-op here.
+        from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+            assigned_worker_completion_service,
+        )
+
+        if not assigned_worker_completion_service.prepare_terminal_retirement(terminal_id):
+            logger.warning(
+                "Terminal %s retirement deferred until its completed final report can be captured",
+                terminal_id,
+            )
+            return False
+
         # Unregister from herdr inbox service
         svc = get_herdr_inbox_service()
         if svc:

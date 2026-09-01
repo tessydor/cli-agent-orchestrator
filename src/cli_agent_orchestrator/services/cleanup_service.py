@@ -4,6 +4,8 @@ import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from sqlalchemy import and_, not_
+
 from cli_agent_orchestrator.clients.database import InboxModel, SessionLocal, TerminalModel
 from cli_agent_orchestrator.constants import (
     LOG_DIR,
@@ -11,6 +13,7 @@ from cli_agent_orchestrator.constants import (
     RETENTION_DAYS,
     TERMINAL_LOG_DIR,
 )
+from cli_agent_orchestrator.models.inbox import InboxMessageOrigin, MessageStatus
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
@@ -60,8 +63,31 @@ def cleanup_old_data():
 
         # Clean up old inbox messages
         with SessionLocal() as db:
+            # A pending assigned-worker callback is a durable delivery promise,
+            # including an equivalent explicit final callback selected for
+            # suppression.  Retention must not delete it while a retained but
+            # temporarily unreachable receiver may still recover.  Once the row
+            # is DELIVERED (or otherwise leaves PENDING), normal age retention
+            # applies; the full final report remains in callback storage.
+            protected_callback = and_(
+                InboxModel.status == MessageStatus.PENDING.value,
+                InboxModel.assignment_id.isnot(None),
+                InboxModel.origin.in_(
+                    (
+                        InboxMessageOrigin.EXPLICIT.value,
+                        InboxMessageOrigin.SERVER_COMPLETION.value,
+                    )
+                ),
+            )
             deleted_messages = (
-                db.query(InboxModel).filter(InboxModel.created_at < cutoff_date).delete()
+                db.query(InboxModel)
+                .filter(
+                    and_(
+                        InboxModel.created_at < cutoff_date,
+                        not_(protected_callback),
+                    )
+                )
+                .delete(synchronize_session=False)
             )
             db.commit()
             logger.info(f"Deleted {deleted_messages} old inbox messages from database")

@@ -1,0 +1,642 @@
+"""Regression and state-machine tests for assigned-worker completion callbacks."""
+
+import asyncio
+import hashlib
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
+from itertools import count
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from cli_agent_orchestrator.clients import database as db
+from cli_agent_orchestrator.models.assigned_worker import (
+    AssignmentLifecycle,
+    CompletionDeliveryState,
+    CompletionReceiverState,
+)
+from cli_agent_orchestrator.models.inbox import InboxMessageOrigin, MessageStatus
+from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.services import assigned_worker_completion_service as completion_mod
+from cli_agent_orchestrator.services import cleanup_service as cleanup_mod
+from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+    AssignedWorkerCompletionService,
+)
+from cli_agent_orchestrator.services.event_bus import EventBus
+
+
+@pytest.fixture
+def callback_db(tmp_path, monkeypatch):
+    """Use a file-backed SQLite database so restart tests cross sessions."""
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'callbacks.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    db.Base.metadata.create_all(bind=engine)
+    sessions = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    monkeypatch.setattr(db, "SessionLocal", sessions)
+    try:
+        yield
+    finally:
+        engine.dispose()
+
+
+@pytest.fixture
+def ids():
+    """Generate valid, deterministic-looking terminal IDs without collisions."""
+    values = count(1)
+
+    def _next() -> str:
+        return f"{next(values):08x}"
+
+    return _next
+
+
+def _terminal(terminal_id: str) -> None:
+    db.create_terminal(terminal_id, "cao-test", f"window-{terminal_id}", "mock_cli")
+
+
+def _assignment(worker_id: str, caller_id: str, sequence: int = 1):
+    """Create an atomic terminal+assignment record and mark its task accepted."""
+    db.create_terminal(
+        worker_id,
+        "cao-test",
+        f"window-{worker_id}",
+        "mock_cli",
+        caller_id=caller_id,
+        assignment_id=f"assignment-{sequence:04d}",
+        completion_id=f"completion-{sequence:04d}",
+    )
+    record = db.mark_assigned_worker_dispatched(worker_id)
+    assert record is not None
+    return record
+
+
+def _service(monkeypatch, report: str = "final report") -> AssignedWorkerCompletionService:
+    """Build a service with deterministic output/receiver and no tmux delivery."""
+    service = AssignedWorkerCompletionService()
+    monkeypatch.setattr(service, "_capture_final_result", lambda _worker: report)
+    monkeypatch.setattr(
+        service,
+        "_classify_receiver",
+        lambda _record: (CompletionReceiverState.ACTIVE, None),
+    )
+    monkeypatch.setattr(service, "_attempt_immediate_inbox_delivery", lambda _caller: None)
+    return service
+
+
+def _messages(receiver_id: str):
+    return db.get_inbox_messages(receiver_id, limit=100)
+
+
+def test_success_without_send_message_generates_exactly_one_callback(callback_db, ids, monkeypatch):
+    """Observed regression: final output exists but the model never invokes send_message."""
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    _assignment(worker, caller)
+    service = _service(monkeypatch, "self-contained final response")
+
+    service.handle_status_event(worker, TerminalStatus.COMPLETED)
+
+    messages = _messages(caller)
+    assert len(messages) == 1
+    assert messages[0].origin == InboxMessageOrigin.SERVER_COMPLETION
+    assert messages[0].sender_id == worker
+    assert messages[0].receiver_id == caller
+    assert messages[0].message.startswith("self-contained final response\n\n")
+
+    record = db.get_assigned_worker_callback(worker)
+    assert record is not None
+    assert record.lifecycle == AssignmentLifecycle.COMPLETED
+    assert record.delivery_state == CompletionDeliveryState.ACKNOWLEDGED
+    assert record.receiver_state == CompletionReceiverState.ACTIVE
+    assert record.final_result == "self-contained final response"
+    assert (
+        record.final_result_sha256 == hashlib.sha256(b"self-contained final response").hexdigest()
+    )
+    assert record.result_reference == f"assigned-worker-callback:{record.assignment_id}"
+    assert record.attempt_count == 1
+    assert record.first_attempt_at is not None
+    assert record.last_attempt_at is not None
+    assert record.enqueued_at is not None
+    assert record.acknowledged_at is not None
+
+
+def test_callback_uses_immutable_persisted_caller(callback_db, ids, monkeypatch):
+    caller, unrelated, worker = ids(), ids(), ids()
+    _terminal(caller)
+    _terminal(unrelated)
+    _assignment(worker, caller)
+    service = _service(monkeypatch)
+
+    service.handle_status_event(worker, TerminalStatus.COMPLETED)
+
+    assert len(_messages(caller)) == 1
+    assert _messages(unrelated) == []
+
+
+def test_equivalent_explicit_final_callback_suppresses_server_duplicate(
+    callback_db, ids, monkeypatch
+):
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    assignment = _assignment(worker, caller)
+    explicit = db.create_inbox_message(
+        worker,
+        caller,
+        "final report\n\n"
+        f"[Message from terminal {worker}. Use send_message MCP tool for any follow-up work.]",
+        origin=InboxMessageOrigin.EXPLICIT,
+    )
+    assert explicit.assignment_id == assignment.assignment_id
+    service = _service(monkeypatch, "final report")
+
+    service.handle_status_event(worker, TerminalStatus.COMPLETED)
+
+    messages = _messages(caller)
+    assert [message.origin for message in messages] == [InboxMessageOrigin.EXPLICIT]
+    record = db.get_assigned_worker_callback(worker)
+    assert record is not None
+    assert record.delivery_state == CompletionDeliveryState.SUPPRESSED_EXPLICIT
+    assert record.inbox_message_id == explicit.id
+
+
+def test_unrelated_intermediate_message_is_preserved_and_does_not_suppress(
+    callback_db, ids, monkeypatch
+):
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    _assignment(worker, caller)
+    intermediate = db.create_inbox_message(
+        worker,
+        caller,
+        "progress: tests are still running",
+        origin=InboxMessageOrigin.EXPLICIT,
+    )
+    service = _service(monkeypatch, "different final report")
+
+    service.handle_status_event(worker, TerminalStatus.COMPLETED)
+
+    messages = _messages(caller)
+    assert [
+        message.id for message in messages if message.origin == InboxMessageOrigin.EXPLICIT
+    ] == [intermediate.id]
+    assert sum(message.origin == InboxMessageOrigin.SERVER_COMPLETION for message in messages) == 1
+
+
+def test_duplicate_completed_events_do_not_duplicate(callback_db, ids, monkeypatch):
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    _assignment(worker, caller)
+    service = _service(monkeypatch)
+
+    service.handle_status_event(worker, TerminalStatus.COMPLETED)
+    service.handle_status_event(worker, TerminalStatus.COMPLETED)
+
+    assert len(_messages(caller)) == 1
+    record = db.get_assigned_worker_callback(worker)
+    assert record is not None
+    assert record.attempt_count == 1
+
+
+def test_concurrent_completed_events_serialize_to_one_callback(callback_db, ids, monkeypatch):
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    _assignment(worker, caller)
+    service = _service(monkeypatch, "one final report")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(service.handle_status_event, worker, TerminalStatus.COMPLETED)
+            for _ in range(2)
+        ]
+        for future in futures:
+            future.result(timeout=2)
+
+    assert len(_messages(caller)) == 1
+    record = db.get_assigned_worker_callback(worker)
+    assert record is not None
+    assert record.attempt_count == 1
+
+
+def test_completion_capture_barrier_blocks_input_until_report_is_durable():
+    service = AssignedWorkerCompletionService()
+    worker = "00000001"
+    service.register_assignment(worker)
+
+    service.announce_terminal_status(worker, TerminalStatus.COMPLETED)
+    assert service.wait_for_capture_before_input(worker, timeout=0) is False
+
+    service._release_capture_barrier(worker)
+    assert service.wait_for_capture_before_input(worker, timeout=0) is True
+
+
+def test_capture_failure_keeps_barrier_closed(callback_db, ids, monkeypatch):
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    _assignment(worker, caller)
+    service = _service(monkeypatch)
+    service.register_assignment(worker)
+    service.announce_terminal_status(worker, TerminalStatus.COMPLETED)
+    monkeypatch.setattr(
+        service,
+        "_capture_final_result",
+        lambda _worker: (_ for _ in ()).throw(RuntimeError("transcript unavailable")),
+    )
+
+    service.handle_status_event(worker, TerminalStatus.COMPLETED)
+
+    assert service.wait_for_capture_before_input(worker, timeout=0) is False
+    record = db.get_assigned_worker_callback(worker)
+    assert record is not None
+    assert record.delivery_state == CompletionDeliveryState.RETRYABLE
+    assert record.final_result is None
+
+
+def test_restart_primes_all_unfinished_capture_barriers(callback_db, ids):
+    caller, unfinished_worker, acknowledged_worker = ids(), ids(), ids()
+    _terminal(caller)
+    _assignment(unfinished_worker, caller, sequence=1)
+    acknowledged = _assignment(acknowledged_worker, caller, sequence=2)
+    report = "already delivered"
+    captured = db.capture_assigned_worker_completion(
+        acknowledged_worker,
+        report,
+        hashlib.sha256(report.encode()).hexdigest(),
+        f"assigned-worker-callback:{acknowledged.assignment_id}",
+    )
+    assert captured is not None
+    inbox = db.create_inbox_message(
+        acknowledged_worker,
+        caller,
+        AssignedWorkerCompletionService._format_callback_message(captured),
+        origin=InboxMessageOrigin.SERVER_COMPLETION,
+        assignment_id=acknowledged.assignment_id,
+        idempotency_key=f"assigned-worker-completion:{acknowledged.completion_id}",
+    )
+    db.mark_completion_enqueued(
+        acknowledged.assignment_id, inbox.id, CompletionReceiverState.ACTIVE
+    )
+    db.acknowledge_completion_enqueued(acknowledged.assignment_id, inbox.id)
+
+    restarted = AssignedWorkerCompletionService()
+    restarted.register_persisted_assignments()
+    restarted.announce_terminal_status(unfinished_worker, TerminalStatus.COMPLETED)
+    restarted.announce_terminal_status(acknowledged_worker, TerminalStatus.COMPLETED)
+
+    assert restarted.wait_for_capture_before_input(unfinished_worker, timeout=0) is False
+    assert restarted.wait_for_capture_before_input(acknowledged_worker, timeout=0) is True
+
+
+def test_completed_status_before_dispatch_gate_is_not_task_completion(
+    callback_db, ids, monkeypatch
+):
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    db.create_terminal(
+        worker,
+        "cao-test",
+        f"window-{worker}",
+        "mock_cli",
+        caller_id=caller,
+        assignment_id="assignment-before-dispatch",
+        completion_id="completion-before-dispatch",
+    )
+    service = _service(monkeypatch)
+
+    service.handle_status_event(worker, TerminalStatus.COMPLETED)
+
+    assert _messages(caller) == []
+    record = db.get_assigned_worker_callback(worker)
+    assert record is not None
+    assert record.lifecycle == AssignmentLifecycle.ASSIGNED
+    assert record.final_result is None
+
+
+def test_restart_before_enqueue_reconciles_captured_report(callback_db, ids, monkeypatch):
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    assignment = _assignment(worker, caller)
+    report = "captured before simulated process stop"
+    captured = db.capture_assigned_worker_completion(
+        worker,
+        report,
+        hashlib.sha256(report.encode()).hexdigest(),
+        f"assigned-worker-callback:{assignment.assignment_id}",
+    )
+    assert captured is not None
+    assert captured.delivery_state == CompletionDeliveryState.CAPTURED
+
+    restarted = _service(monkeypatch, report)
+    restarted.reconcile_pending()
+
+    assert len(_messages(caller)) == 1
+    assert db.get_assigned_worker_callback(worker).delivery_state == (  # type: ignore[union-attr]
+        CompletionDeliveryState.ACKNOWLEDGED
+    )
+
+
+@pytest.mark.parametrize("link_before_restart", [False, True])
+def test_restart_after_enqueue_before_ack_reuses_exact_inbox_row(
+    callback_db, ids, monkeypatch, link_before_restart
+):
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    assignment = _assignment(worker, caller)
+    report = "durable report"
+    captured = db.capture_assigned_worker_completion(
+        worker,
+        report,
+        hashlib.sha256(report.encode()).hexdigest(),
+        f"assigned-worker-callback:{assignment.assignment_id}",
+    )
+    assert captured is not None
+    db.record_completion_delivery_attempt(assignment.assignment_id, CompletionReceiverState.ACTIVE)
+    inbox = db.create_inbox_message(
+        worker,
+        caller,
+        AssignedWorkerCompletionService._format_callback_message(captured),
+        origin=InboxMessageOrigin.SERVER_COMPLETION,
+        assignment_id=assignment.assignment_id,
+        idempotency_key=f"assigned-worker-completion:{assignment.completion_id}",
+    )
+    if link_before_restart:
+        db.mark_completion_enqueued(
+            assignment.assignment_id, inbox.id, CompletionReceiverState.ACTIVE
+        )
+
+    restarted = _service(monkeypatch, report)
+    restarted.reconcile_pending()
+
+    messages = _messages(caller)
+    assert [message.id for message in messages] == [inbox.id]
+    record = db.get_assigned_worker_callback(worker)
+    assert record is not None
+    assert record.delivery_state == CompletionDeliveryState.ACKNOWLEDGED
+    assert record.inbox_message_id == inbox.id
+
+
+def test_deleted_receiver_is_terminal_error_but_report_is_retained(callback_db, ids, monkeypatch):
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    _assignment(worker, caller)
+    db.delete_terminal(caller)
+    service = AssignedWorkerCompletionService()
+    monkeypatch.setattr(service, "_capture_final_result", lambda _worker: "recover me")
+
+    service.handle_status_event(worker, TerminalStatus.COMPLETED)
+
+    assert _messages(caller) == []
+    record = db.get_assigned_worker_callback(worker)
+    assert record is not None
+    assert record.lifecycle == AssignmentLifecycle.COMPLETED
+    assert record.delivery_state == CompletionDeliveryState.TERMINAL_ERROR
+    assert record.receiver_state == CompletionReceiverState.DELETED
+    assert record.final_result == "recover me"
+    assert record.terminal_error_at is not None
+
+
+def test_permanently_invalid_receiver_is_not_rerouted(callback_db, ids, monkeypatch):
+    worker = ids()
+    db.create_terminal(
+        worker,
+        "cao-test",
+        f"window-{worker}",
+        "mock_cli",
+        caller_id="invalid-caller",
+        assignment_id="assignment-invalid-caller",
+        completion_id="completion-invalid-caller",
+    )
+    db.mark_assigned_worker_dispatched(worker)
+    service = AssignedWorkerCompletionService()
+    monkeypatch.setattr(service, "_capture_final_result", lambda _worker: "retained report")
+
+    service.handle_status_event(worker, TerminalStatus.COMPLETED)
+
+    record = db.get_assigned_worker_callback(worker)
+    assert record is not None
+    assert record.delivery_state == CompletionDeliveryState.TERMINAL_ERROR
+    assert record.receiver_state == CompletionReceiverState.PERMANENTLY_INVALID
+    assert record.caller_id == "invalid-caller"
+    assert record.final_result == "retained report"
+
+
+def test_retained_unreachable_receiver_keeps_one_pending_callback(callback_db, ids, monkeypatch):
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    _assignment(worker, caller)
+    service = _service(monkeypatch)
+    monkeypatch.setattr(
+        service,
+        "_classify_receiver",
+        lambda _record: (CompletionReceiverState.RETAINED_UNREACHABLE, None),
+    )
+
+    service.handle_status_event(worker, TerminalStatus.COMPLETED)
+
+    messages = _messages(caller)
+    assert len(messages) == 1
+    assert messages[0].status == MessageStatus.PENDING
+    record = db.get_assigned_worker_callback(worker)
+    assert record is not None
+    assert record.delivery_state == CompletionDeliveryState.ACKNOWLEDGED
+    assert record.receiver_state == CompletionReceiverState.RETAINED_UNREACHABLE
+
+
+def test_retention_never_deletes_a_pending_assigned_callback(
+    callback_db, ids, monkeypatch, tmp_path
+):
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    assignment = _assignment(worker, caller)
+    callback = db.create_inbox_message(
+        worker,
+        caller,
+        "durable callback",
+        origin=InboxMessageOrigin.SERVER_COMPLETION,
+        assignment_id=assignment.assignment_id,
+        idempotency_key=f"assigned-worker-completion:{assignment.completion_id}",
+    )
+    ordinary = db.create_inbox_message(worker, caller, "ordinary old message")
+    with db.SessionLocal() as session:
+        old = datetime.now() - timedelta(days=30)
+        session.query(db.InboxModel).filter(
+            db.InboxModel.id.in_((callback.id, ordinary.id))
+        ).update({db.InboxModel.created_at: old}, synchronize_session=False)
+        session.commit()
+
+    monkeypatch.setattr(cleanup_mod, "SessionLocal", db.SessionLocal)
+    monkeypatch.setattr(cleanup_mod, "RETENTION_DAYS", 7)
+    monkeypatch.setattr(cleanup_mod, "TERMINAL_LOG_DIR", tmp_path / "no-terminal-logs")
+    monkeypatch.setattr(cleanup_mod, "LOG_DIR", tmp_path / "no-server-logs")
+
+    cleanup_mod.cleanup_old_data()
+
+    assert [message.id for message in _messages(caller)] == [callback.id]
+
+
+def test_retryable_enqueue_failure_retries_once_without_duplicate(callback_db, ids, monkeypatch):
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    _assignment(worker, caller)
+    service = _service(monkeypatch)
+    real_create = db.create_inbox_message
+    attempts = count(1)
+
+    def flaky_create(*args, **kwargs):
+        if next(attempts) == 1:
+            raise RuntimeError("database temporarily busy")
+        return real_create(*args, **kwargs)
+
+    monkeypatch.setattr(completion_mod, "create_inbox_message", flaky_create)
+
+    service.handle_status_event(worker, TerminalStatus.COMPLETED)
+    failed = db.get_assigned_worker_callback(worker)
+    assert failed is not None
+    assert failed.delivery_state == CompletionDeliveryState.RETRYABLE
+    assert _messages(caller) == []
+
+    service.reconcile_pending()
+    assert len(_messages(caller)) == 1
+    recovered = db.get_assigned_worker_callback(worker)
+    assert recovered is not None
+    assert recovered.delivery_state == CompletionDeliveryState.ACKNOWLEDGED
+    assert recovered.attempt_count == 2
+
+
+def test_retryable_receiver_classification_recovers_without_enqueueing_early(
+    callback_db, ids, monkeypatch
+):
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    _assignment(worker, caller)
+    service = _service(monkeypatch)
+    classifications = iter(
+        (
+            (
+                CompletionReceiverState.RETRYABLE_FAILURE,
+                "backend metadata temporarily unavailable",
+            ),
+            (CompletionReceiverState.ACTIVE, None),
+        )
+    )
+    monkeypatch.setattr(service, "_classify_receiver", lambda _record: next(classifications))
+
+    service.handle_status_event(worker, TerminalStatus.COMPLETED)
+    retryable = db.get_assigned_worker_callback(worker)
+    assert retryable is not None
+    assert retryable.delivery_state == CompletionDeliveryState.RETRYABLE
+    assert retryable.receiver_state == CompletionReceiverState.RETRYABLE_FAILURE
+    assert retryable.attempt_count == 0
+    assert _messages(caller) == []
+
+    service.reconcile_pending()
+
+    assert len(_messages(caller)) == 1
+    recovered = db.get_assigned_worker_callback(worker)
+    assert recovered is not None
+    assert recovered.delivery_state == CompletionDeliveryState.ACKNOWLEDGED
+    assert recovered.receiver_state == CompletionReceiverState.ACTIVE
+    assert recovered.attempt_count == 1
+
+
+def test_multiple_workers_one_caller_each_deliver_once(callback_db, ids, monkeypatch):
+    caller, worker_one, worker_two = ids(), ids(), ids()
+    _terminal(caller)
+    _assignment(worker_one, caller, sequence=1)
+    _assignment(worker_two, caller, sequence=2)
+    service = _service(monkeypatch)
+
+    service.handle_status_event(worker_one, TerminalStatus.COMPLETED)
+    service.handle_status_event(worker_two, TerminalStatus.COMPLETED)
+
+    messages = _messages(caller)
+    assert len(messages) == 2
+    assert {message.sender_id for message in messages} == {worker_one, worker_two}
+
+
+def test_two_callers_never_cross_routes(callback_db, ids, monkeypatch):
+    caller_one, caller_two, worker_one, worker_two = ids(), ids(), ids(), ids()
+    _terminal(caller_one)
+    _terminal(caller_two)
+    _assignment(worker_one, caller_one, sequence=1)
+    _assignment(worker_two, caller_two, sequence=2)
+    service = _service(monkeypatch)
+
+    service.handle_status_event(worker_one, TerminalStatus.COMPLETED)
+    service.handle_status_event(worker_two, TerminalStatus.COMPLETED)
+
+    assert [message.sender_id for message in _messages(caller_one)] == [worker_one]
+    assert [message.sender_id for message in _messages(caller_two)] == [worker_two]
+
+
+def test_failure_and_cancellation_never_emit_success_callback(callback_db, ids, monkeypatch):
+    caller, failed_worker, cancelled_worker = ids(), ids(), ids()
+    _terminal(caller)
+    _assignment(failed_worker, caller, sequence=1)
+    _assignment(cancelled_worker, caller, sequence=2)
+    service = _service(monkeypatch)
+
+    service.handle_status_event(failed_worker, TerminalStatus.ERROR)
+    monkeypatch.setattr(service, "_detect_live_status", lambda _record: TerminalStatus.IDLE)
+    assert service.prepare_terminal_retirement(cancelled_worker) is True
+
+    assert _messages(caller) == []
+    assert db.get_assigned_worker_callback(failed_worker).lifecycle == (  # type: ignore[union-attr]
+        AssignmentLifecycle.FAILED
+    )
+    assert db.get_assigned_worker_callback(cancelled_worker).lifecycle == (  # type: ignore[union-attr]
+        AssignmentLifecycle.CANCELLED
+    )
+
+
+def test_report_integrity_and_manual_recovery_outlive_both_terminals(callback_db, ids, monkeypatch):
+    caller, worker = ids(), ids()
+    report = "line one\nline two\nverbatim terminal result"
+    _terminal(caller)
+    _assignment(worker, caller)
+    service = _service(monkeypatch, report)
+    service.handle_status_event(worker, TerminalStatus.COMPLETED)
+
+    db.delete_terminal(worker)
+    db.delete_terminal(caller)
+
+    retained = db.get_assigned_worker_callback(worker)
+    assert retained is not None
+    assert retained.final_result == report
+    assert retained.final_result_sha256 == hashlib.sha256(report.encode("utf-8")).hexdigest()
+    assert retained.result_reference == f"assigned-worker-callback:{retained.assignment_id}"
+    assert retained.delivery_state == CompletionDeliveryState.ACKNOWLEDGED
+
+
+@pytest.mark.asyncio
+async def test_status_event_delivers_without_supervisor_polling(callback_db, ids, monkeypatch):
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    _assignment(worker, caller)
+    service = _service(monkeypatch, "event-driven result")
+    local_bus = EventBus()
+    local_bus.set_loop(asyncio.get_running_loop())
+    monkeypatch.setattr(completion_mod, "bus", local_bus)
+    delivered = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(
+        service,
+        "_attempt_immediate_inbox_delivery",
+        lambda _caller: loop.call_soon_threadsafe(delivered.set),
+    )
+    task = asyncio.create_task(service.run())
+    await asyncio.sleep(0)
+    try:
+        local_bus.publish(f"terminal.{worker}.status", {"status": "completed"})
+        await asyncio.wait_for(delivered.wait(), timeout=2)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        local_bus.set_loop(None)
+
+    messages = _messages(caller)
+    assert len(messages) == 1
+    assert messages[0].origin == InboxMessageOrigin.SERVER_COMPLETION

@@ -18,7 +18,11 @@ from cli_agent_orchestrator.constants import (
     EAGER_INBOX_DELIVERY,
     INBOX_RECONCILE_GRACE_SECONDS,
 )
-from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
+from cli_agent_orchestrator.models.inbox import (
+    InboxMessageOrigin,
+    MessageStatus,
+    OrchestrationType,
+)
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
@@ -93,12 +97,30 @@ class InboxService:
             if not eager_eligible:
                 return
 
+        if status == TerminalStatus.COMPLETED:
+            # Assigned workers must retain their just-finished output until the
+            # completion service has copied it into durable callback storage.
+            # Unknown/non-assigned terminals have no barrier and return
+            # immediately.  A timeout deliberately leaves every row PENDING for
+            # the next reconciliation pass instead of risking transcript loss.
+            from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+                assigned_worker_completion_service,
+            )
+
+            if not assigned_worker_completion_service.wait_for_capture_before_input(terminal_id):
+                logger.warning(
+                    "Deferred inbox delivery to completed assigned worker %s until its final "
+                    "report is durably captured",
+                    terminal_id,
+                )
+                return
+
         # Mark DELIVERED before sending (#164). send_input() types into the tmux
         # pane; that output flows back through the FIFO/StatusMonitor pipeline and
         # can re-emit an IDLE/COMPLETED status event, re-entering deliver_pending.
         # If the messages were still PENDING then, they would be delivered twice.
         # Marking them DELIVERED first closes that window; the except path resets
-        # them to FAILED.
+        # ordinary messages to FAILED and durable assignment callbacks to PENDING.
         for message in messages:
             update_message_status(message.id, MessageStatus.DELIVERED)
 
@@ -135,8 +157,31 @@ class InboxService:
                 )
             except Exception as e:
                 for message in batch:
-                    logger.error(f"Failed to deliver message {message.id} to {terminal_id}: {e}")
-                    update_message_status(message.id, MessageStatus.FAILED)
+                    # Completion callbacks have stronger durability semantics
+                    # than ordinary inbox traffic.  A transient paste/backend
+                    # failure must remain retryable after durable enqueue; this
+                    # also covers an equivalent explicit final callback selected
+                    # for duplicate suppression.  Unrelated legacy messages keep
+                    # the established FAILED behavior.
+                    is_assignment_callback = (
+                        message.assignment_id is not None
+                        and message.origin
+                        in (
+                            InboxMessageOrigin.EXPLICIT,
+                            InboxMessageOrigin.SERVER_COMPLETION,
+                        )
+                    )
+                    retry_status = (
+                        MessageStatus.PENDING if is_assignment_callback else MessageStatus.FAILED
+                    )
+                    logger.error(
+                        "Failed to deliver message %s to %s; status reset to %s: %s",
+                        message.id,
+                        terminal_id,
+                        retry_status.value,
+                        e,
+                    )
+                    update_message_status(message.id, retry_status)
 
     def poll_opencode_pending_messages(self, registry: PluginRegistry | None = None) -> None:
         """Poll OpenCode terminals for pending inbox messages.
