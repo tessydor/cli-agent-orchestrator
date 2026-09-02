@@ -10,6 +10,15 @@ import pytest
 from cli_agent_orchestrator.services.cleanup_service import cleanup_old_data
 
 
+@pytest.fixture(autouse=True)
+def no_protected_callback_logs(monkeypatch):
+    """Mock-only cleanup tests must not inspect the host's configured CAO DB."""
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.cleanup_service.list_protected_assigned_worker_callbacks",
+        lambda: [],
+    )
+
+
 class TestCleanupOldData:
     """Tests for cleanup_old_data function."""
 
@@ -37,36 +46,30 @@ class TestCleanupOldData:
         assert mock_db.query.called
         assert mock_db.commit.called
 
-    @patch("cli_agent_orchestrator.services.cleanup_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal", return_value=False)
     @patch("cli_agent_orchestrator.services.cleanup_service.SessionLocal")
     @patch("cli_agent_orchestrator.services.cleanup_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.services.cleanup_service.LOG_DIR")
     @patch("cli_agent_orchestrator.services.cleanup_service.RETENTION_DAYS", 7)
     def test_cleanup_old_data_retains_grok_row_when_provider_cleanup_is_deferred(
-        self, mock_log_dir, mock_terminal_log_dir, mock_session_local, mock_provider_manager
+        self, mock_log_dir, mock_terminal_log_dir, mock_session_local, mock_delete_terminal
     ):
         """Retention cleanup keeps the only retry handle for a private Grok home."""
         mock_db = MagicMock()
         mock_session_local.return_value.__enter__.return_value = mock_db
-        old_terminal = MagicMock(id="retained-grok", provider="grok_cli")
         old_terminal_query = MagicMock()
-        terminal_delete_query = MagicMock()
+        linked_callback_query = MagicMock()
         inbox_query = MagicMock()
-        mock_db.query.side_effect = [old_terminal_query, terminal_delete_query, inbox_query]
-        old_terminal_query.filter.return_value.all.return_value = [old_terminal]
-        terminal_delete_query.filter.return_value.filter.return_value.delete.return_value = 0
+        mock_db.query.side_effect = [old_terminal_query, linked_callback_query, inbox_query]
+        old_terminal_query.filter.return_value.all.return_value = [("retained-grok",)]
         inbox_query.filter.return_value.delete.return_value = 0
-        mock_provider_manager.cleanup_provider.return_value = False
         mock_log_dir.exists.return_value = False
         mock_terminal_log_dir.exists.return_value = False
 
         cleanup_old_data()
 
-        mock_provider_manager.cleanup_provider.assert_called_once_with("retained-grok")
-        terminal_delete_query.filter.return_value.filter.assert_called_once()
+        mock_delete_terminal.assert_called_once_with("retained-grok")
 
-    @patch("cli_agent_orchestrator.services.cleanup_service.status_monitor")
-    @patch("cli_agent_orchestrator.services.cleanup_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.cleanup_service.SessionLocal")
     @patch("cli_agent_orchestrator.services.cleanup_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.services.cleanup_service.LOG_DIR")
@@ -76,8 +79,6 @@ class TestCleanupOldData:
         mock_log_dir,
         mock_terminal_log_dir,
         mock_session_local,
-        mock_fifo_manager,
-        mock_status_monitor,
     ):
         """Test that cleanup deletes old inbox messages from database."""
         # Setup mock database session
@@ -97,7 +98,7 @@ class TestCleanupOldData:
         # Session 1: query.all() for terminal iteration + query.delete() for terminal deletion
         # Session 2: query.delete() for inbox deletion
         assert mock_db.query.call_count >= 2
-        assert mock_db.commit.call_count == 2
+        assert mock_db.commit.call_count >= 1
 
     @patch("cli_agent_orchestrator.services.cleanup_service.SessionLocal")
     @patch("cli_agent_orchestrator.services.cleanup_service.RETENTION_DAYS", 7)
@@ -220,13 +221,9 @@ class TestCleanupOldData:
         # Verify database operations still occurred
         assert mock_db.query.called
 
-    @patch("cli_agent_orchestrator.services.cleanup_service.status_monitor")
-    @patch("cli_agent_orchestrator.services.cleanup_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.cleanup_service.SessionLocal")
     @patch("cli_agent_orchestrator.services.cleanup_service.RETENTION_DAYS", 30)
-    def test_cleanup_uses_correct_retention_period(
-        self, mock_session_local, mock_fifo_manager, mock_status_monitor
-    ):
+    def test_cleanup_uses_correct_retention_period(self, mock_session_local):
         """Test that cleanup uses the configured retention period."""
         mock_db = MagicMock()
         mock_session_local.return_value.__enter__.return_value = mock_db
@@ -251,5 +248,5 @@ class TestCleanupOldData:
                 mock_log.exists.return_value = False
                 cleanup_old_data()
 
-        # Verify filter was called (terminals: .all() + .delete(), inbox: .delete())
+        # Terminal selection, linked-callback evidence selection, and inbox cleanup.
         assert len(filter_calls) >= 2

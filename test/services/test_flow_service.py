@@ -857,10 +857,9 @@ Prompt.
         mock_get_backend.return_value.kill_session.assert_not_called()
 
     @pytest.mark.asyncio
-    @patch("cli_agent_orchestrator.services.flow_service.delete_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.flow_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
-    @patch("cli_agent_orchestrator.services.flow_service.provider_manager")
     @patch("cli_agent_orchestrator.services.flow_service.status_monitor")
     @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.flow_service.get_backend")
@@ -873,10 +872,9 @@ Prompt.
         mock_get_backend,
         mock_list_terminals,
         mock_status_monitor,
-        mock_provider_manager,
         mock_create_terminal,
         mock_send_input,
-        mock_delete_terminals,
+        mock_delete_terminal,
     ):
         """Session exists with an IDLE terminal — flow should kill and proceed."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
@@ -904,21 +902,20 @@ Prompt.
         mock_create_terminal.return_value = mock_terminal
         lifecycle: list[str] = []
         mock_get_backend.return_value.kill_session.side_effect = lambda *_: lifecycle.append("kill")
-        mock_provider_manager.cleanup_provider.side_effect = lambda *_: lifecycle.append("cleanup")
+        mock_delete_terminal.side_effect = lambda *_: lifecycle.append("delete") or True
 
         result = await execute_flow("idle-flow")
 
         assert result is True
         mock_get_backend.return_value.kill_session.assert_called_once()
-        mock_provider_manager.cleanup_provider.assert_called_once_with("t1")
-        assert lifecycle == ["kill", "cleanup"]
+        mock_delete_terminal.assert_called_once_with("t1")
+        assert lifecycle == ["delete", "kill"]
         mock_create_terminal.assert_called_once()
 
     @pytest.mark.asyncio
-    @patch("cli_agent_orchestrator.services.flow_service.delete_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.flow_service.delete_terminal", return_value=False)
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
-    @patch("cli_agent_orchestrator.services.flow_service.provider_manager")
     @patch("cli_agent_orchestrator.services.flow_service.status_monitor")
     @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.flow_service.get_backend")
@@ -931,10 +928,9 @@ Prompt.
         mock_get_backend,
         mock_list_terminals,
         mock_status_monitor,
-        mock_provider_manager,
         mock_create_terminal,
         mock_send_input,
-        mock_delete_terminals,
+        mock_delete_terminal,
     ):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             f.write(
@@ -955,17 +951,18 @@ Prompt.
         mock_get_backend.return_value.session_exists.return_value = True
         mock_list_terminals.return_value = [{"id": "grok-worker"}]
         mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
-        mock_provider_manager.cleanup_provider.return_value = False
 
         assert await execute_flow("deferred-cleanup-flow") is False
-        mock_delete_terminals.assert_not_called()
+        mock_delete_terminal.assert_called_once_with("grok-worker")
+        mock_get_backend.return_value.kill_session.assert_not_called()
         mock_create_terminal.assert_not_called()
 
     @pytest.mark.asyncio
-    @patch("cli_agent_orchestrator.services.flow_service.delete_terminals_by_session")
+    @patch(
+        "cli_agent_orchestrator.services.flow_service.delete_missing_terminal", return_value=False
+    )
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
-    @patch("cli_agent_orchestrator.services.flow_service.provider_manager")
     @patch("cli_agent_orchestrator.services.flow_service.status_monitor")
     @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.flow_service.get_backend")
@@ -978,10 +975,9 @@ Prompt.
         mock_get_backend,
         mock_list_terminals,
         mock_status_monitor,
-        mock_provider_manager,
         mock_create_terminal,
         mock_send_input,
-        mock_delete_terminals,
+        mock_delete_missing_terminal,
     ):
         """A vanished flow session must not orphan a deferred Grok cleanup row."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
@@ -1001,18 +997,18 @@ Prompt.
             )
         mock_get_backend.return_value.session_exists.return_value = False
         mock_list_terminals.return_value = [{"id": "retained-grok"}]
-        mock_provider_manager.cleanup_provider.return_value = False
 
         assert await execute_flow("retry-flow") is False
-        mock_provider_manager.cleanup_provider.assert_called_once_with("retained-grok")
-        mock_delete_terminals.assert_not_called()
+        mock_delete_missing_terminal.assert_called_once_with(
+            "retained-grok",
+            "Flow recycle found the persisted terminal's backend session missing",
+        )
         mock_create_terminal.assert_not_called()
 
     @pytest.mark.asyncio
-    @patch("cli_agent_orchestrator.services.flow_service.delete_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.flow_service.delete_terminal", return_value=True)
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
-    @patch("cli_agent_orchestrator.services.flow_service.provider_manager")
     @patch("cli_agent_orchestrator.services.flow_service.status_monitor")
     @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.flow_service.get_backend")
@@ -1025,10 +1021,9 @@ Prompt.
         mock_get_backend,
         mock_list_terminals,
         mock_status_monitor,
-        mock_provider_manager,
         mock_create_terminal,
         mock_send_input,
-        mock_delete_terminals,
+        mock_delete_terminal,
     ):
         """Status lookup raises (unknown terminal) — treated as non-busy, flow proceeds."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
@@ -1059,14 +1054,14 @@ Prompt.
         result = await execute_flow("orphan-provider-flow")
 
         assert result is True
+        mock_delete_terminal.assert_called_once_with("t1")
         mock_get_backend.return_value.kill_session.assert_called_once()
         mock_create_terminal.assert_called_once()
 
     @pytest.mark.asyncio
-    @patch("cli_agent_orchestrator.services.flow_service.delete_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.flow_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
-    @patch("cli_agent_orchestrator.services.flow_service.provider_manager")
     @patch("cli_agent_orchestrator.services.flow_service.status_monitor")
     @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.flow_service.get_backend")
@@ -1079,10 +1074,9 @@ Prompt.
         mock_get_backend,
         mock_list_terminals,
         mock_status_monitor,
-        mock_provider_manager,
         mock_create_terminal,
         mock_send_input,
-        mock_delete_terminals,
+        mock_delete_terminal,
     ):
         """Session exists but has no terminals — flow should kill and proceed without checking status."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
@@ -1112,6 +1106,7 @@ Prompt.
         assert result is True
         mock_get_backend.return_value.kill_session.assert_called_once()
         mock_create_terminal.assert_called_once()
+        mock_delete_terminal.assert_not_called()
         # No conductor terminal exists, so the busy check never queries status.
         mock_status_monitor.get_status.assert_not_called()
 

@@ -232,7 +232,15 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
         cleanup_complete = True
         for terminal in terminals:
             try:
-                if terminal_service.delete_terminal(terminal["id"], registry=registry) is False:
+                if session_alive:
+                    retired = terminal_service.delete_terminal(terminal["id"], registry=registry)
+                else:
+                    retired = terminal_service.delete_missing_terminal(
+                        terminal["id"],
+                        f"Session deletion proved backend session {session_name!r} is absent",
+                        registry=registry,
+                    )
+                if retired is False:
                     cleanup_complete = False
                     result["errors"].append(
                         {
@@ -242,27 +250,28 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
                     )
             except Exception as e:
                 logger.warning(f"Failed to cleanup terminal {terminal['id']}: {e}")
+                cleanup_complete = False
+                result["errors"].append({"terminal_id": terminal["id"], "error": str(e)})
 
-        # Kill backend session only if it still exists
-        if session_alive:
+        # A False return means the terminal/pane is the only remaining report
+        # recovery handle.  Never kill the containing session or clear its env
+        # underneath that deferral.
+        if cleanup_complete and session_alive:
             get_backend().kill_session(session_name)
 
-        # Drop the per-session forwarded-env mapping (issue #248). Safe
-        # even when no vars were forwarded — the helper is a no-op then.
-        clear_session_env(session_name)
-
         if cleanup_complete:
+            # Drop forwarded env only after the backend session is genuinely
+            # retired.  A deferred session may still need it for recovery.
+            clear_session_env(session_name)
             result["deleted"].append(session_name)
             logger.info(f"Deleted session: {session_name}")
-        else:
-            logger.warning(
-                "Session %s backend was removed but terminal cleanup is deferred", session_name
+            dispatch_plugin_event(
+                registry,
+                "post_kill_session",
+                PostKillSessionEvent(session_id=session_name, session_name=session_name),
             )
-        dispatch_plugin_event(
-            registry,
-            "post_kill_session",
-            PostKillSessionEvent(session_id=session_name, session_name=session_name),
-        )
+        else:
+            logger.warning("Session %s retained because terminal cleanup is deferred", session_name)
         return result
 
     except Exception as e:

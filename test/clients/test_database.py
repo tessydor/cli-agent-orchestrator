@@ -168,36 +168,30 @@ class TestTerminalOperations:
 
         assert result is False
 
-    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
-    def test_delete_terminal(self, mock_session_class):
+    def test_delete_terminal(self, test_db):
         """Test deleting a terminal."""
-        mock_session = MagicMock()
-        mock_session.__enter__ = MagicMock(return_value=mock_session)
-        mock_session.__exit__ = MagicMock(return_value=False)
+        with test_db() as seed:
+            seed.add(
+                TerminalModel(
+                    id="test123",
+                    tmux_session="cao-session",
+                    tmux_window="window-0",
+                    provider="kiro_cli",
+                )
+            )
+            seed.commit()
 
-        mock_query = MagicMock()
-        mock_query.filter.return_value.delete.return_value = 1
-        mock_session.query.return_value = mock_query
-        mock_session_class.return_value = mock_session
-
-        result = delete_terminal("test123")
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            result = delete_terminal("test123")
 
         assert result is True
-        mock_session.commit.assert_called_once()
+        with test_db() as verify:
+            assert verify.query(TerminalModel).filter(TerminalModel.id == "test123").first() is None
 
-    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
-    def test_delete_terminal_not_found(self, mock_session_class):
+    def test_delete_terminal_not_found(self, test_db):
         """Test deleting a terminal that doesn't exist."""
-        mock_session = MagicMock()
-        mock_session.__enter__ = MagicMock(return_value=mock_session)
-        mock_session.__exit__ = MagicMock(return_value=False)
-
-        mock_query = MagicMock()
-        mock_query.filter.return_value.delete.return_value = 0
-        mock_session.query.return_value = mock_query
-        mock_session_class.return_value = mock_session
-
-        result = delete_terminal("nonexistent")
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            result = delete_terminal("nonexistent")
 
         assert result is False
 
@@ -313,21 +307,33 @@ class TestTerminalOperations:
 
         assert result == ["term-old"]
 
-    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
-    def test_delete_terminals_by_session(self, mock_session_class):
+    def test_delete_terminals_by_session(self, test_db):
         """Test deleting all terminals in a session."""
-        mock_session = MagicMock()
-        mock_session.__enter__ = MagicMock(return_value=mock_session)
-        mock_session.__exit__ = MagicMock(return_value=False)
+        with test_db() as seed:
+            seed.add_all(
+                [
+                    TerminalModel(
+                        id="terminal-1",
+                        tmux_session="cao-session",
+                        tmux_window="window-1",
+                        provider="kiro_cli",
+                    ),
+                    TerminalModel(
+                        id="terminal-2",
+                        tmux_session="cao-session",
+                        tmux_window="window-2",
+                        provider="kiro_cli",
+                    ),
+                ]
+            )
+            seed.commit()
 
-        mock_query = MagicMock()
-        mock_query.filter.return_value.delete.return_value = 2
-        mock_session.query.return_value = mock_query
-        mock_session_class.return_value = mock_session
-
-        result = delete_terminals_by_session("cao-session")
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            result = delete_terminals_by_session("cao-session")
 
         assert result == 2
+        with test_db() as verify:
+            assert verify.query(TerminalModel).count() == 0
 
 
 class TestGroupAndMetadata:
@@ -1361,35 +1367,28 @@ class TestFlowOperations:
 
         assert result is False
 
-    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
-    def test_create_inbox_message(self, mock_session_class):
+    def test_create_inbox_message(self, test_db):
         """Test creating an inbox message when receiver terminal exists."""
-        mock_session = MagicMock()
-        mock_session.__enter__ = MagicMock(return_value=mock_session)
-        mock_session.__exit__ = MagicMock(return_value=False)
-        mock_session_class.return_value = mock_session
+        with test_db() as seed:
+            seed.add(
+                TerminalModel(
+                    id="receiver-456",
+                    tmux_session="cao-session",
+                    tmux_window="receiver",
+                    provider="kiro_cli",
+                )
+            )
+            seed.commit()
 
-        # Receiver terminal exists
-        mock_session.query.return_value.filter.return_value.first.return_value = MagicMock()
-
-        # Setup mock to update message attributes on refresh
-        def mock_refresh(msg):
-            msg.id = 1
-            msg.sender_id = "sender-123"
-            msg.receiver_id = "receiver-456"
-            msg.message = "Hello"
-            msg.status = MessageStatus.PENDING.value
-            msg.created_at = datetime.now()
-
-        mock_session.refresh.side_effect = mock_refresh
-
-        result = create_inbox_message("sender-123", "receiver-456", "Hello")
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            result = create_inbox_message("sender-123", "receiver-456", "Hello")
 
         assert result.sender_id == "sender-123"
         assert result.receiver_id == "receiver-456"
         assert result.message == "Hello"
-        mock_session.add.assert_called_once()
-        mock_session.commit.assert_called_once()
+        assert result.status == MessageStatus.PENDING
+        with test_db() as verify:
+            assert verify.query(InboxModel).count() == 1
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_create_inbox_message_receiver_not_found(self, mock_session_class):

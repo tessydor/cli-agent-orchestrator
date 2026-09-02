@@ -23,6 +23,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from datetime import datetime
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
@@ -261,6 +262,8 @@ async def create_terminal(
         TimeoutError: If provider initialization times out
     """
     terminal_id: Optional[str] = None
+    assignment_id: Optional[str] = None
+    completion_id: Optional[str] = None
     session_created = False  # tracks whether THIS call created the tmux session
     # harness-control#186: tracks whether THIS call created a new WINDOW in an
     # already-existing session (the `new_session=False` branch below — what
@@ -335,6 +338,13 @@ async def create_terminal(
         # Step 1: Generate unique identifiers
         terminal_id = generate_terminal_id()
 
+        # Assigned workers get durable identities before any task delivery.  The
+        # database insert below commits these in the same transaction as the
+        # terminal row, so a successful assign can never lose its callback route.
+        if initial_message_orchestration_type == OrchestrationType.ASSIGN and caller_id is not None:
+            assignment_id = uuid.uuid4().hex
+            completion_id = uuid.uuid4().hex
+
         if not session_name:
             session_name = generate_session_name()
 
@@ -392,7 +402,14 @@ async def create_terminal(
                 extra_env=env_vars,
             )
             session_created = True  # only set after successful creation
-            delete_terminals_by_session(session_name)
+            delete_terminals_by_session(
+                session_name,
+                missing_backend=True,
+                reason=(
+                    "Stale terminal row belonged to a backend session that was absent before "
+                    "same-name session creation"
+                ),
+            )
 
             # Persist forwarded env only after the tmux session actually
             # exists; the failure path below clears it if a later step
@@ -440,6 +457,11 @@ async def create_terminal(
 
         # Step 3c: Persist terminal metadata to database after restrictions
         # are resolved so API reads and snapshots report the actual launch policy.
+        callback_identity = (
+            {"assignment_id": assignment_id, "completion_id": completion_id}
+            if assignment_id is not None and completion_id is not None
+            else {}
+        )
         db_create_terminal(
             terminal_id,
             session_name,
@@ -452,7 +474,18 @@ async def create_terminal(
             group=group,
             metadata=metadata,
             working_directory=resolved_working_directory,
+            **callback_identity,
         )
+        if assignment_id is not None:
+            # Register immediately after the atomic terminal/assignment commit.
+            # StatusMonitor can then install a completion-capture barrier before
+            # publishing COMPLETED, preventing a queued inbox turn from replacing
+            # the final response before the server has durably copied it.
+            from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+                assigned_worker_completion_service,
+            )
+
+            assigned_worker_completion_service.register_assignment(terminal_id)
 
         # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
         # backends (tmux). Event-inbox backends (herdr) deliver via their own
@@ -585,6 +618,25 @@ async def create_terminal(
     except Exception as e:
         # Cleanup on failure: clean up FIFO reader, status monitor, provider, and session
         logger.error(f"Failed to create terminal: {e}")
+        if terminal_id is not None and assignment_id is not None:
+            try:
+                from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+                    assigned_worker_completion_service,
+                )
+
+                assigned_worker_completion_service.record_worker_failure(
+                    terminal_id,
+                    f"Assigned worker creation failed: {type(e).__name__}: {e}",
+                )
+            except Exception:
+                # The original creation failure remains authoritative; recovery
+                # can still inspect a callback row left in NOT_READY if this
+                # best-effort terminal-state write itself failed.
+                logger.warning(
+                    "Could not persist assigned-worker creation failure for %s",
+                    terminal_id,
+                    exc_info=True,
+                )
         try:
             if terminal_id is not None:
                 fifo_manager.stop_reader(terminal_id)
@@ -676,15 +728,21 @@ def _notify_caller_of_deferred_failure(
     registry: "PluginRegistry | None",
     delete_worker: bool,
 ) -> None:
-    """Make a deferred-init failure observable to the supervisor that assigned
-    the worker, then optionally tear the worker down.
+    """Classify and retire a never-dispatched worker, then notify its caller.
 
     Runs in a worker thread (blocking DB + tmux I/O). The supervisor is the
     worker's ``caller_id``; we enqueue a PENDING inbox message to it so the
     failure surfaces as the supervisor's next input instead of leaving it to
-    wait forever on a callback that will never come. Every step is best-effort
-    and independently guarded — a failure to notify must not prevent teardown,
-    and a failure to tear down must not crash the background task.
+    wait forever on a callback that will never come.
+
+    ``delete_worker=True`` is reserved for paths with positive local proof that
+    provider initialization failed before input, or that every submitted input
+    remained unaccepted.  Persisting ``FAILED`` / ``TERMINAL_ERROR`` first is
+    what allows the normal report-preserving deletion invariant to retire an
+    otherwise-unproven ``ASSIGNED`` callback.  Notification deliberately occurs
+    *after* the deletion attempt so its wording reflects the committed outcome.
+    Every step remains independently guarded: notification failure cannot block
+    a safe teardown, and teardown failure cannot suppress an honest warning.
     """
     caller_id = None
     try:
@@ -698,9 +756,67 @@ def _notify_caller_of_deferred_failure(
             exc,
         )
 
+    notification = message
+    if delete_worker:
+        # Older call sites included a deletion claim in ``message`` before the
+        # deletion was attempted.  Strip that legacy suffix defensively so even
+        # a direct/internal caller cannot accidentally report false success.
+        notification = re.sub(
+            r"\s+It has been deleted\s*[—-]\s*re-assign"
+            r"(?: the task)?(?: or report the failure)?\.?\s*$",
+            "",
+            message,
+            flags=re.IGNORECASE,
+        ).rstrip()
+
+        # This path has stronger evidence than ordinary retirement: the assigned
+        # task never crossed the accepted-input gate.  Record that non-success
+        # outcome before deleting the terminal/report handle.
+        try:
+            from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+                assigned_worker_completion_service,
+            )
+
+            assigned_worker_completion_service.record_worker_failure(
+                terminal_id,
+                f"Deferred assigned-worker startup failed before dispatch: {notification}",
+            )
+        except Exception as exc:  # noqa: BLE001 — teardown is best-effort
+            logger.warning(
+                "Deferred-init failure: could not persist pre-dispatch failure "
+                "for worker %s: %s",
+                terminal_id,
+                exc,
+            )
+
+        deleted = False
+        try:
+            # Pass registry so post_kill_terminal hooks fire — parity with the
+            # DELETE endpoint and agent_step teardown.
+            deleted = delete_terminal(terminal_id, registry=registry) is True
+        except Exception as exc:  # noqa: BLE001 — teardown is best-effort
+            logger.warning(
+                "Deferred-init failure: teardown of worker %s failed (terminal/report "
+                "recovery handle remains): %s",
+                terminal_id,
+                exc,
+            )
+
+        if deleted:
+            notification = f"{notification} It has been deleted — re-assign the task."
+        else:
+            notification = (
+                f"{notification} Cleanup was deferred; the worker terminal/report "
+                "recovery handle remains for retry or manual recovery."
+            )
+
     if caller_id:
         try:
-            create_inbox_message(sender_id=terminal_id, receiver_id=caller_id, message=message)
+            create_inbox_message(
+                sender_id=terminal_id,
+                receiver_id=caller_id,
+                message=notification,
+            )
         except Exception as exc:  # noqa: BLE001 — best-effort
             logger.warning(
                 "Deferred-init failure notify: could not enqueue inbox message to "
@@ -711,22 +827,9 @@ def _notify_caller_of_deferred_failure(
             )
     else:
         logger.warning(
-            "Deferred-init failure for %s has no caller_id to notify; failure is " "log-only.",
+            "Deferred-init failure for %s has no caller_id to notify; failure is log-only.",
             terminal_id,
         )
-
-    if delete_worker:
-        try:
-            # Pass registry so post_kill_terminal hooks fire — parity with the
-            # DELETE endpoint and agent_step teardown.
-            delete_terminal(terminal_id, registry=registry)
-        except Exception as exc:  # noqa: BLE001 — teardown is best-effort
-            logger.warning(
-                "Deferred-init failure: teardown of worker %s failed (zombie "
-                "window may remain): %s",
-                terminal_id,
-                exc,
-            )
 
 
 # --- deferred-init submit verification ----------------------------------------
@@ -903,6 +1006,7 @@ def _schedule_deferred_init(
 
     async def _run() -> None:
         caller_id: Optional[str] = None
+        input_delivery_attempted = False
         try:
             await provider_instance.initialize()
             shell_command = provider_instance.shell_baseline
@@ -934,6 +1038,9 @@ def _schedule_deferred_init(
                 effective_orchestration_type = orchestration_type or OrchestrationType.ASSIGN
                 # send_input is blocking tmux I/O — off the loop so it can't
                 # freeze the server for concurrent requests.
+                # Set this before entering the backend call: an exception does
+                # not prove that its external paste side effect never happened.
+                input_delivery_attempted = True
                 await asyncio.to_thread(
                     send_input,
                     terminal_id,
@@ -970,12 +1077,25 @@ def _schedule_deferred_init(
                         (
                             f"Worker {terminal_id} received the assigned task but "
                             f"never started processing (input not accepted after "
-                            f"retries). It has been deleted — re-assign the task."
+                            f"retries)."
                         ),
                         registry,
                         True,  # delete_worker
                     )
                     return
+
+                # The accepted-task edge is durable and is the gate that keeps
+                # startup/stale COMPLETED chrome from becoming a false callback.
+                # Reconcile immediately after the write to close the race where
+                # a very fast worker completed before DISPATCHED was committed.
+                from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+                    assigned_worker_completion_service,
+                )
+
+                await asyncio.to_thread(
+                    assigned_worker_completion_service.mark_dispatched_and_reconcile,
+                    terminal_id,
+                )
         except TerminalInputBlockedError as e:
             # The worker initialized but is parked on an interactive prompt
             # (WAITING_USER_ANSWER). It is alive and can be driven via
@@ -1003,21 +1123,51 @@ def _schedule_deferred_init(
             # exc_info=True preserves the traceback for debugging; {e!r} avoids
             # newline/control-character injection into logs and the inbox message
             # (the exception text can contain provider-supplied content).
-            logger.error(
-                "Deferred init for terminal %s failed: %r. "
-                "Notifying caller and tearing down worker.",
-                terminal_id,
-                e,
-                exc_info=True,
-            )
-            await asyncio.to_thread(
-                _notify_caller_of_deferred_failure,
-                terminal_id,
-                f"Worker {terminal_id} failed to initialize: {e!r}. It has been "
-                f"deleted — re-assign the task or report the failure.",
-                registry,
-                delete_worker=True,
-            )
+            if input_delivery_attempted:
+                # send_input can raise after an external paste/Enter side effect,
+                # and later confirmation/dispatch persistence can also fail. That
+                # is not proof the task never ran, so retain the recovery handle.
+                logger.error(
+                    "Deferred delivery for terminal %s failed after input began: %r. "
+                    "Dispatch outcome is unresolved; retaining worker.",
+                    terminal_id,
+                    e,
+                    exc_info=True,
+                )
+                from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+                    assigned_worker_completion_service,
+                )
+
+                await asyncio.to_thread(
+                    assigned_worker_completion_service.record_dispatch_uncertain,
+                    terminal_id,
+                    "Deferred input delivery raised after its external side effect may have "
+                    f"begun: {type(e).__name__}: {e}",
+                )
+                await asyncio.to_thread(
+                    _notify_caller_of_deferred_failure,
+                    terminal_id,
+                    f"Worker {terminal_id} encountered {e!r} after initial input delivery "
+                    "began; task acceptance is unresolved. The worker terminal/report "
+                    "recovery handle remains for manual recovery.",
+                    registry,
+                    delete_worker=False,
+                )
+            else:
+                logger.error(
+                    "Deferred init for terminal %s failed before input delivery: %r. "
+                    "Notifying caller and tearing down worker.",
+                    terminal_id,
+                    e,
+                    exc_info=True,
+                )
+                await asyncio.to_thread(
+                    _notify_caller_of_deferred_failure,
+                    terminal_id,
+                    f"Worker {terminal_id} failed to initialize: {e!r}.",
+                    registry,
+                    delete_worker=True,
+                )
 
     try:
         loop = asyncio.get_running_loop()
@@ -1623,9 +1773,85 @@ def read_output_range(terminal_id: str, offset: int, length: int) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+def delete_missing_terminal(
+    terminal_id: str,
+    reason: str,
+    registry: PluginRegistry | None = None,
+) -> bool:
+    """Retire a DB terminal after its backend pane is positively known missing.
+
+    This is the only bypass for a report handle that cannot physically be
+    retained.  The database transaction records an explicit FAILED/manual audit
+    before deleting the stale terminal row; it never fabricates success.
+    """
+    metadata = get_terminal_metadata(terminal_id)
+    if metadata is None:
+        return False
+    # The pane/session is already gone, so no later transcript capture is
+    # possible.  Persist that true failure before any provider cleanup that may
+    # defer and retain the terminal row.  This prevents an uncaptured assignment
+    # from dangling indefinitely merely because a private provider home is busy.
+    from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+        assigned_worker_completion_service,
+    )
+
+    assigned_worker_completion_service.record_worker_failure(terminal_id, reason)
+    svc = get_herdr_inbox_service()
+    if svc:
+        try:
+            svc.unregister_terminal(terminal_id)
+        except Exception:
+            logger.warning("Failed to unregister missing terminal %s", terminal_id, exc_info=True)
+    try:
+        fifo_manager.stop_reader(terminal_id)
+    except Exception:
+        logger.warning("Failed to stop FIFO for missing terminal %s", terminal_id, exc_info=True)
+    try:
+        status_monitor.clear_terminal(terminal_id)
+    except Exception:
+        logger.warning("Failed to clear status for missing terminal %s", terminal_id, exc_info=True)
+    if provider_manager.cleanup_provider(terminal_id) is False:
+        logger.warning(
+            "Missing terminal %s provider cleanup deferred; retaining DB recovery row",
+            terminal_id,
+        )
+        return False
+    deleted = db_delete_terminal(
+        terminal_id,
+        missing_backend=True,
+        reason=reason,
+    )
+    if deleted:
+        dispatch_plugin_event(
+            registry,
+            "post_kill_terminal",
+            PostKillTerminalEvent(
+                session_id=metadata["tmux_session"],
+                terminal_id=terminal_id,
+                agent_name=metadata.get("agent_profile"),
+            ),
+        )
+    return deleted
+
+
 def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) -> bool:
     """Delete terminal and kill its tmux window."""
     try:
+        # Retirement is ordered after successful-completion capture.  A caller
+        # deleting a worker immediately after it finishes must not destroy the
+        # only extractable copy of its final report while the status event is
+        # still queued.  Non-assigned workers are a fast no-op here.
+        from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+            assigned_worker_completion_service,
+        )
+
+        if not assigned_worker_completion_service.prepare_terminal_retirement(terminal_id):
+            logger.warning(
+                "Terminal %s retirement deferred until its completed final report can be captured",
+                terminal_id,
+            )
+            return False
+
         # Unregister from herdr inbox service
         svc = get_herdr_inbox_service()
         if svc:

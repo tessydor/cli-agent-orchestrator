@@ -151,6 +151,30 @@ class TestStickyLatching:
         assert m.status() == TerminalStatus.IDLE
         assert m.published == ["idle"]
 
+    def test_completed_capture_barrier_is_announced_before_event_publish(self):
+        """Inbox and completion consumers race on the same status event.
+
+        The capture barrier must exist before either subscriber can run.
+        """
+        monitor = StatusMonitor()
+        order = []
+        completion_path = (
+            "cli_agent_orchestrator.services.assigned_worker_completion_service."
+            "assigned_worker_completion_service"
+        )
+        with (
+            patch(completion_path) as completion_service,
+            patch("cli_agent_orchestrator.services.status_monitor.bus") as event_bus,
+        ):
+            completion_service.announce_terminal_status.side_effect = lambda *_args: order.append(
+                "barrier"
+            )
+            event_bus.publish.side_effect = lambda *_args: order.append("publish")
+
+            monitor._apply_detection("00000001", TerminalStatus.COMPLETED)
+
+        assert order == ["barrier", "publish"]
+
     def test_ready_to_unknown_blocked_without_arm(self):
         m = _SequencedMonitor()
         m.feed(TerminalStatus.COMPLETED)

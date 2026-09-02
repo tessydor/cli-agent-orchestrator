@@ -19,6 +19,9 @@ from cli_agent_orchestrator.api.main import (
 )
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import Terminal
+from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+    assigned_worker_completion_service,
+)
 from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.utils.skills import SkillNameError
 
@@ -1295,12 +1298,12 @@ class TestInboxReconciliationDaemon:
             with pytest.raises(asyncio.CancelledError):
                 await inbox_reconciliation_daemon(registry)
 
-        mock_to_thread.assert_awaited_once()
-        # The sweep, not some other sync function, must be the dispatched work.
-        # reconcile_orphaned_messages is a bound method on the singleton now, so a
-        # fresh attribute access is a distinct object — compare by value, not id.
-        assert mock_to_thread.await_args.args[0] == inbox_service.reconcile_orphaned_messages
-        assert mock_to_thread.await_args.args[1] is registry
+        assert mock_to_thread.await_count == 1
+        # Callback retry is event-woken inside AssignedWorkerCompletionService;
+        # this slower sweep remains responsible only for orphaned inbox rows.
+        assert mock_to_thread.await_args_list == [
+            call(inbox_service.reconcile_orphaned_messages, registry),
+        ]
 
 
 # ── lifespan ─────────────────────────────────────────────────────────

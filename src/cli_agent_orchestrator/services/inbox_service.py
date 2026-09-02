@@ -5,14 +5,17 @@ Consumer: terminal.{id}.status
 
 import asyncio
 import logging
+import uuid
 from itertools import groupby
 
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.clients.database import (
+    claim_inbox_message,
     get_pending_messages,
+    is_assigned_worker_callback_inbox_message,
     list_pending_receiver_ids_by_provider,
     list_pending_receiver_ids_older_than,
-    update_message_status,
+    resolve_inbox_claim,
 )
 from cli_agent_orchestrator.constants import (
     EAGER_INBOX_DELIVERY,
@@ -93,14 +96,44 @@ class InboxService:
             if not eager_eligible:
                 return
 
-        # Mark DELIVERED before sending (#164). send_input() types into the tmux
-        # pane; that output flows back through the FIFO/StatusMonitor pipeline and
-        # can re-emit an IDLE/COMPLETED status event, re-entering deliver_pending.
-        # If the messages were still PENDING then, they would be delivered twice.
-        # Marking them DELIVERED first closes that window; the except path resets
-        # them to FAILED.
-        for message in messages:
-            update_message_status(message.id, MessageStatus.DELIVERED)
+        if status == TerminalStatus.COMPLETED:
+            # Assigned workers must retain their just-finished output until the
+            # completion service has copied it into durable callback storage.
+            # Unknown/non-assigned terminals have no barrier and return
+            # immediately.  A timeout deliberately leaves every row PENDING for
+            # the next reconciliation pass instead of risking transcript loss.
+            from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+                assigned_worker_completion_service,
+            )
+
+            if not assigned_worker_completion_service.wait_for_capture_before_input(terminal_id):
+                logger.warning(
+                    "Deferred inbox delivery to completed assigned worker %s until its final "
+                    "report is durably captured",
+                    terminal_id,
+                )
+                return
+
+        # A stale read is harmless: every candidate must win a durable
+        # PENDING -> DELIVERING compare-and-set before it may touch the pane.
+        # Concurrent fast paths can both read the same row, but only one claim
+        # token wins.  DELIVERING also closes re-entrant status-event delivery.
+        claim_token = uuid.uuid4().hex
+        claimed_messages = []
+        try:
+            for message in messages:
+                claimed = claim_inbox_message(message.id, claim_token)
+                if claimed is not None:
+                    claimed_messages.append(claimed)
+        except Exception:
+            # No paste has occurred yet. Release earlier claims from this batch
+            # so one corrupt/lost later candidate does not strand valid rows.
+            for claimed in claimed_messages:
+                resolve_inbox_claim(claimed.id, claim_token, MessageStatus.PENDING)
+            raise
+        messages = claimed_messages
+        if not messages:
+            return
 
         # Deliver in contiguous runs of the same sender. With the default
         # num_messages=1 this is a single run; when draining all pending messages
@@ -121,22 +154,61 @@ class InboxService:
                         sender_id=sender_id,
                         orchestration_type=OrchestrationType.SEND_MESSAGE,
                     )
-                logger.info(f"Delivered {len(batch)} message(s) to terminal {terminal_id}")
             except TerminalNotFoundError as e:
                 # Pane not resolvable yet (e.g. a herdr pane that isn't mapped
                 # for this window). Treat as transient: reset to PENDING so the
-                # reconcile sweep retries rather than marking FAILED. These were
-                # optimistically set to DELIVERED above. (#271 semantic.)
+                # reconcile sweep retries rather than marking FAILED. (#271 semantic.)
                 for message in batch:
-                    update_message_status(message.id, MessageStatus.PENDING)
+                    resolve_inbox_claim(message.id, claim_token, MessageStatus.PENDING)
                 logger.warning(
                     f"Pane not resolvable for terminal {terminal_id}; leaving "
                     f"{len(batch)} message(s) pending for retry: {e}"
                 )
             except Exception as e:
                 for message in batch:
-                    logger.error(f"Failed to deliver message {message.id} to {terminal_id}: {e}")
-                    update_message_status(message.id, MessageStatus.FAILED)
+                    # Completion callbacks have stronger durability semantics
+                    # than ordinary inbox traffic.  A transient paste/backend
+                    # failure must remain retryable after durable enqueue; this
+                    # also covers an equivalent explicit final callback selected
+                    # for duplicate suppression.  Unrelated legacy messages keep
+                    # the established FAILED behavior.
+                    is_assignment_callback = is_assigned_worker_callback_inbox_message(message.id)
+                    retry_status = (
+                        MessageStatus.PENDING if is_assignment_callback else MessageStatus.FAILED
+                    )
+                    logger.error(
+                        "Failed to deliver message %s to %s; status reset to %s: %s",
+                        message.id,
+                        terminal_id,
+                        retry_status.value,
+                        e,
+                    )
+                    resolve_inbox_claim(message.id, claim_token, retry_status)
+            else:
+                logger.info(f"Delivered {len(batch)} message(s) to terminal {terminal_id}")
+                for message in batch:
+                    try:
+                        resolved = resolve_inbox_claim(
+                            message.id, claim_token, MessageStatus.DELIVERED
+                        )
+                    except Exception:
+                        # Paste returned successfully. A resolution exception is
+                        # beyond the observable side-effect boundary, so resetting
+                        # would risk a duplicate paste. Retain DELIVERING/manual.
+                        logger.exception(
+                            "Could not resolve pasted inbox claim %s; manual recovery required",
+                            message.id,
+                        )
+                        continue
+                    if not resolved:
+                        # The paste may already have occurred. Never blindly
+                        # reset or redeliver a claim whose ownership/evidence
+                        # changed; leave it for manual audit.
+                        logger.error(
+                            "Could not durably resolve delivered inbox claim %s; "
+                            "manual recovery required",
+                            message.id,
+                        )
 
     def poll_opencode_pending_messages(self, registry: PluginRegistry | None = None) -> None:
         """Poll OpenCode terminals for pending inbox messages.

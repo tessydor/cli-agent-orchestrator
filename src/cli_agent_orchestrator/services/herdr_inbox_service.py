@@ -144,13 +144,11 @@ class HerdrInboxService:
         (populated later by _reconcile).  Builds the workspace map directly
         from a herdr api snapshot.
         """
-        from cli_agent_orchestrator.clients.database import (
-            delete_terminal,
-            list_terminals_by_session,
-        )
+        from cli_agent_orchestrator.clients.database import list_terminals_by_session
+        from cli_agent_orchestrator.services.terminal_service import delete_missing_terminal
 
         snapshot = self._fetch_snapshot()
-        if snapshot is None:
+        if snapshot is None or not self._snapshot_has_complete_identity(snapshot):
             logger.debug("Startup DB cleanup: no snapshot, skipping")
             return
 
@@ -181,8 +179,11 @@ class HerdrInboxService:
                         f"({session_name}:{window}) — tab not in herdr"
                     )
                     try:
-                        delete_terminal(term["id"])
-                        deleted += 1
+                        if delete_missing_terminal(
+                            term["id"],
+                            "Herdr startup snapshot proved the persisted worker tab is missing",
+                        ):
+                            deleted += 1
                     except Exception as e:
                         logger.warning(
                             f"Startup DB cleanup: failed to delete ghost terminal "
@@ -272,6 +273,9 @@ class HerdrInboxService:
             if not isinstance(snapshot, dict):
                 logger.warning("Snapshot: result.snapshot is not a dict; ignoring")
                 return None
+            if not self._snapshot_has_complete_identity(snapshot):
+                logger.warning("Snapshot: identity collections are incomplete; ignoring")
+                return None
             return snapshot
         except (
             subprocess.SubprocessError,
@@ -283,6 +287,25 @@ class HerdrInboxService:
             logger.warning(f"Snapshot: failed to fetch/parse: {e}")
             return None
 
+    @staticmethod
+    def _snapshot_has_complete_identity(snapshot: dict) -> bool:
+        """Require complete identity collections before treating absence as proof."""
+        required_fields = {
+            "panes": ("pane_id",),
+            "tabs": ("workspace_id", "label"),
+            "workspaces": ("workspace_id", "label"),
+        }
+        for collection, fields in required_fields.items():
+            records = snapshot.get(collection)
+            if not isinstance(records, list):
+                return False
+            if any(
+                not isinstance(record, dict) or any(not record.get(field) for field in fields)
+                for record in records
+            ):
+                return False
+        return True
+
     async def _reconcile(self) -> None:
         """Reconcile _pane_to_terminal map against live herdr state.
 
@@ -291,16 +314,16 @@ class HerdrInboxService:
         """
         from cli_agent_orchestrator.backends.registry import get_backend
         from cli_agent_orchestrator.clients.database import (
-            delete_terminal,
             get_terminal_metadata,
             list_terminals_by_session,
         )
+        from cli_agent_orchestrator.services.terminal_service import delete_missing_terminal
 
         # One socket call replaces the former pane-list + workspace-list +
         # tab-list subprocess fan-out. All three data structures below are derived
         # from this single snapshot.
         snapshot = self._fetch_snapshot()
-        if snapshot is None:
+        if snapshot is None or not self._snapshot_has_complete_identity(snapshot):
             logger.warning("Reconcile: no snapshot, skipping")
             return
 
@@ -340,7 +363,10 @@ class HerdrInboxService:
                         f"({session_name}:{window}) — tab not in herdr"
                     )
                     try:
-                        delete_terminal(term["id"])
+                        delete_missing_terminal(
+                            term["id"],
+                            "Herdr snapshot reconciliation proved the persisted tab is missing",
+                        )
                     except Exception as e:
                         logger.warning(
                             f"Reconcile: failed to delete ghost terminal {term['id']}: {e}"
@@ -382,7 +408,8 @@ class HerdrInboxService:
             # label means the pane_id was renumbered, not closed: re-resolve the
             # current pane_id and update both maps. Only when re-resolution fails
             # do we fall through to the delete path.
-            if term_window and self._label_still_live(term_window):
+            label_live = self._label_still_live(term_window) if term_window else None
+            if label_live is True:
                 try:
                     # Invalidate pane cache so get_pane_id does a fresh label-based
                     # lookup instead of returning the stale pane_id we just proved
@@ -390,15 +417,18 @@ class HerdrInboxService:
                     backend = get_backend()
                     if hasattr(backend, "_pane_cache"):
                         backend._pane_cache.pop(terminal_id, None)
-                    new_pane_id = backend.get_pane_id(terminal_id, term_session or "", term_window)
+                    new_pane_id = backend.get_pane_id(
+                        terminal_id, term_session or "", term_window or ""
+                    )
                 except Exception as e:
                     logger.warning(
                         "Reconcile: tab %s live but pane re-resolve failed for %s (%s); "
-                        "deleting",
+                        "retaining until backend identity can be proven",
                         term_window,
                         terminal_id,
                         e,
                     )
+                    continue
                 else:
                     self._pane_to_terminal.pop(pane_id, None)
                     self._pane_to_terminal[new_pane_id] = terminal_id
@@ -412,21 +442,31 @@ class HerdrInboxService:
                     remapped += 1
                     continue
 
-            # Tab label genuinely gone (or re-resolve failed): prune maps and
-            # delete the orphaned DB record.
-            self._pane_to_terminal.pop(pane_id, None)
-            self._terminal_to_pane.pop(terminal_id, None)
-            self._kiro_terminals.discard(terminal_id)
-            self._working_since.pop(terminal_id, None)
+            if term_window and label_live is None:
+                logger.warning(
+                    "Reconcile: cannot prove whether tab %s for %s is missing; "
+                    "retaining its report-recovery handle",
+                    term_window,
+                    terminal_id,
+                )
+                continue
 
+            # The durable label is positively absent. Classify an assigned
+            # worker as failed before deleting the irrecoverably missing pane.
             try:
-                delete_terminal(terminal_id)
-                deleted += 1
+                if delete_missing_terminal(
+                    terminal_id,
+                    "Herdr reconciliation proved the persisted worker tab is missing",
+                ):
+                    deleted += 1
+                    self._pane_to_terminal.pop(pane_id, None)
+                    self._terminal_to_pane.pop(terminal_id, None)
+                    self._kiro_terminals.discard(terminal_id)
+                    self._working_since.pop(terminal_id, None)
+                    if term_session:
+                        affected_sessions.add(term_session)
             except Exception as e:
                 logger.warning(f"Reconcile: failed to delete terminal {terminal_id}: {e}")
-
-            if term_session:
-                affected_sessions.add(term_session)
 
         # Kill a workspace only when its label is gone from herdr AND no managed
         # terminal remains for the session. A live label means the workspace is
@@ -545,15 +585,15 @@ class HerdrInboxService:
                     if terminal_id not in self._working_since:
                         self._working_since[terminal_id] = time.time()
 
-    def _label_still_live(self, window_name: str) -> bool:
-        """Return True if a tab with this label is still live in herdr.
+    def _label_still_live(self, window_name: str) -> Optional[bool]:
+        """Return tab liveness, or None when the backend cannot prove it.
 
         Used to disambiguate herdr's reused compact pane_ids on replayed
         pane_closed events. The tab label is unique per incarnation, so a live
         label means the close event refers to an older incarnation and is stale.
 
-        Fails toward False (not live) when herdr can't be queried, so the caller
-        proceeds with cleanup rather than leaving a possibly-closed terminal.
+        Query failures fail closed toward retention.  Treating uncertainty as a
+        missing backend could destroy the only uncaptured report handle.
         """
         try:
             result = subprocess.run(
@@ -568,59 +608,42 @@ class HerdrInboxService:
                     result.returncode,
                     result.stderr.strip(),
                 )
-                return False
-            tab_data = json.loads(result.stdout)
-            tabs = tab_data.get("result", {}).get("tabs", [])
-            live_labels = {tab.get("label", "") for tab in tabs}
-            return window_name in live_labels
-        except (subprocess.SubprocessError, json.JSONDecodeError, KeyError, OSError) as e:
-            logger.warning("_label_still_live: could not query herdr (%s)", e)
-            return False
-
-    def _resolve_session_from_herdr(self, workspace_id: str) -> Optional[str]:
-        """Resolve a workspace_id to its session name from live herdr state.
-
-        Used by workspace.closed handling when the in-memory _workspace_to_session
-        map (populated only by _reconcile) does not contain the closed
-        workspace_id. Queries herdr workspace list, refreshes the whole map from
-        the result, and returns the label for workspace_id if found.
-
-        Returns None when herdr cannot be queried or the workspace_id is not in
-        the live list, so the caller can treat the event as unresolvable and take
-        no destructive action.
-        """
-        try:
-            result = subprocess.run(
-                ["herdr", "--session", self._herdr_session, "workspace", "list"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if result.returncode != 0:
-                logger.warning(
-                    "_resolve_session_from_herdr: herdr workspace list failed (rc=%s): %s",
-                    result.returncode,
-                    result.stderr.strip(),
-                )
                 return None
-            ws_data = json.loads(result.stdout)
-            workspaces = ws_data.get("result", {}).get("workspaces", [])
-            self._workspace_to_session = {ws["workspace_id"]: ws["label"] for ws in workspaces}
-            return self._workspace_to_session.get(workspace_id)
-        except (subprocess.SubprocessError, json.JSONDecodeError, KeyError, OSError) as e:
-            logger.warning("_resolve_session_from_herdr: could not query herdr (%s)", e)
+            tab_data = json.loads(result.stdout)
+            result_data = tab_data.get("result")
+            if not isinstance(result_data, dict):
+                return None
+            tabs = result_data.get("tabs")
+            if not isinstance(tabs, list) or any(
+                not isinstance(tab, dict) or not tab.get("label") for tab in tabs
+            ):
+                return None
+            live_labels = {tab["label"] for tab in tabs}
+            return window_name in live_labels
+        except (
+            subprocess.SubprocessError,
+            json.JSONDecodeError,
+            KeyError,
+            OSError,
+            TypeError,
+        ) as e:
+            logger.warning("_label_still_live: could not query herdr (%s)", e)
             return None
+
+    def _workspace_label_still_live(self, session_name: str) -> Optional[bool]:
+        """Return workspace-label liveness, or None when absence is unproven."""
+        snapshot = self._fetch_snapshot()
+        if snapshot is None:
+            return None
+        return any(workspace.get("label") == session_name for workspace in snapshot["workspaces"])
 
     def _handle_lifecycle_event(self, event_type: str, data: dict) -> None:
         """Handle pane.closed and workspace.closed events."""
-        from cli_agent_orchestrator.backends.registry import get_backend
         from cli_agent_orchestrator.clients.database import (
             get_terminal_metadata,
             list_terminals_by_session,
         )
-        from cli_agent_orchestrator.services.terminal_service import (
-            delete_terminal as teardown_terminal,
-        )
+        from cli_agent_orchestrator.services.terminal_service import delete_missing_terminal
 
         if event_type == "pane.closed":
             pane_id = data.get("pane_id", "")
@@ -644,10 +667,11 @@ class HerdrInboxService:
             # The tab label (tmux_window) is unique per incarnation, so confirm
             # the label is genuinely gone from herdr before deleting. If the
             # label is still live, this close is stale (replayed) — ignore it.
-            # If herdr can't be queried, fall toward delete: never leave a
-            # terminal we think is open when it may actually be closed.
+            # If herdr cannot be queried, retain the recovery handle until the
+            # backend can positively prove that this incarnation is gone.
             window_name = meta["tmux_window"] if meta else None
-            if window_name and self._label_still_live(window_name):
+            label_live = self._label_still_live(window_name) if window_name else None
+            if label_live is True:
                 logger.info(
                     "pane.closed: ignoring stale close for %s (pane=%s) — "
                     "label %s still live in herdr (compact pane_id reused)",
@@ -656,68 +680,89 @@ class HerdrInboxService:
                     window_name,
                 )
                 return
+            if window_name and label_live is None:
+                logger.warning(
+                    "pane.closed: cannot verify label %s for %s; retaining its "
+                    "report-recovery handle",
+                    window_name,
+                    terminal_id,
+                )
+                return
 
-            # Remove from maps
+            # A pane.closed event plus a positively absent durable label proves
+            # the backend handle is gone. The missing-terminal path records a
+            # failed outcome before deleting an uncaptured assigned worker.
+            deleted = False
+            try:
+                deleted = delete_missing_terminal(
+                    terminal_id,
+                    "Herdr pane.closed event and absent durable tab label proved the pane missing",
+                )
+                if not deleted:
+                    logger.warning("pane.closed: cleanup deferred for terminal %s", terminal_id)
+            except Exception as e:
+                logger.warning(f"pane.closed: failed to delete terminal {terminal_id}: {e}")
+
+            if not deleted:
+                return
+
             self._pane_to_terminal.pop(pane_id, None)
             self._terminal_to_pane.pop(terminal_id, None)
             self._kiro_terminals.discard(terminal_id)
             self._working_since.pop(terminal_id, None)
 
-            # Route pane lifecycle through the normal teardown rather than a
-            # direct DB delete, so a Grok private home can return explicit
-            # deferred cleanup and retain its terminal row for retry.
-            try:
-                if teardown_terminal(terminal_id) is False:
-                    logger.warning("pane.closed: cleanup deferred for terminal %s", terminal_id)
-            except Exception as e:
-                logger.warning(f"pane.closed: failed to delete terminal {terminal_id}: {e}")
-
             logger.info(f"pane.closed: cleaned up terminal {terminal_id} (pane={pane_id})")
 
-            # If session has no more terminals in our map, kill workspace
-            remaining_in_session = [
-                t
-                for t in self._pane_to_terminal.values()
-                if (m := get_terminal_metadata(t)) and m.get("tmux_session") == session_name
-            ]
-            if session_name and not remaining_in_session:
-                try:
-                    get_backend().kill_session(session_name)
-                    logger.info(f"pane.closed: killed empty workspace {session_name}")
-                except Exception as e:
-                    logger.warning(f"pane.closed: failed to kill workspace {session_name}: {e}")
+            # A pane-close event proves only that pane is gone. Workspace
+            # teardown belongs to a verified workspace-close/reconcile path; it
+            # must not kill other unregistered or not-yet-mapped panes.
 
         elif event_type == "workspace.closed":
             workspace_id = data.get("workspace_id", "")
             session_name = self._workspace_to_session.get(workspace_id)
             if not session_name:
-                # The in-memory map is populated only by _reconcile(); a workspace
-                # that closed before any reconcile cached it would otherwise be a
-                # silent no-op, leaking the session's terminals as orphan rows.
-                # Resolve the session identity from live herdr state instead of
-                # trusting the map. Only treat the event as unresolvable after the
-                # live query also fails to identify a session.
-                session_name = self._resolve_session_from_herdr(workspace_id)
-                if not session_name:
-                    return
+                # Once the workspace is absent, a fresh backend query cannot map
+                # its opaque id back to a persisted session safely. Guessing from
+                # a live/reused id could delete a new workspace, so retain rows.
+                logger.warning(
+                    "workspace.closed: no persisted session mapping for %s; retaining rows",
+                    workspace_id,
+                )
+                return
 
-            # A workspace close is also a terminal lifecycle transition. Route
-            # every persisted terminal through the normal teardown rather than
-            # bulk-deleting rows, so Grok private homes receive their safe,
-            # retryable provider cleanup even when this inbox service was
-            # restored without an in-memory provider map.
-            from cli_agent_orchestrator.services.terminal_service import (
-                delete_terminal as teardown_terminal,
-            )
+            workspace_live = self._workspace_label_still_live(session_name)
+            if workspace_live is True:
+                logger.info(
+                    "workspace.closed: ignoring stale close for live session %s",
+                    session_name,
+                )
+                return
+            if workspace_live is None:
+                logger.warning(
+                    "workspace.closed: cannot prove session %s is absent; retaining rows",
+                    session_name,
+                )
+                return
 
+            # The event plus a positively absent durable workspace label proves
+            # every contained backend pane is gone. Classify workers first.
+            deleted_terminal_ids = set()
+            cleanup_complete = True
             for terminal in list_terminals_by_session(session_name):
                 terminal_id = terminal["id"]
                 try:
-                    if teardown_terminal(terminal_id) is False:
+                    if delete_missing_terminal(
+                        terminal_id,
+                        "Herdr workspace.closed event proved the backend workspace missing",
+                    ):
+                        deleted_terminal_ids.add(terminal_id)
+                    else:
+                        cleanup_complete = False
                         logger.warning(
                             "workspace.closed: cleanup deferred for terminal %s", terminal_id
                         )
                 except Exception as e:
+                    cleanup_complete = False
                     logger.warning(
                         "workspace.closed: failed to cleanup terminal %s: %s", terminal_id, e
                     )
@@ -730,7 +775,7 @@ class HerdrInboxService:
             to_remove = [
                 (pid, tid)
                 for pid, tid in self._pane_to_terminal.items()
-                if (m := get_terminal_metadata(tid)) and m.get("tmux_session") == session_name
+                if tid in deleted_terminal_ids
             ]
             for pid, tid in to_remove:
                 self._pane_to_terminal.pop(pid, None)
@@ -738,9 +783,13 @@ class HerdrInboxService:
                 self._kiro_terminals.discard(tid)
                 self._working_since.pop(tid, None)
 
-            self._workspace_to_session.pop(workspace_id, None)
+            if cleanup_complete:
+                self._workspace_to_session.pop(workspace_id, None)
             logger.info(
-                f"workspace.closed: cleaned up session {session_name} ({len(to_remove)} terminals)"
+                "workspace.closed: processed session %s (%d terminals deleted; complete=%s)",
+                session_name,
+                len(to_remove),
+                cleanup_complete,
             )
 
     # TODO: _deliver() calls callback synchronously — if callback is async,

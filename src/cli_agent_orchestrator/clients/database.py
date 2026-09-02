@@ -1,5 +1,6 @@
 """Minimal database client with only terminal metadata."""
 
+import hashlib
 import logging
 import os
 import uuid
@@ -7,22 +8,40 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, cast
 
 from sqlalchemy import (
+    DDL,
     Boolean,
     CheckConstraint,
     Column,
     DateTime,
     Float,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
     create_engine,
+    event,
 )
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
 
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
+from cli_agent_orchestrator.models.assigned_worker import (
+    AssignedWorkerCallback,
+    AssignedWorkerIntegrityError,
+    AssignmentLifecycle,
+    CompletionDeliveryState,
+    CompletionReceiverState,
+    callback_routing_digest,
+    canonical_callback_text,
+    format_server_completion_message,
+)
 from cli_agent_orchestrator.models.flow import Flow
-from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
+from cli_agent_orchestrator.models.inbox import (
+    InboxMessage,
+    InboxMessageOrigin,
+    MessageStatus,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +86,212 @@ class InboxModel(Base):
     receiver_id = Column(String, nullable=False)
     message = Column(String, nullable=False)
     status = Column(String, nullable=False)  # MessageStatus enum value
+    # Origin and assignment linkage let successful assigned-worker completion
+    # delivery suppress only an equivalent explicit final callback.  Legacy and
+    # unrelated intermediate messages remain independent inbox rows.
+    origin = Column(
+        String,
+        nullable=False,
+        default=InboxMessageOrigin.LEGACY.value,
+        # Keep a freshly created V1 database writable by a rolled-back 2.4.1
+        # server, whose INSERT statements do not name this additive column.
+        server_default=InboxMessageOrigin.LEGACY.value,
+    )
+    assignment_id = Column(String, nullable=True)
+    # Nullable for legacy/explicit rows.  SQLite permits multiple NULLs in a
+    # unique index, while server-generated callbacks use a stable non-NULL key.
+    idempotency_key = Column(String, nullable=True)
+    # Delivery uses an atomic PENDING -> DELIVERING compare-and-set.  Only the
+    # owner of this opaque token may resolve the claim after terminal paste.
+    claim_token = Column(String, nullable=True)
+    claimed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.now)
+
+    __table_args__ = (Index("uq_inbox_idempotency_key", "idempotency_key", unique=True),)
+
+
+class AssignedWorkerCallbackModel(Base):
+    """Durable successful-completion callback state for one assigned worker.
+
+    No foreign key points at ``terminals``: worker and caller rows are operational
+    records that may be deleted, while the completion report must remain available
+    for manual recovery.  Identity/routing fields are written once at assignment
+    creation and no update function below mutates them.
+    """
+
+    __tablename__ = "assigned_worker_callbacks"
+
+    assignment_id = Column(String, primary_key=True)
+    completion_id = Column(String, nullable=False)
+    worker_terminal_id = Column(String, nullable=False)
+    caller_id = Column(String, nullable=False)
+    routing_digest = Column(String, nullable=False)
+    lifecycle = Column(String, nullable=False, default=AssignmentLifecycle.ASSIGNED.value)
+    delivery_state = Column(String, nullable=False, default=CompletionDeliveryState.NOT_READY.value)
+    receiver_state = Column(String, nullable=False, default=CompletionReceiverState.UNKNOWN.value)
+    final_result = Column(Text, nullable=True)
+    final_result_sha256 = Column(String, nullable=True)
+    result_reference = Column(String, nullable=True)
+    inbox_message_id = Column(Integer, nullable=True)
+    attempt_count = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+    dispatched_at = Column(DateTime, nullable=True)
+    completion_observed_at = Column(DateTime, nullable=True)
+    captured_at = Column(DateTime, nullable=True)
+    first_attempt_at = Column(DateTime, nullable=True)
+    last_attempt_at = Column(DateTime, nullable=True)
+    enqueued_at = Column(DateTime, nullable=True)
+    acknowledged_at = Column(DateTime, nullable=True)
+    terminal_error_at = Column(DateTime, nullable=True)
+    last_error = Column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("uq_assigned_worker_callback_completion_id", "completion_id", unique=True),
+        Index("uq_assigned_worker_callback_worker", "worker_terminal_id", unique=True),
+        Index("idx_assigned_worker_callback_delivery", "delivery_state"),
+    )
+
+
+_IMMUTABLE_CALLBACK_ROUTE_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS trg_assigned_worker_route_immutable
+BEFORE UPDATE OF assignment_id, completion_id, worker_terminal_id, caller_id, routing_digest
+ON assigned_worker_callbacks
+WHEN NEW.assignment_id IS NOT OLD.assignment_id
+  OR NEW.completion_id IS NOT OLD.completion_id
+  OR NEW.worker_terminal_id IS NOT OLD.worker_terminal_id
+  OR NEW.caller_id IS NOT OLD.caller_id
+  OR NEW.routing_digest IS NOT OLD.routing_digest
+BEGIN
+  SELECT RAISE(ABORT, 'assigned-worker callback routing is immutable');
+END
+"""
+
+_IMMUTABLE_CALLBACK_RESULT_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS trg_assigned_worker_result_immutable
+BEFORE UPDATE OF final_result, final_result_sha256, result_reference
+ON assigned_worker_callbacks
+WHEN (OLD.final_result IS NOT NULL
+   OR OLD.final_result_sha256 IS NOT NULL
+   OR OLD.result_reference IS NOT NULL)
+ AND (
+      NEW.final_result IS NOT OLD.final_result
+   OR NEW.final_result_sha256 IS NOT OLD.final_result_sha256
+   OR NEW.result_reference IS NOT OLD.result_reference
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'captured assigned-worker result is immutable');
+END
+"""
+
+_IMMUTABLE_CALLBACK_LINK_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS trg_assigned_worker_link_immutable
+BEFORE UPDATE OF inbox_message_id ON assigned_worker_callbacks
+WHEN OLD.inbox_message_id IS NOT NULL
+ AND NEW.inbox_message_id IS NOT OLD.inbox_message_id
+BEGIN
+  SELECT RAISE(ABORT, 'assigned-worker callback inbox link is immutable once set');
+END
+"""
+
+_RETAIN_CALLBACK_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS trg_assigned_worker_callback_retain
+BEFORE DELETE ON assigned_worker_callbacks
+BEGIN
+  SELECT RAISE(ABORT, 'assigned-worker callback audit/report must be retained');
+END
+"""
+
+_RETAIN_UNCLASSIFIED_WORKER_TERMINAL_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS trg_assigned_worker_terminal_recovery_retain
+BEFORE DELETE ON terminals
+WHEN EXISTS (
+  SELECT 1 FROM assigned_worker_callbacks callback
+  WHERE callback.worker_terminal_id = OLD.id
+    AND callback.lifecycle IN ('assigned', 'dispatched', 'unresolved')
+)
+BEGIN
+  SELECT RAISE(ABORT, 'unclassified assigned-worker terminal must be retained');
+END
+"""
+
+_REQUIRE_RECEIVER_DELETE_AUDIT_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS trg_assigned_worker_receiver_delete_audit
+BEFORE DELETE ON terminals
+WHEN EXISTS (
+  SELECT 1 FROM assigned_worker_callbacks callback
+  WHERE callback.caller_id = OLD.id
+    AND callback.lifecycle IN ('assigned', 'dispatched', 'unresolved', 'completed')
+    AND callback.receiver_state != 'deleted'
+    AND callback.delivery_state != 'terminal_error'
+)
+BEGIN
+  SELECT RAISE(ABORT, 'assigned-worker receiver deletion requires callback audit');
+END
+"""
+
+_IMMUTABLE_LINKED_INBOX_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS trg_assigned_worker_inbox_evidence_immutable
+BEFORE UPDATE OF id, sender_id, receiver_id, message, origin, assignment_id, idempotency_key
+ON inbox
+WHEN OLD.origin = 'server_completion'
+ OR EXISTS (
+  SELECT 1 FROM assigned_worker_callbacks callback
+  WHERE callback.inbox_message_id = OLD.id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'linked assigned-worker inbox evidence is immutable');
+END
+"""
+
+_RETAIN_LINKED_INBOX_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS trg_assigned_worker_inbox_evidence_retain
+BEFORE DELETE ON inbox
+WHEN EXISTS (
+  SELECT 1 FROM assigned_worker_callbacks callback
+  WHERE callback.inbox_message_id = OLD.id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'linked assigned-worker inbox evidence must be retained');
+END
+"""
+
+_RETAIN_SERVER_INBOX_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS trg_assigned_worker_server_inbox_retain
+BEFORE DELETE ON inbox
+WHEN OLD.origin = 'server_completion'
+BEGIN
+  SELECT RAISE(ABORT, 'assigned-worker server inbox evidence must be retained');
+END
+"""
+
+_RETAIN_DELIVERED_INBOX_STATUS_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS trg_delivered_inbox_status_immutable
+BEFORE UPDATE OF status ON inbox
+WHEN OLD.status = 'delivered' AND NEW.status != 'delivered'
+ AND EXISTS (
+  SELECT 1 FROM assigned_worker_callbacks callback
+  WHERE callback.inbox_message_id = OLD.id
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'delivered inbox status is immutable');
+END
+"""
+
+# Fresh databases receive the same guards as migrated databases.  The callback
+# table is declared after inbox, so both referenced tables exist at after_create.
+for _callback_trigger in (
+    _IMMUTABLE_CALLBACK_ROUTE_TRIGGER,
+    _IMMUTABLE_CALLBACK_RESULT_TRIGGER,
+    _IMMUTABLE_CALLBACK_LINK_TRIGGER,
+    _RETAIN_CALLBACK_TRIGGER,
+    _RETAIN_UNCLASSIFIED_WORKER_TERMINAL_TRIGGER,
+    _REQUIRE_RECEIVER_DELETE_AUDIT_TRIGGER,
+    _IMMUTABLE_LINKED_INBOX_TRIGGER,
+    _RETAIN_LINKED_INBOX_TRIGGER,
+    _RETAIN_SERVER_INBOX_TRIGGER,
+    _RETAIN_DELIVERED_INBOX_STATUS_TRIGGER,
+):
+    event.listen(AssignedWorkerCallbackModel.__table__, "after_create", DDL(_callback_trigger))
 
 
 def _utcnow() -> datetime:
@@ -299,6 +523,8 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _restrict_db_file_permissions()
     _migrate_terminals_schema()
+    _migrate_inbox_callback_schema()
+    _migrate_assigned_worker_integrity_schema()
     _migrate_memory_indexes()
     _migrate_add_access_count()
     _migrate_add_last_compiled_at()
@@ -1025,6 +1251,123 @@ def _migrate_terminals_schema() -> None:
         logger.warning(f"Migration check for terminals schema failed: {e}")
 
 
+def _migrate_inbox_callback_schema() -> None:
+    """Add callback audit/idempotency columns to an existing inbox table.
+
+    ``Base.metadata.create_all`` creates ``assigned_worker_callbacks`` and the
+    complete inbox schema for fresh installations.  SQLite does not add columns
+    to an existing table, so upgrades use additive nullable/defaulted columns and
+    a named unique index.  The migration is idempotent and preserves every legacy
+    inbox row as ``origin='legacy'``.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(inbox)")}
+            if not columns:
+                # A mocked/partial startup may not have created the table.  The
+                # normal create_all path handles it on the next real startup.
+                return
+            if "origin" not in columns:
+                conn.execute("ALTER TABLE inbox ADD COLUMN origin TEXT NOT NULL DEFAULT 'legacy'")
+            if "assignment_id" not in columns:
+                conn.execute("ALTER TABLE inbox ADD COLUMN assignment_id TEXT")
+            if "idempotency_key" not in columns:
+                conn.execute("ALTER TABLE inbox ADD COLUMN idempotency_key TEXT")
+            if "claim_token" not in columns:
+                conn.execute("ALTER TABLE inbox ADD COLUMN claim_token TEXT")
+            if "claimed_at" not in columns:
+                conn.execute("ALTER TABLE inbox ADD COLUMN claimed_at DATETIME")
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_inbox_idempotency_key "
+                "ON inbox (idempotency_key)"
+            )
+            conn.commit()
+    except Exception as e:
+        # Callback idempotency depends on this unique index.  Continuing with a
+        # partially migrated inbox would turn duplicate completion events into
+        # duplicate supervisor messages, so startup must fail closed.
+        logger.error(f"Migration check for inbox callback schema failed: {e}")
+        raise
+
+
+def _migrate_assigned_worker_integrity_schema() -> None:
+    """Anchor immutable routes and install fail-closed SQLite integrity guards."""
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(assigned_worker_callbacks)")
+            }
+            if not columns:
+                return
+            if "routing_digest" not in columns:
+                conn.execute("ALTER TABLE assigned_worker_callbacks ADD COLUMN routing_digest TEXT")
+
+            rows = conn.execute(
+                "SELECT assignment_id, completion_id, worker_terminal_id, caller_id, "
+                "routing_digest FROM assigned_worker_callbacks"
+            ).fetchall()
+            for assignment_id, completion_id, worker_terminal_id, caller_id, digest in rows:
+                expected = callback_routing_digest(
+                    assignment_id, completion_id, worker_terminal_id, caller_id
+                )
+                if digest is None:
+                    conn.execute(
+                        "UPDATE assigned_worker_callbacks SET routing_digest = ? "
+                        "WHERE assignment_id = ?",
+                        (expected, assignment_id),
+                    )
+                elif digest != expected:
+                    raise AssignedWorkerIntegrityError(
+                        f"Routing digest mismatch during migration for assignment {assignment_id}"
+                    )
+
+            callback_triggers = (
+                _IMMUTABLE_CALLBACK_ROUTE_TRIGGER,
+                _IMMUTABLE_CALLBACK_RESULT_TRIGGER,
+                _IMMUTABLE_CALLBACK_LINK_TRIGGER,
+                _RETAIN_CALLBACK_TRIGGER,
+                _RETAIN_UNCLASSIFIED_WORKER_TERMINAL_TRIGGER,
+                _REQUIRE_RECEIVER_DELETE_AUDIT_TRIGGER,
+                _IMMUTABLE_LINKED_INBOX_TRIGGER,
+                _RETAIN_LINKED_INBOX_TRIGGER,
+                _RETAIN_SERVER_INBOX_TRIGGER,
+                _RETAIN_DELIVERED_INBOX_STATUS_TRIGGER,
+            )
+            # Trigger definitions are versioned code, not merely presence
+            # markers. Recreate every V1 guard so a database exercised by an
+            # earlier draft cannot retain weaker result, route, or deletion
+            # semantics behind CREATE IF NOT EXISTS.
+            for trigger_name in (
+                "trg_assigned_worker_route_immutable",
+                "trg_assigned_worker_result_immutable",
+                "trg_assigned_worker_link_immutable",
+                "trg_assigned_worker_callback_retain",
+                "trg_assigned_worker_terminal_recovery_retain",
+                "trg_assigned_worker_receiver_delete_audit",
+                "trg_assigned_worker_inbox_evidence_immutable",
+                "trg_assigned_worker_inbox_evidence_retain",
+                "trg_assigned_worker_server_inbox_retain",
+                "trg_delivered_inbox_status_immutable",
+            ):
+                conn.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+            for trigger_sql in callback_triggers:
+                conn.execute(trigger_sql)
+            conn.commit()
+    except Exception as e:
+        # Starting without these guards would make self-consistent route
+        # rewriting indistinguishable from a legitimate assignment.
+        logger.error(f"Assigned-worker integrity migration failed: {e}")
+        raise
+
+
 def create_terminal(
     terminal_id: str,
     tmux_session: str,
@@ -1038,9 +1381,21 @@ def create_terminal(
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
     working_directory: Optional[str] = None,
+    assignment_id: Optional[str] = None,
+    completion_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Create terminal metadata record."""
+    """Create terminal metadata and, when supplied, its assignment atomically.
+
+    The terminal and assigned-worker callback rows share one transaction.  A
+    crash can therefore never expose an assigned worker whose immutable caller
+    and completion identities were not persisted.
+    """
     import json as _json
+
+    if bool(assignment_id) != bool(completion_id):
+        raise ValueError("assignment_id and completion_id must be supplied together")
+    if assignment_id and not caller_id:
+        raise ValueError("an assigned-worker callback requires caller_id")
 
     with SessionLocal() as db:
         terminal = TerminalModel(
@@ -1058,6 +1413,21 @@ def create_terminal(
             metadata_json=_json.dumps(metadata) if metadata else None,
         )
         db.add(terminal)
+        if assignment_id and completion_id:
+            db.add(
+                AssignedWorkerCallbackModel(
+                    assignment_id=assignment_id,
+                    completion_id=completion_id,
+                    worker_terminal_id=terminal_id,
+                    caller_id=caller_id,
+                    routing_digest=callback_routing_digest(
+                        assignment_id, completion_id, terminal_id, caller_id
+                    ),
+                    lifecycle=AssignmentLifecycle.ASSIGNED.value,
+                    delivery_state=CompletionDeliveryState.NOT_READY.value,
+                    receiver_state=CompletionReceiverState.UNKNOWN.value,
+                )
+            )
         db.commit()
         return {
             "id": terminal.id,
@@ -1366,55 +1736,497 @@ def list_pending_receiver_ids_older_than(min_age_seconds: int) -> List[str]:
         return [row[0] for row in rows]
 
 
-def delete_terminal(terminal_id: str) -> bool:
-    """Delete terminal metadata."""
-    with SessionLocal() as db:
-        deleted = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).delete()
-        db.commit()
-        return deleted > 0
+def _audit_receiver_deletion(db: Any, terminal_id: str) -> None:
+    """Record the true fate of callbacks routed to a deleted receiver."""
+    callbacks = (
+        db.query(AssignedWorkerCallbackModel)
+        .filter(AssignedWorkerCallbackModel.caller_id == terminal_id)
+        .all()
+    )
+    for callback in callbacks:
+        _validate_assigned_worker_callback_row(db, callback)
+        lifecycle = AssignmentLifecycle(callback.lifecycle)
+        linked = None
+        if callback.inbox_message_id is not None:
+            linked = db.query(InboxModel).filter(InboxModel.id == callback.inbox_message_id).first()
+
+        # A completed paste is durable evidence that deletion happened later;
+        # preserve the successful historical state while recording the
+        # receiver's true current disposition. This update also permits the
+        # central delete through the raw-delete audit trigger below.
+        if linked is not None and linked.status == MessageStatus.DELIVERED.value:
+            callback.receiver_state = CompletionReceiverState.DELETED.value
+            callback.last_error = (
+                f"Persisted caller terminal {terminal_id} was deleted after callback paste; "
+                "durable delivered evidence is preserved"
+            )
+            db.flush()
+            _validate_assigned_worker_callback_row(db, callback)
+            continue
+
+        if lifecycle == AssignmentLifecycle.COMPLETED:
+            if linked is not None and linked.status in (
+                MessageStatus.PENDING.value,
+                MessageStatus.DELIVERING.value,
+            ):
+                linked.status = MessageStatus.FAILED.value
+                linked.claim_token = None
+            callback.delivery_state = CompletionDeliveryState.TERMINAL_ERROR.value
+            callback.receiver_state = CompletionReceiverState.DELETED.value
+            callback.terminal_error_at = datetime.now()
+            callback.last_error = (
+                f"Persisted caller terminal {terminal_id} was deleted before callback paste; "
+                "retained report requires manual recovery"
+            )
+        elif lifecycle in (
+            AssignmentLifecycle.ASSIGNED,
+            AssignmentLifecycle.DISPATCHED,
+            AssignmentLifecycle.UNRESOLVED,
+        ):
+            # The task may still complete.  Keep it capture-reconcilable; once
+            # captured, normal receiver classification records TERMINAL_ERROR.
+            callback.receiver_state = CompletionReceiverState.DELETED.value
+            if lifecycle != AssignmentLifecycle.UNRESOLVED:
+                callback.last_error = (
+                    f"Persisted caller terminal {terminal_id} was deleted before task completion"
+                )
+        db.flush()
+        _validate_assigned_worker_callback_row(db, callback)
 
 
-def delete_terminals_by_session(tmux_session: str) -> int:
-    """Delete all terminals in a session."""
-    with SessionLocal() as db:
-        deleted = (
-            db.query(TerminalModel).filter(TerminalModel.tmux_session == tmux_session).delete()
-        )
-        db.commit()
-        return deleted
+def delete_terminal(
+    terminal_id: str,
+    *,
+    missing_backend: bool = False,
+    reason: Optional[str] = None,
+) -> bool:
+    """Delete terminal metadata under the central report-preservation invariant.
 
-
-def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> InboxMessage:
-    """Create inbox message with status=MessageStatus.PENDING.
-
-    Raises:
-        ValueError: If the receiver terminal does not exist.
+    Direct deletion refuses any worker whose task outcome is not durably
+    classified.  A caller that has positively established the backend handle is
+    already gone may pass ``missing_backend=True`` plus an audit reason; that
+    atomically records FAILED/TERMINAL_ERROR before deleting the stale row.
     """
+    if missing_backend and not reason:
+        raise ValueError("missing_backend deletion requires an auditable reason")
     with SessionLocal() as db:
-        if not db.query(TerminalModel).filter(TerminalModel.id == receiver_id).first():
-            raise ValueError(f"Terminal '{receiver_id}' not found")
-        inbox_msg = InboxModel(
+        # Serialize receiver audit and terminal deletion with callback enqueue
+        # and explicit-final equivalence transactions.
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if terminal is None:
+            db.rollback()
+            return False
+
+        worker_callback = (
+            db.query(AssignedWorkerCallbackModel)
+            .filter(AssignedWorkerCallbackModel.worker_terminal_id == terminal_id)
+            .first()
+        )
+        if worker_callback is not None:
+            _validate_assigned_worker_callback_row(db, worker_callback)
+            lifecycle = AssignmentLifecycle(worker_callback.lifecycle)
+            if lifecycle in (
+                AssignmentLifecycle.ASSIGNED,
+                AssignmentLifecycle.DISPATCHED,
+                AssignmentLifecycle.UNRESOLVED,
+            ):
+                if not missing_backend:
+                    db.rollback()
+                    logger.warning(
+                        "Refusing direct deletion of assigned worker %s with unclassified "
+                        "lifecycle %s",
+                        terminal_id,
+                        lifecycle.value,
+                    )
+                    return False
+                worker_callback.lifecycle = AssignmentLifecycle.FAILED.value
+                worker_callback.delivery_state = CompletionDeliveryState.TERMINAL_ERROR.value
+                worker_callback.receiver_state = CompletionReceiverState.UNKNOWN.value
+                worker_callback.terminal_error_at = datetime.now()
+                worker_callback.last_error = reason
+                db.flush()
+                _validate_assigned_worker_callback_row(db, worker_callback)
+
+        _audit_receiver_deletion(db, terminal_id)
+        db.delete(terminal)
+        db.commit()
+        return True
+
+
+def delete_terminals_by_session(
+    tmux_session: str,
+    *,
+    missing_backend: bool = False,
+    reason: Optional[str] = None,
+) -> int:
+    """Delete session rows one-by-one through the central deletion invariant."""
+    with SessionLocal() as db:
+        terminal_ids = [
+            row[0]
+            for row in db.query(TerminalModel.id)
+            .filter(TerminalModel.tmux_session == tmux_session)
+            .all()
+        ]
+    deleted = 0
+    for terminal_id in terminal_ids:
+        if delete_terminal(
+            terminal_id,
+            missing_backend=missing_backend,
+            reason=reason,
+        ):
+            deleted += 1
+    return deleted
+
+
+def _inbox_message_from_row(row: InboxModel) -> InboxMessage:
+    """Convert an ORM inbox row, including legacy rows, to its read model."""
+    raw_origin = getattr(row, "origin", None) or InboxMessageOrigin.LEGACY.value
+    try:
+        origin = InboxMessageOrigin(raw_origin)
+    except ValueError:
+        origin = InboxMessageOrigin.LEGACY
+    return InboxMessage(
+        id=row.id,
+        sender_id=row.sender_id,
+        receiver_id=row.receiver_id,
+        message=row.message,
+        status=MessageStatus(row.status),
+        created_at=row.created_at,
+        origin=origin,
+        assignment_id=getattr(row, "assignment_id", None),
+        idempotency_key=getattr(row, "idempotency_key", None),
+        claim_token=getattr(row, "claim_token", None),
+        claimed_at=getattr(row, "claimed_at", None),
+    )
+
+
+def create_inbox_message(
+    sender_id: str,
+    receiver_id: str,
+    message: str,
+    *,
+    origin: InboxMessageOrigin = InboxMessageOrigin.LEGACY,
+    assignment_id: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+) -> InboxMessage:
+    """Create one durable inbox row, serializing callback equivalence races.
+
+    Explicit-final suppression and server-callback insertion share one SQLite
+    ``BEGIN IMMEDIATE`` transaction.  Whichever ordering wins commits the sole
+    callback evidence; the loser returns that row instead of inserting another
+    supervisor-visible message.  Non-equivalent explicit traffic is unchanged.
+    """
+
+    def _matches_immutable_payload(existing: InboxModel) -> bool:
+        return (
+            cast(str, existing.sender_id) == sender_id
+            and cast(str, existing.receiver_id) == receiver_id
+            and cast(str, existing.message) == message
+            and cast(Optional[str], existing.assignment_id) == assignment_id
+            and cast(str, existing.origin) == origin.value
+        )
+
+    def _new_row(
+        *,
+        row_origin: InboxMessageOrigin = origin,
+        row_assignment_id: Optional[str] = assignment_id,
+        row_idempotency_key: Optional[str] = idempotency_key,
+    ) -> InboxModel:
+        row = InboxModel(
             sender_id=sender_id,
             receiver_id=receiver_id,
             message=message,
             status=MessageStatus.PENDING.value,
+            origin=row_origin.value,
+            assignment_id=row_assignment_id,
+            idempotency_key=row_idempotency_key,
         )
-        db.add(inbox_msg)
+        db.add(row)
+        db.flush()
+        return row
+
+    def _link_callback(callback: AssignedWorkerCallbackModel, inbox_row: InboxModel) -> None:
+        now = datetime.now()
+        callback.inbox_message_id = inbox_row.id
+        callback.enqueued_at = callback.enqueued_at or inbox_row.created_at or now
+        callback.acknowledged_at = callback.acknowledged_at or now
+        callback.last_error = None
+        callback.delivery_state = (
+            CompletionDeliveryState.SUPPRESSED_EXPLICIT.value
+            if inbox_row.origin == InboxMessageOrigin.EXPLICIT.value
+            else CompletionDeliveryState.ACKNOWLEDGED.value
+        )
+
+    callback_write = origin in (
+        InboxMessageOrigin.EXPLICIT,
+        InboxMessageOrigin.SERVER_COMPLETION,
+    )
+    with SessionLocal() as db:
+        if callback_write or idempotency_key is not None:
+            # Acquire the SQLite writer slot before any equivalence read.  This
+            # closes both explicit-first/server-first callback races and the
+            # ordinary idempotency-key check/insert race.
+            db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+
+        if not db.query(TerminalModel).filter(TerminalModel.id == receiver_id).first():
+            raise ValueError(f"Terminal '{receiver_id}' not found")
+
+        callback: Optional[AssignedWorkerCallbackModel] = None
+        if origin == InboxMessageOrigin.EXPLICIT and assignment_id is None:
+            callback = (
+                db.query(AssignedWorkerCallbackModel)
+                .filter(
+                    AssignedWorkerCallbackModel.worker_terminal_id == sender_id,
+                    AssignedWorkerCallbackModel.caller_id == receiver_id,
+                    AssignedWorkerCallbackModel.lifecycle.in_(
+                        (
+                            AssignmentLifecycle.ASSIGNED.value,
+                            AssignmentLifecycle.DISPATCHED.value,
+                            AssignmentLifecycle.COMPLETED.value,
+                            AssignmentLifecycle.UNRESOLVED.value,
+                        )
+                    ),
+                )
+                .order_by(AssignedWorkerCallbackModel.created_at.desc())
+                .first()
+            )
+            if callback is not None:
+                _validate_assigned_worker_callback_row(db, callback)
+                assignment_id = cast(str, callback.assignment_id)
+        elif assignment_id is not None:
+            callback = (
+                db.query(AssignedWorkerCallbackModel)
+                .filter(AssignedWorkerCallbackModel.assignment_id == assignment_id)
+                .first()
+            )
+            if callback is not None:
+                _validate_assigned_worker_callback_row(db, callback)
+
+        if origin == InboxMessageOrigin.EXPLICIT and callback is not None:
+            equivalent_final = (
+                callback.lifecycle == AssignmentLifecycle.COMPLETED.value
+                and callback.final_result is not None
+                and callback.delivery_state != CompletionDeliveryState.TERMINAL_ERROR.value
+                and canonical_callback_text(message)
+                == canonical_callback_text(callback.final_result)
+            )
+            if equivalent_final:
+                # Server already won: satisfy the explicit API call with its
+                # exact row.  No second explicit row becomes supervisor input.
+                if callback.inbox_message_id is not None:
+                    linked = (
+                        db.query(InboxModel)
+                        .filter(InboxModel.id == callback.inbox_message_id)
+                        .first()
+                    )
+                    if linked is None:
+                        raise _callback_integrity_error(callback, "linked inbox row disappeared")
+                    db.commit()
+                    return _inbox_message_from_row(linked)
+
+                expected_key = f"assigned-worker-completion:{callback.completion_id}"
+                existing_server = (
+                    db.query(InboxModel).filter(InboxModel.idempotency_key == expected_key).first()
+                )
+                if existing_server is not None:
+                    _validate_server_completion_inbox_row(callback, existing_server)
+                    _link_callback(callback, existing_server)
+                    db.flush()
+                    _validate_assigned_worker_callback_row(db, callback)
+                    db.commit()
+                    return _inbox_message_from_row(existing_server)
+
+                explicit_row = _new_row(
+                    row_origin=InboxMessageOrigin.EXPLICIT,
+                    row_assignment_id=callback.assignment_id,
+                    row_idempotency_key=None,
+                )
+                _link_callback(callback, explicit_row)
+                db.flush()
+                _validate_assigned_worker_callback_row(db, callback)
+                db.commit()
+                return _inbox_message_from_row(explicit_row)
+
+        if origin == InboxMessageOrigin.SERVER_COMPLETION:
+            if callback is None:
+                raise ValueError("Server completion requires a persisted assignment")
+            if callback.lifecycle != AssignmentLifecycle.COMPLETED.value:
+                raise ValueError("Server completion requires a captured successful result")
+            if callback.delivery_state == CompletionDeliveryState.TERMINAL_ERROR.value:
+                raise ValueError("A terminal callback cannot be enqueued again")
+            expected_message = format_server_completion_message(
+                callback.final_result or "",
+                callback.worker_terminal_id,
+                callback.assignment_id,
+                callback.completion_id,
+            )
+            expected_key = f"assigned-worker-completion:{callback.completion_id}"
+            if message != expected_message or idempotency_key != expected_key:
+                raise ValueError("Server completion payload or idempotency identity mismatch")
+
+            if callback.inbox_message_id is not None:
+                linked = (
+                    db.query(InboxModel).filter(InboxModel.id == callback.inbox_message_id).first()
+                )
+                if linked is None:
+                    raise _callback_integrity_error(callback, "linked inbox row disappeared")
+                db.commit()
+                return _inbox_message_from_row(linked)
+
+            existing_server = (
+                db.query(InboxModel).filter(InboxModel.idempotency_key == expected_key).first()
+            )
+            if existing_server is not None:
+                _validate_server_completion_inbox_row(callback, existing_server)
+                _link_callback(callback, existing_server)
+                db.flush()
+                _validate_assigned_worker_callback_row(db, callback)
+                db.commit()
+                return _inbox_message_from_row(existing_server)
+
+            explicit_candidates = (
+                db.query(InboxModel)
+                .filter(
+                    InboxModel.assignment_id == callback.assignment_id,
+                    InboxModel.origin == InboxMessageOrigin.EXPLICIT.value,
+                    InboxModel.status.in_(
+                        (
+                            MessageStatus.PENDING.value,
+                            MessageStatus.DELIVERING.value,
+                            MessageStatus.DELIVERED.value,
+                        )
+                    ),
+                )
+                .order_by(InboxModel.created_at.asc(), InboxModel.id.asc())
+                .all()
+            )
+            for explicit_row in explicit_candidates:
+                if canonical_callback_text(explicit_row.message) == canonical_callback_text(
+                    callback.final_result or ""
+                ):
+                    _link_callback(callback, explicit_row)
+                    db.flush()
+                    _validate_assigned_worker_callback_row(db, callback)
+                    db.commit()
+                    return _inbox_message_from_row(explicit_row)
+
+            server_row = _new_row(
+                row_origin=InboxMessageOrigin.SERVER_COMPLETION,
+                row_assignment_id=callback.assignment_id,
+                row_idempotency_key=expected_key,
+            )
+            _link_callback(callback, server_row)
+            db.flush()
+            _validate_assigned_worker_callback_row(db, callback)
+            db.commit()
+            return _inbox_message_from_row(server_row)
+
+        if idempotency_key:
+            existing = (
+                db.query(InboxModel).filter(InboxModel.idempotency_key == idempotency_key).first()
+            )
+            if existing is not None:
+                if not _matches_immutable_payload(existing):
+                    raise ValueError(f"Inbox idempotency key collision: {idempotency_key}")
+                db.commit()
+                return _inbox_message_from_row(existing)
+
+        inbox_msg = _new_row(row_assignment_id=assignment_id)
         db.commit()
-        db.refresh(inbox_msg)
-        return InboxMessage(
-            id=inbox_msg.id,
-            sender_id=inbox_msg.sender_id,
-            receiver_id=inbox_msg.receiver_id,
-            message=inbox_msg.message,
-            status=MessageStatus(inbox_msg.status),
-            created_at=inbox_msg.created_at,
-        )
+        return _inbox_message_from_row(inbox_msg)
 
 
 def get_pending_messages(receiver_id: str, limit: int = 1) -> List[InboxMessage]:
     """Get pending messages ordered by created_at ASC (oldest first)."""
     return get_inbox_messages(receiver_id, limit=limit, status=MessageStatus.PENDING)
+
+
+def claim_inbox_message(message_id: int, claim_token: str) -> Optional[InboxMessage]:
+    """Atomically claim one PENDING row; only one concurrent caller can win."""
+    if not claim_token:
+        raise ValueError("claim_token must be non-empty")
+    with SessionLocal() as db:
+        claimed_at = datetime.now()
+        claimed = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.id == message_id,
+                InboxModel.status == MessageStatus.PENDING.value,
+            )
+            .update(
+                {
+                    InboxModel.status: MessageStatus.DELIVERING.value,
+                    InboxModel.claim_token: claim_token,
+                    InboxModel.claimed_at: claimed_at,
+                },
+                synchronize_session=False,
+            )
+        )
+        if claimed != 1:
+            db.rollback()
+            return None
+        row = db.query(InboxModel).filter(InboxModel.id == message_id).first()
+        if row is None:  # Defensive: the row cannot disappear inside this write transaction.
+            db.rollback()
+            return None
+        _validate_inbox_callback_evidence(db, row)
+        db.commit()
+        return _inbox_message_from_row(row)
+
+
+def resolve_inbox_claim(
+    message_id: int,
+    claim_token: str,
+    status: MessageStatus,
+) -> bool:
+    """Resolve only the exact durable claim owned by ``claim_token``."""
+    if status not in (
+        MessageStatus.PENDING,
+        MessageStatus.DELIVERED,
+        MessageStatus.FAILED,
+    ):
+        raise ValueError(f"Invalid inbox claim resolution status: {status.value}")
+    with SessionLocal() as db:
+        # Serialize claim resolution with receiver deletion. Whichever commits
+        # first supplies the durable truth: DELIVERED means paste finished
+        # before deletion; FAILED/TERMINAL_ERROR means deletion won first.
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        values: Dict[Any, Any] = {
+            InboxModel.status: status.value,
+            InboxModel.claim_token: None,
+        }
+        updated = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.id == message_id,
+                InboxModel.status == MessageStatus.DELIVERING.value,
+                InboxModel.claim_token == claim_token,
+            )
+            .update(values, synchronize_session=False)
+        )
+        if updated == 1:
+            row = db.query(InboxModel).filter(InboxModel.id == message_id).first()
+            if row is None:  # Defensive: this write transaction owns the row.
+                db.rollback()
+                return False
+            _validate_inbox_callback_evidence(db, row)
+        db.commit()
+        return updated == 1
+
+
+def is_assigned_worker_callback_inbox_message(message_id: int) -> bool:
+    """Return whether an inbox row is the callback evidence linked by a worker."""
+    with SessionLocal() as db:
+        callback = (
+            db.query(AssignedWorkerCallbackModel)
+            .filter(AssignedWorkerCallbackModel.inbox_message_id == message_id)
+            .first()
+        )
+        if callback is None:
+            return False
+        _validate_assigned_worker_callback_row(db, callback)
+        return True
 
 
 def get_inbox_messages(
@@ -1437,18 +2249,850 @@ def get_inbox_messages(
             query = query.filter(InboxModel.status == status.value)
 
         messages = query.order_by(InboxModel.created_at.asc()).limit(limit).all()
+        for message in messages:
+            _validate_inbox_callback_evidence(db, message)
 
-        return [
-            InboxMessage(
-                id=msg.id,
-                sender_id=msg.sender_id,
-                receiver_id=msg.receiver_id,
-                message=msg.message,
-                status=MessageStatus(msg.status),
-                created_at=msg.created_at,
+        return [_inbox_message_from_row(msg) for msg in messages]
+
+
+def _callback_integrity_error(
+    row: AssignedWorkerCallbackModel, detail: str
+) -> AssignedWorkerIntegrityError:
+    return AssignedWorkerIntegrityError(
+        f"Assigned-worker callback integrity failure for assignment "
+        f"{row.assignment_id!r}: {detail}"
+    )
+
+
+def _validate_assigned_worker_callback_row(db: Any, row: AssignedWorkerCallbackModel) -> None:
+    """Fail closed on corrupt route, result, state, timestamps, or inbox evidence."""
+    try:
+        lifecycle = AssignmentLifecycle(row.lifecycle)
+        delivery_state = CompletionDeliveryState(row.delivery_state)
+        CompletionReceiverState(row.receiver_state)
+    except ValueError as exc:
+        raise _callback_integrity_error(row, f"unknown enum value: {exc}") from exc
+
+    expected_routing_digest = callback_routing_digest(
+        row.assignment_id,
+        row.completion_id,
+        row.worker_terminal_id,
+        row.caller_id,
+    )
+    if row.routing_digest != expected_routing_digest:
+        raise _callback_integrity_error(row, "immutable routing digest mismatch")
+
+    result_fields = (row.final_result, row.final_result_sha256, row.result_reference)
+    if any(value is None for value in result_fields) != all(
+        value is None for value in result_fields
+    ):
+        raise _callback_integrity_error(row, "captured result fields are only partially present")
+    has_result = row.final_result is not None
+    if has_result:
+        expected_hash = hashlib.sha256(row.final_result.encode("utf-8")).hexdigest()
+        if row.final_result_sha256 != expected_hash:
+            raise _callback_integrity_error(row, "final_result SHA-256 mismatch")
+        expected_reference = f"assigned-worker-callback:{row.assignment_id}"
+        if row.result_reference != expected_reference:
+            raise _callback_integrity_error(row, "result_reference does not match assignment")
+
+    attempt_count = row.attempt_count or 0
+    if attempt_count < 0:
+        raise _callback_integrity_error(row, "attempt_count is negative")
+    if attempt_count == 0 and (row.first_attempt_at is not None or row.last_attempt_at is not None):
+        raise _callback_integrity_error(row, "attempt timestamps exist with zero attempts")
+    if attempt_count > 0 and (row.first_attempt_at is None or row.last_attempt_at is None):
+        raise _callback_integrity_error(row, "attempt timestamps are missing")
+    if (
+        row.first_attempt_at is not None
+        and row.last_attempt_at is not None
+        and row.last_attempt_at < row.first_attempt_at
+    ):
+        raise _callback_integrity_error(row, "last_attempt_at precedes first_attempt_at")
+
+    ordered_timestamps = (
+        ("dispatched_at", row.dispatched_at, row.created_at),
+        ("completion_observed_at", row.completion_observed_at, row.dispatched_at),
+        ("captured_at", row.captured_at, row.completion_observed_at),
+        ("last_attempt_at", row.last_attempt_at, row.first_attempt_at),
+        ("acknowledged_at", row.acknowledged_at, row.enqueued_at),
+        ("terminal_error_at", row.terminal_error_at, row.created_at),
+    )
+    for timestamp_name, later, earlier in ordered_timestamps:
+        if later is not None and earlier is not None and later < earlier:
+            raise _callback_integrity_error(
+                row, f"{timestamp_name} precedes its required predecessor"
             )
-            for msg in messages
-        ]
+
+    if lifecycle == AssignmentLifecycle.ASSIGNED:
+        if row.dispatched_at is not None or has_result:
+            raise _callback_integrity_error(
+                row, "unproven assignment contains dispatch/result data"
+            )
+        if delivery_state != CompletionDeliveryState.NOT_READY:
+            raise _callback_integrity_error(
+                row, "unproven assignment has an impossible delivery state"
+            )
+        if any(
+            value is not None
+            for value in (
+                row.completion_observed_at,
+                row.captured_at,
+                row.first_attempt_at,
+                row.last_attempt_at,
+                row.enqueued_at,
+                row.acknowledged_at,
+                row.terminal_error_at,
+                row.inbox_message_id,
+            )
+        ):
+            raise _callback_integrity_error(row, "unproven assignment contains terminal evidence")
+    elif lifecycle == AssignmentLifecycle.DISPATCHED:
+        if row.dispatched_at is None or has_result:
+            raise _callback_integrity_error(
+                row, "dispatched assignment has invalid dispatch/result data"
+            )
+        if delivery_state not in (
+            CompletionDeliveryState.NOT_READY,
+            CompletionDeliveryState.RETRYABLE,
+        ):
+            raise _callback_integrity_error(
+                row, "dispatched assignment has an impossible delivery state"
+            )
+        if any(
+            value is not None
+            for value in (
+                row.completion_observed_at,
+                row.captured_at,
+                row.enqueued_at,
+                row.acknowledged_at,
+                row.terminal_error_at,
+                row.inbox_message_id,
+            )
+        ):
+            raise _callback_integrity_error(row, "dispatched assignment contains terminal evidence")
+    elif lifecycle == AssignmentLifecycle.UNRESOLVED:
+        if has_result or delivery_state != CompletionDeliveryState.MANUAL_RECOVERY:
+            raise _callback_integrity_error(
+                row, "unresolved assignment has an impossible result/state"
+            )
+        if row.terminal_error_at is None or not row.last_error:
+            raise _callback_integrity_error(row, "unresolved assignment lacks recovery audit data")
+        if any(
+            value is not None
+            for value in (
+                row.completion_observed_at,
+                row.captured_at,
+                row.first_attempt_at,
+                row.last_attempt_at,
+                row.enqueued_at,
+                row.acknowledged_at,
+                row.inbox_message_id,
+            )
+        ):
+            raise _callback_integrity_error(row, "unresolved assignment contains delivery evidence")
+    elif lifecycle == AssignmentLifecycle.COMPLETED:
+        if (
+            row.dispatched_at is None
+            or row.completion_observed_at is None
+            or row.captured_at is None
+            or not has_result
+        ):
+            raise _callback_integrity_error(row, "completed assignment lacks capture evidence")
+        if delivery_state in (
+            CompletionDeliveryState.NOT_READY,
+            CompletionDeliveryState.MANUAL_RECOVERY,
+        ):
+            raise _callback_integrity_error(
+                row, "completed assignment has an impossible delivery state"
+            )
+        if row.first_attempt_at is not None and row.first_attempt_at < row.captured_at:
+            raise _callback_integrity_error(row, "delivery attempt precedes result capture")
+        if row.acknowledged_at is not None and row.acknowledged_at < row.captured_at:
+            raise _callback_integrity_error(row, "callback acknowledgement precedes result capture")
+        if row.terminal_error_at is not None and row.terminal_error_at < row.captured_at:
+            raise _callback_integrity_error(row, "terminal error precedes result capture")
+    elif lifecycle in (AssignmentLifecycle.FAILED, AssignmentLifecycle.CANCELLED):
+        if has_result or delivery_state != CompletionDeliveryState.TERMINAL_ERROR:
+            raise _callback_integrity_error(
+                row, "failed/cancelled assignment has invalid result/state"
+            )
+        if any(
+            value is not None
+            for value in (
+                row.completion_observed_at,
+                row.captured_at,
+                row.first_attempt_at,
+                row.last_attempt_at,
+                row.enqueued_at,
+                row.acknowledged_at,
+                row.inbox_message_id,
+            )
+        ):
+            raise _callback_integrity_error(
+                row, "failed/cancelled assignment has delivery evidence"
+            )
+
+    if delivery_state == CompletionDeliveryState.NOT_READY and (
+        attempt_count != 0 or row.inbox_message_id is not None
+    ):
+        raise _callback_integrity_error(row, "not-ready state contains delivery evidence")
+    if delivery_state == CompletionDeliveryState.CAPTURED and (
+        attempt_count != 0
+        or row.inbox_message_id is not None
+        or row.enqueued_at is not None
+        or row.acknowledged_at is not None
+    ):
+        raise _callback_integrity_error(row, "captured state contains premature delivery evidence")
+    if delivery_state == CompletionDeliveryState.DELIVERING and (
+        attempt_count == 0
+        or row.inbox_message_id is not None
+        or row.enqueued_at is not None
+        or row.acknowledged_at is not None
+    ):
+        raise _callback_integrity_error(row, "delivering state has an impossible evidence shape")
+    if delivery_state == CompletionDeliveryState.RETRYABLE and (
+        row.inbox_message_id is not None
+        or row.enqueued_at is not None
+        or row.acknowledged_at is not None
+        or not row.last_error
+    ):
+        raise _callback_integrity_error(row, "retryable state has an impossible evidence shape")
+
+    if delivery_state in (
+        CompletionDeliveryState.ENQUEUED,
+        CompletionDeliveryState.ACKNOWLEDGED,
+        CompletionDeliveryState.SUPPRESSED_EXPLICIT,
+    ) and (row.inbox_message_id is None or row.enqueued_at is None):
+        raise _callback_integrity_error(row, "delivery state lacks linked inbox evidence")
+    if (
+        delivery_state
+        in (
+            CompletionDeliveryState.ACKNOWLEDGED,
+            CompletionDeliveryState.SUPPRESSED_EXPLICIT,
+        )
+        and row.acknowledged_at is None
+    ):
+        raise _callback_integrity_error(row, "acknowledged state lacks acknowledged_at")
+    if delivery_state == CompletionDeliveryState.ENQUEUED and row.acknowledged_at is not None:
+        raise _callback_integrity_error(row, "enqueued state has premature acknowledgement")
+    if delivery_state == CompletionDeliveryState.TERMINAL_ERROR and (
+        row.terminal_error_at is None or not row.last_error
+    ):
+        raise _callback_integrity_error(row, "terminal error lacks error audit data")
+    if delivery_state == CompletionDeliveryState.MANUAL_RECOVERY and (
+        row.terminal_error_at is None or not row.last_error
+    ):
+        raise _callback_integrity_error(row, "manual recovery lacks audit data")
+    if row.inbox_message_id is None and (
+        row.enqueued_at is not None or row.acknowledged_at is not None
+    ):
+        raise _callback_integrity_error(row, "inbox timestamps exist without an inbox link")
+
+    if row.inbox_message_id is not None:
+        inbox_row = db.query(InboxModel).filter(InboxModel.id == row.inbox_message_id).first()
+        if inbox_row is None:
+            raise _callback_integrity_error(row, "linked inbox evidence is missing")
+        if (
+            inbox_row.assignment_id != row.assignment_id
+            or inbox_row.sender_id != row.worker_terminal_id
+            or inbox_row.receiver_id != row.caller_id
+        ):
+            raise _callback_integrity_error(row, "linked inbox route/assignment mismatch")
+        try:
+            inbox_status = MessageStatus(inbox_row.status)
+        except ValueError as exc:
+            raise _callback_integrity_error(row, f"linked inbox status is invalid: {exc}") from exc
+        if inbox_status == MessageStatus.DELIVERING:
+            if not inbox_row.claim_token or inbox_row.claimed_at is None:
+                raise _callback_integrity_error(row, "linked inbox delivery claim is incomplete")
+        elif inbox_row.claim_token is not None:
+            raise _callback_integrity_error(
+                row, "linked inbox has a claim token outside DELIVERING"
+            )
+        if (
+            delivery_state
+            in (
+                CompletionDeliveryState.ACKNOWLEDGED,
+                CompletionDeliveryState.SUPPRESSED_EXPLICIT,
+            )
+            and inbox_status == MessageStatus.FAILED
+        ):
+            raise _callback_integrity_error(row, "successful enqueue evidence is marked failed")
+        if (
+            delivery_state == CompletionDeliveryState.TERMINAL_ERROR
+            and lifecycle == AssignmentLifecycle.COMPLETED
+            and inbox_status != MessageStatus.FAILED
+        ):
+            raise _callback_integrity_error(
+                row, "undeliverable linked callback is not marked failed"
+            )
+        if inbox_row.origin == InboxMessageOrigin.SERVER_COMPLETION.value:
+            expected_key = f"assigned-worker-completion:{row.completion_id}"
+            expected_message = format_server_completion_message(
+                row.final_result or "",
+                row.worker_terminal_id,
+                row.assignment_id,
+                row.completion_id,
+            )
+            if inbox_row.idempotency_key != expected_key or inbox_row.message != expected_message:
+                raise _callback_integrity_error(row, "server inbox payload/idempotency mismatch")
+            if row.enqueued_at is not None and row.enqueued_at < row.captured_at:
+                raise _callback_integrity_error(row, "server enqueue precedes result capture")
+            if delivery_state == CompletionDeliveryState.SUPPRESSED_EXPLICIT:
+                raise _callback_integrity_error(row, "suppressed state links a server callback")
+        elif inbox_row.origin == InboxMessageOrigin.EXPLICIT.value:
+            if inbox_row.idempotency_key is not None:
+                raise _callback_integrity_error(
+                    row, "explicit callback has a server idempotency key"
+                )
+            if not has_result or canonical_callback_text(
+                inbox_row.message
+            ) != canonical_callback_text(row.final_result or ""):
+                raise _callback_integrity_error(
+                    row, "explicit inbox evidence is not final-equivalent"
+                )
+            if delivery_state not in (
+                CompletionDeliveryState.SUPPRESSED_EXPLICIT,
+                CompletionDeliveryState.TERMINAL_ERROR,
+            ):
+                raise _callback_integrity_error(row, "non-suppressed state links explicit evidence")
+        else:
+            raise _callback_integrity_error(row, "linked inbox origin is not callback evidence")
+
+
+def _validate_inbox_callback_evidence(db: Any, inbox_row: InboxModel) -> None:
+    """Prevent a tampered callback row from reaching terminal paste/readback."""
+    callback = (
+        db.query(AssignedWorkerCallbackModel)
+        .filter(AssignedWorkerCallbackModel.inbox_message_id == inbox_row.id)
+        .first()
+    )
+    if callback is None and inbox_row.origin == InboxMessageOrigin.SERVER_COMPLETION.value:
+        callback = (
+            db.query(AssignedWorkerCallbackModel)
+            .filter(AssignedWorkerCallbackModel.assignment_id == inbox_row.assignment_id)
+            .first()
+        )
+        if callback is None:
+            raise AssignedWorkerIntegrityError(
+                f"Server-completion inbox row {inbox_row.id} has no persisted assignment"
+            )
+        _validate_assigned_worker_callback_row(db, callback)
+        _validate_server_completion_inbox_row(callback, inbox_row)
+        return
+    if callback is not None:
+        _validate_assigned_worker_callback_row(db, callback)
+
+
+def _commit_validated_callback_mutation(db: Any, row: AssignedWorkerCallbackModel) -> None:
+    """Validate pending callback state before, and again after, committing it.
+
+    Readback-only validation is too late: a malformed transition would already
+    be durable. Flushing first lets SQLite triggers and the complete state/link
+    validator reject the mutation while rollback can still restore the row.
+    """
+    db.flush()
+    _validate_assigned_worker_callback_row(db, row)
+    db.commit()
+    db.refresh(row)
+    _validate_assigned_worker_callback_row(db, row)
+
+
+def _assigned_worker_callback_from_row(
+    row: AssignedWorkerCallbackModel,
+) -> AssignedWorkerCallback:
+    """Convert an already integrity-validated callback row to the read model."""
+    return AssignedWorkerCallback(
+        assignment_id=row.assignment_id,
+        completion_id=row.completion_id,
+        worker_terminal_id=row.worker_terminal_id,
+        caller_id=row.caller_id,
+        routing_digest=row.routing_digest,
+        lifecycle=AssignmentLifecycle(row.lifecycle),
+        delivery_state=CompletionDeliveryState(row.delivery_state),
+        receiver_state=CompletionReceiverState(row.receiver_state),
+        final_result=row.final_result,
+        final_result_sha256=row.final_result_sha256,
+        result_reference=row.result_reference,
+        inbox_message_id=row.inbox_message_id,
+        attempt_count=row.attempt_count or 0,
+        created_at=row.created_at,
+        dispatched_at=row.dispatched_at,
+        completion_observed_at=row.completion_observed_at,
+        captured_at=row.captured_at,
+        first_attempt_at=row.first_attempt_at,
+        last_attempt_at=row.last_attempt_at,
+        enqueued_at=row.enqueued_at,
+        acknowledged_at=row.acknowledged_at,
+        terminal_error_at=row.terminal_error_at,
+        last_error=row.last_error,
+    )
+
+
+def get_assigned_worker_callback(worker_terminal_id: str) -> Optional[AssignedWorkerCallback]:
+    """Return the durable callback record for a worker, even after retirement."""
+    with SessionLocal() as db:
+        row = (
+            db.query(AssignedWorkerCallbackModel)
+            .filter(AssignedWorkerCallbackModel.worker_terminal_id == worker_terminal_id)
+            .first()
+        )
+        if row is None:
+            return None
+        _validate_assigned_worker_callback_row(db, row)
+        return _assigned_worker_callback_from_row(row)
+
+
+def get_assigned_worker_callback_by_assignment(
+    assignment_id: str,
+) -> Optional[AssignedWorkerCallback]:
+    """Return one callback record by immutable assignment identity."""
+    with SessionLocal() as db:
+        row = (
+            db.query(AssignedWorkerCallbackModel)
+            .filter(AssignedWorkerCallbackModel.assignment_id == assignment_id)
+            .first()
+        )
+        if row is None:
+            return None
+        _validate_assigned_worker_callback_row(db, row)
+        return _assigned_worker_callback_from_row(row)
+
+
+def list_reconcilable_assigned_worker_callbacks() -> List[AssignedWorkerCallback]:
+    """List callbacks that may still require status capture or durable enqueue."""
+    terminal_states = (
+        CompletionDeliveryState.ACKNOWLEDGED.value,
+        CompletionDeliveryState.SUPPRESSED_EXPLICIT.value,
+        CompletionDeliveryState.MANUAL_RECOVERY.value,
+        CompletionDeliveryState.TERMINAL_ERROR.value,
+    )
+    with SessionLocal() as db:
+        rows = (
+            db.query(AssignedWorkerCallbackModel)
+            .filter(AssignedWorkerCallbackModel.delivery_state.notin_(terminal_states))
+            .order_by(AssignedWorkerCallbackModel.created_at.asc())
+            .all()
+        )
+        for row in rows:
+            _validate_assigned_worker_callback_row(db, row)
+        return [_assigned_worker_callback_from_row(row) for row in rows]
+
+
+def list_protected_assigned_worker_callbacks() -> List[AssignedWorkerCallback]:
+    """List workers whose uncaptured terminal remains a recovery handle."""
+    with SessionLocal() as db:
+        rows = (
+            db.query(AssignedWorkerCallbackModel)
+            .filter(
+                AssignedWorkerCallbackModel.lifecycle.in_(
+                    (
+                        AssignmentLifecycle.ASSIGNED.value,
+                        AssignmentLifecycle.DISPATCHED.value,
+                        AssignmentLifecycle.UNRESOLVED.value,
+                    )
+                )
+            )
+            .order_by(AssignedWorkerCallbackModel.created_at.asc())
+            .all()
+        )
+        for row in rows:
+            _validate_assigned_worker_callback_row(db, row)
+        return [_assigned_worker_callback_from_row(row) for row in rows]
+
+
+def mark_assigned_worker_dispatched(worker_terminal_id: str) -> Optional[AssignedWorkerCallback]:
+    """Persist that the assigned prompt was accepted by the worker."""
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        row = (
+            db.query(AssignedWorkerCallbackModel)
+            .filter(AssignedWorkerCallbackModel.worker_terminal_id == worker_terminal_id)
+            .first()
+        )
+        if row is None:
+            return None
+        _validate_assigned_worker_callback_row(db, row)
+        if row.lifecycle == AssignmentLifecycle.ASSIGNED.value:
+            row.lifecycle = AssignmentLifecycle.DISPATCHED.value
+            row.dispatched_at = datetime.now()
+            _commit_validated_callback_mutation(db, row)
+        return _assigned_worker_callback_from_row(row)
+
+
+def capture_assigned_worker_completion(
+    worker_terminal_id: str,
+    final_result: str,
+    final_result_sha256: str,
+    result_reference: str,
+) -> Optional[AssignedWorkerCallback]:
+    """Capture a final report once, after a dispatched worker truly completes."""
+    calculated_sha256 = hashlib.sha256(final_result.encode("utf-8")).hexdigest()
+    if final_result_sha256 != calculated_sha256:
+        raise ValueError("final_result_sha256 does not match final_result")
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        row = (
+            db.query(AssignedWorkerCallbackModel)
+            .filter(AssignedWorkerCallbackModel.worker_terminal_id == worker_terminal_id)
+            .first()
+        )
+        if row is None:
+            return None
+        _validate_assigned_worker_callback_row(db, row)
+        if row.lifecycle == AssignmentLifecycle.COMPLETED.value:
+            if row.final_result_sha256 != final_result_sha256:
+                logger.warning(
+                    "Ignoring changed final output for immutable completion %s",
+                    row.completion_id,
+                )
+            return _assigned_worker_callback_from_row(row)
+        if row.lifecycle != AssignmentLifecycle.DISPATCHED.value:
+            return _assigned_worker_callback_from_row(row)
+        expected_reference = f"assigned-worker-callback:{row.assignment_id}"
+        if result_reference != expected_reference:
+            raise ValueError(
+                f"result_reference must be the immutable assignment reference {expected_reference!r}"
+            )
+
+        now = datetime.now()
+        row.lifecycle = AssignmentLifecycle.COMPLETED.value
+        row.delivery_state = CompletionDeliveryState.CAPTURED.value
+        row.completion_observed_at = now
+        row.captured_at = now
+        row.final_result = final_result
+        row.final_result_sha256 = final_result_sha256
+        row.result_reference = result_reference
+        row.last_error = None
+        _commit_validated_callback_mutation(db, row)
+        return _assigned_worker_callback_from_row(row)
+
+
+def list_explicit_callback_candidates(assignment_id: str) -> List[InboxMessage]:
+    """Return durable, non-failed explicit messages associated with an assignment."""
+    with SessionLocal() as db:
+        callback = (
+            db.query(AssignedWorkerCallbackModel)
+            .filter(AssignedWorkerCallbackModel.assignment_id == assignment_id)
+            .first()
+        )
+        if callback is None:
+            return []
+        _validate_assigned_worker_callback_row(db, callback)
+        rows = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.assignment_id == assignment_id,
+                InboxModel.origin == InboxMessageOrigin.EXPLICIT.value,
+                InboxModel.status.in_(
+                    (
+                        MessageStatus.PENDING.value,
+                        MessageStatus.DELIVERING.value,
+                        MessageStatus.DELIVERED.value,
+                    )
+                ),
+            )
+            .order_by(InboxModel.created_at.asc(), InboxModel.id.asc())
+            .all()
+        )
+        for row in rows:
+            if (
+                row.sender_id != callback.worker_terminal_id
+                or row.receiver_id != callback.caller_id
+            ):
+                raise _callback_integrity_error(
+                    callback, f"explicit inbox candidate {row.id} has a routing mismatch"
+                )
+        return [_inbox_message_from_row(row) for row in rows]
+
+
+def record_completion_delivery_attempt(
+    assignment_id: str, receiver_state: CompletionReceiverState
+) -> Optional[AssignedWorkerCallback]:
+    """Durably record an enqueue attempt before touching the inbox table."""
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        row = (
+            db.query(AssignedWorkerCallbackModel)
+            .filter(AssignedWorkerCallbackModel.assignment_id == assignment_id)
+            .first()
+        )
+        if row is None:
+            return None
+        _validate_assigned_worker_callback_row(db, row)
+        if row.delivery_state in (
+            CompletionDeliveryState.ENQUEUED.value,
+            CompletionDeliveryState.ACKNOWLEDGED.value,
+            CompletionDeliveryState.SUPPRESSED_EXPLICIT.value,
+            CompletionDeliveryState.TERMINAL_ERROR.value,
+        ):
+            return _assigned_worker_callback_from_row(row)
+        now = datetime.now()
+        row.delivery_state = CompletionDeliveryState.DELIVERING.value
+        row.receiver_state = receiver_state.value
+        row.attempt_count = (row.attempt_count or 0) + 1
+        row.first_attempt_at = row.first_attempt_at or now
+        row.last_attempt_at = now
+        row.last_error = None
+        _commit_validated_callback_mutation(db, row)
+        return _assigned_worker_callback_from_row(row)
+
+
+def mark_completion_enqueued(
+    assignment_id: str,
+    inbox_message_id: int,
+    receiver_state: CompletionReceiverState,
+) -> Optional[AssignedWorkerCallback]:
+    """Link the committed inbox row before acknowledging delivery."""
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        row = (
+            db.query(AssignedWorkerCallbackModel)
+            .filter(AssignedWorkerCallbackModel.assignment_id == assignment_id)
+            .first()
+        )
+        if row is None:
+            return None
+        _validate_assigned_worker_callback_row(db, row)
+        if row.delivery_state in (
+            CompletionDeliveryState.ACKNOWLEDGED.value,
+            CompletionDeliveryState.SUPPRESSED_EXPLICIT.value,
+            CompletionDeliveryState.TERMINAL_ERROR.value,
+        ):
+            return _assigned_worker_callback_from_row(row)
+        if row.inbox_message_id is not None and row.inbox_message_id != inbox_message_id:
+            raise ValueError(
+                f"Assignment {assignment_id} is already linked to inbox row "
+                f"{row.inbox_message_id}"
+            )
+        inbox_row = db.query(InboxModel).filter(InboxModel.id == inbox_message_id).first()
+        _validate_server_completion_inbox_row(row, inbox_row)
+        row.delivery_state = CompletionDeliveryState.ENQUEUED.value
+        row.receiver_state = receiver_state.value
+        row.inbox_message_id = inbox_message_id
+        row.enqueued_at = row.enqueued_at or datetime.now()
+        _commit_validated_callback_mutation(db, row)
+        return _assigned_worker_callback_from_row(row)
+
+
+def acknowledge_completion_enqueued(
+    assignment_id: str, inbox_message_id: int
+) -> Optional[AssignedWorkerCallback]:
+    """Acknowledge only after the linked inbox row is durably observable."""
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        row = (
+            db.query(AssignedWorkerCallbackModel)
+            .filter(AssignedWorkerCallbackModel.assignment_id == assignment_id)
+            .first()
+        )
+        if row is None:
+            return None
+        _validate_assigned_worker_callback_row(db, row)
+        if row.delivery_state in (
+            CompletionDeliveryState.ACKNOWLEDGED.value,
+            CompletionDeliveryState.SUPPRESSED_EXPLICIT.value,
+            CompletionDeliveryState.TERMINAL_ERROR.value,
+        ):
+            return _assigned_worker_callback_from_row(row)
+        if row.delivery_state != CompletionDeliveryState.ENQUEUED.value:
+            raise ValueError(f"Assignment {assignment_id} is not awaiting enqueue acknowledgement")
+        if row.inbox_message_id != inbox_message_id:
+            raise ValueError(
+                f"Assignment {assignment_id} is linked to inbox row {row.inbox_message_id}, "
+                f"not {inbox_message_id}"
+            )
+        inbox_row = db.query(InboxModel).filter(InboxModel.id == inbox_message_id).first()
+        _validate_server_completion_inbox_row(row, inbox_row)
+        row.delivery_state = CompletionDeliveryState.ACKNOWLEDGED.value
+        row.inbox_message_id = inbox_message_id
+        row.acknowledged_at = datetime.now()
+        row.last_error = None
+        _commit_validated_callback_mutation(db, row)
+        return _assigned_worker_callback_from_row(row)
+
+
+def _validate_server_completion_inbox_row(
+    callback_row: AssignedWorkerCallbackModel,
+    inbox_row: Optional[InboxModel],
+) -> None:
+    """Require the exact immutable callback route and idempotency identity."""
+    expected_key = f"assigned-worker-completion:{callback_row.completion_id}"
+    if (
+        inbox_row is None
+        or inbox_row.assignment_id != callback_row.assignment_id
+        or inbox_row.sender_id != callback_row.worker_terminal_id
+        or inbox_row.receiver_id != callback_row.caller_id
+        or inbox_row.origin != InboxMessageOrigin.SERVER_COMPLETION.value
+        or inbox_row.idempotency_key != expected_key
+        or inbox_row.message
+        != format_server_completion_message(
+            callback_row.final_result or "",
+            callback_row.worker_terminal_id,
+            callback_row.assignment_id,
+            callback_row.completion_id,
+        )
+    ):
+        raise ValueError(
+            f"Inbox row is not the immutable server completion for assignment "
+            f"{callback_row.assignment_id}"
+        )
+
+
+def suppress_completion_for_explicit_callback(
+    assignment_id: str,
+    inbox_message_id: int,
+    receiver_state: CompletionReceiverState,
+) -> Optional[AssignedWorkerCallback]:
+    """Record that an equivalent explicit final callback already exists."""
+    with SessionLocal() as db:
+        # This legacy recovery API obeys the same writer serialization as the
+        # explicit send endpoint and server callback insertion.
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        row = (
+            db.query(AssignedWorkerCallbackModel)
+            .filter(AssignedWorkerCallbackModel.assignment_id == assignment_id)
+            .first()
+        )
+        if row is None:
+            return None
+        _validate_assigned_worker_callback_row(db, row)
+        if row.delivery_state in (
+            CompletionDeliveryState.ACKNOWLEDGED.value,
+            CompletionDeliveryState.SUPPRESSED_EXPLICIT.value,
+            CompletionDeliveryState.TERMINAL_ERROR.value,
+        ):
+            return _assigned_worker_callback_from_row(row)
+        inbox_row = db.query(InboxModel).filter(InboxModel.id == inbox_message_id).first()
+        if (
+            row.lifecycle != AssignmentLifecycle.COMPLETED.value
+            or row.final_result is None
+            or inbox_row is None
+            or inbox_row.assignment_id != assignment_id
+            or inbox_row.sender_id != row.worker_terminal_id
+            or inbox_row.receiver_id != row.caller_id
+            or inbox_row.origin != InboxMessageOrigin.EXPLICIT.value
+            or inbox_row.idempotency_key is not None
+            or inbox_row.status
+            not in (
+                MessageStatus.PENDING.value,
+                MessageStatus.DELIVERING.value,
+                MessageStatus.DELIVERED.value,
+            )
+            or canonical_callback_text(inbox_row.message)
+            != canonical_callback_text(row.final_result)
+        ):
+            raise ValueError(
+                "Explicit callback suppression requires an equivalent routed final inbox row"
+            )
+        if row.inbox_message_id is not None and row.inbox_message_id != inbox_message_id:
+            raise ValueError(
+                f"Assignment {assignment_id} is already linked to inbox row "
+                f"{row.inbox_message_id}"
+            )
+        now = datetime.now()
+        row.delivery_state = CompletionDeliveryState.SUPPRESSED_EXPLICIT.value
+        row.receiver_state = receiver_state.value
+        row.inbox_message_id = inbox_message_id
+        row.enqueued_at = row.enqueued_at or inbox_row.created_at or now
+        row.acknowledged_at = now
+        row.last_error = None
+        _commit_validated_callback_mutation(db, row)
+        return _assigned_worker_callback_from_row(row)
+
+
+def mark_completion_retryable(
+    assignment_id: str,
+    error: str,
+    receiver_state: CompletionReceiverState = CompletionReceiverState.RETRYABLE_FAILURE,
+) -> Optional[AssignedWorkerCallback]:
+    """Retain a transient delivery error for server-side reconciliation."""
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        row = (
+            db.query(AssignedWorkerCallbackModel)
+            .filter(AssignedWorkerCallbackModel.assignment_id == assignment_id)
+            .first()
+        )
+        if row is None:
+            return None
+        _validate_assigned_worker_callback_row(db, row)
+        if row.delivery_state in (
+            CompletionDeliveryState.ACKNOWLEDGED.value,
+            CompletionDeliveryState.SUPPRESSED_EXPLICIT.value,
+            CompletionDeliveryState.TERMINAL_ERROR.value,
+        ):
+            return _assigned_worker_callback_from_row(row)
+        row.delivery_state = CompletionDeliveryState.RETRYABLE.value
+        row.receiver_state = receiver_state.value
+        row.last_error = error
+        _commit_validated_callback_mutation(db, row)
+        return _assigned_worker_callback_from_row(row)
+
+
+def mark_completion_terminal_error(
+    assignment_id: str,
+    error: str,
+    receiver_state: CompletionReceiverState,
+    *,
+    lifecycle: Optional[AssignmentLifecycle] = None,
+) -> Optional[AssignedWorkerCallback]:
+    """Set a permanent/manual-recovery terminal state without deleting report data."""
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        row = (
+            db.query(AssignedWorkerCallbackModel)
+            .filter(AssignedWorkerCallbackModel.assignment_id == assignment_id)
+            .first()
+        )
+        if row is None:
+            return None
+        _validate_assigned_worker_callback_row(db, row)
+        if row.delivery_state in (
+            CompletionDeliveryState.ACKNOWLEDGED.value,
+            CompletionDeliveryState.SUPPRESSED_EXPLICIT.value,
+            CompletionDeliveryState.TERMINAL_ERROR.value,
+        ):
+            return _assigned_worker_callback_from_row(row)
+        if lifecycle is not None and row.lifecycle != AssignmentLifecycle.COMPLETED.value:
+            row.lifecycle = lifecycle.value
+        row.delivery_state = CompletionDeliveryState.TERMINAL_ERROR.value
+        row.receiver_state = receiver_state.value
+        row.terminal_error_at = datetime.now()
+        row.last_error = error
+        _commit_validated_callback_mutation(db, row)
+        return _assigned_worker_callback_from_row(row)
+
+
+def mark_assignment_manual_recovery(
+    assignment_id: str,
+    error: str,
+) -> Optional[AssignedWorkerCallback]:
+    """Fail closed when restart status cannot prove task-input dispatch.
+
+    The terminal is deliberately retained as the recovery handle.  This is a
+    terminal audit state for automation, but unlike FAILED/CANCELLED it does not
+    assert an outcome that CAO never observed.
+    """
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        row = (
+            db.query(AssignedWorkerCallbackModel)
+            .filter(AssignedWorkerCallbackModel.assignment_id == assignment_id)
+            .first()
+        )
+        if row is None:
+            return None
+        _validate_assigned_worker_callback_row(db, row)
+        if row.lifecycle != AssignmentLifecycle.ASSIGNED.value:
+            return _assigned_worker_callback_from_row(row)
+        row.lifecycle = AssignmentLifecycle.UNRESOLVED.value
+        row.delivery_state = CompletionDeliveryState.MANUAL_RECOVERY.value
+        row.terminal_error_at = datetime.now()
+        row.last_error = error
+        _commit_validated_callback_mutation(db, row)
+        return _assigned_worker_callback_from_row(row)
 
 
 def record_project_alias(project_id: str, alias: str, kind: str) -> None:

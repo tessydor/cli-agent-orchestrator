@@ -219,6 +219,17 @@ class StatusMonitor:
             if detected == last:
                 return
 
+            # Install the assigned-worker capture barrier before COMPLETED is
+            # observable through either get_status() or the event bus.  The API
+            # immediate-delivery path runs on separate threads and can read
+            # _last_status as soon as this lock is released; announcing later
+            # would leave a small window in which it could paste queued input
+            # over the final response before durable capture.
+            from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+                assigned_worker_completion_service,
+            )
+
+            assigned_worker_completion_service.announce_terminal_status(terminal_id, detected)
             self._last_status[terminal_id] = detected
             if detected == TerminalStatus.PROCESSING:
                 self._allow_processing_revert[terminal_id] = False

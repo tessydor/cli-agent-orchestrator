@@ -15,9 +15,6 @@ from apscheduler.triggers.cron import CronTrigger  # type: ignore
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import create_flow as db_create_flow
 from cli_agent_orchestrator.clients.database import delete_flow as db_delete_flow
-from cli_agent_orchestrator.clients.database import (
-    delete_terminals_by_session,
-)
 from cli_agent_orchestrator.clients.database import get_flow as db_get_flow
 from cli_agent_orchestrator.clients.database import get_flows_to_run as db_get_flows_to_run
 from cli_agent_orchestrator.clients.database import list_flows as db_list_flows
@@ -32,10 +29,13 @@ from cli_agent_orchestrator.constants import DEFAULT_PROVIDER, PROVIDERS
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.kiro_engine import parse_kiro_engine
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.providers.manager import provider_manager
-from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.status_monitor import status_monitor
-from cli_agent_orchestrator.services.terminal_service import create_terminal, send_input
+from cli_agent_orchestrator.services.terminal_service import (
+    create_terminal,
+    delete_missing_terminal,
+    delete_terminal,
+    send_input,
+)
 from cli_agent_orchestrator.utils.template import render_template
 
 logger = logging.getLogger(__name__)
@@ -283,37 +283,21 @@ async def execute_flow(name: str) -> bool:
             if conductor and _is_terminal_busy(conductor["id"]):
                 logger.info(f"Flow {name}: session {session_name} is busy, skipping")
                 return False
-            for t in terminals:
-                # Tear down the event-driven pipeline for each recycled terminal:
-                # stop the FIFO reader thread (and unlink its *.fifo file) and clear
-                # the StatusMonitor buffers. Without this, repeated flow runs leak
-                # background reader threads and stale FIFO files / status entries.
-                try:
-                    fifo_manager.stop_reader(t["id"])
-                except Exception as e:
-                    logger.warning(f"Failed to stop FIFO reader for {t['id']}: {e}")
-                try:
-                    status_monitor.clear_terminal(t["id"])
-                except Exception as e:
-                    logger.warning(f"Failed to clear status buffers for {t['id']}: {e}")
-            get_backend().kill_session(session_name)
-            # A provider's private state must outlive the process that owns
-            # it.  Grok cleanup confirms any escaped updater has stopped
-            # before recursively deleting its private GROK_HOME.
             cleanup_complete = True
             for t in terminals:
-                # Do not bulk-delete DB rows if a Grok private home is still
-                # owned by a process we cannot safely inspect. Retained rows
-                # are the retry handle for a later terminal cleanup.
-                if provider_manager.cleanup_provider(t["id"]) is False:
+                # Per-terminal retirement captures/classifies assigned-worker
+                # outcomes before killing each window.  A single deferral keeps
+                # the containing session and remaining recovery handles alive.
+                if delete_terminal(t["id"]) is False:
                     cleanup_complete = False
             if not cleanup_complete:
                 logger.warning(
-                    "Flow %s recycling cleanup deferred; retaining terminal metadata for retry",
+                    "Flow %s recycling deferred; retaining backend session for recovery",
                     name,
                 )
                 return False
-            delete_terminals_by_session(session_name)
+            if get_backend().session_exists(session_name):
+                get_backend().kill_session(session_name)
         elif terminals:
             # A previous recycle can have killed the backend session but safely
             # retained its terminal rows because a Grok-owned private home was
@@ -322,12 +306,14 @@ async def execute_flow(name: str) -> bool:
             # handle and could collide with the deterministic GROK_HOME path.
             cleanup_complete = True
             for terminal_metadata in terminals:
-                if provider_manager.cleanup_provider(terminal_metadata["id"]) is False:
+                if not delete_missing_terminal(
+                    terminal_metadata["id"],
+                    "Flow recycle found the persisted terminal's backend session missing",
+                ):
                     cleanup_complete = False
             if not cleanup_complete:
                 logger.warning("Flow %s has retained terminal cleanup; deferring next run", name)
                 return False
-            delete_terminals_by_session(session_name)
         terminal = await create_terminal(
             session_name=session_name,
             provider=flow.provider,
