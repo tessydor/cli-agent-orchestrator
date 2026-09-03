@@ -102,6 +102,52 @@ class TestCodexBuildCommand:
             " -c check_for_update_on_startup=false"
         )
 
+    def test_assigned_worker_installs_native_completion_notify_last(self):
+        provider = CodexProvider(
+            "deadbeef",
+            "test-session",
+            "window-0",
+            None,
+            completion_id="a" * 32,
+        )
+
+        args = shlex.split(provider._build_codex_command())
+        overrides = [args[index + 1] for index, value in enumerate(args) if value == "-c"]
+        notify = [value for value in overrides if value.startswith("notify=")]
+
+        assert len(notify) == 1
+        assert "cli_agent_orchestrator.services.provider_completion_report" in notify[0]
+        assert '"deadbeef"' in notify[0]
+        assert f'"{"a" * 32}"' in notify[0]
+        assert overrides[-2] == notify[0]
+        assert overrides[-1] == "check_for_update_on_startup=false"
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_authoritative_notify_overrides_profile_notify_for_assigned_worker(self, mock_load):
+        profile = MagicMock()
+        profile.model = None
+        profile.system_prompt = None
+        profile.mcpServers = None
+        profile.codexProfile = None
+        profile.codexConfig = {"notify": "profile-notifier"}
+        mock_load.return_value = profile
+        provider = CodexProvider(
+            "deadbeef",
+            "test-session",
+            "window-0",
+            "developer",
+            completion_id="b" * 32,
+        )
+
+        args = shlex.split(provider._build_codex_command())
+        overrides = [args[index + 1] for index, value in enumerate(args) if value == "-c"]
+        notify = [value for value in overrides if value.startswith("notify=")]
+
+        assert len(notify) == 2
+        assert notify[0] == 'notify="profile-notifier"'
+        assert "provider_completion_report" in notify[1]
+        assert overrides.index(notify[1]) > overrides.index(notify[0])
+
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_build_command_with_skill_prompt(self, mock_load_profile, tmp_path):
         mock_profile = MagicMock()

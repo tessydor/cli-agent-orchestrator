@@ -68,6 +68,28 @@ The provider automatically extracts the last assistant response from terminal ou
 
 This works for both the label format (`assistant: response`) and Codex's native bullet format (`• response with multiple bullets`).
 
+Message extraction is a display/API feature only. Assigned-worker completion
+callbacks do not use it as a source of `final_result`.
+
+### Authoritative assigned-worker completion
+
+For an assigned Codex worker, CAO adds a per-run `notify` command. Codex invokes
+that command with its structured `agent-turn-complete` JSON after a successful
+agent turn. CAO validates the native `thread-id` and `turn-id`, requires a
+non-empty `last-assistant-message`, and exactly correlates the final structured
+`input-messages` entry to the task bytes bound before dispatch. It then persists
+only `last-assistant-message` and hashes its exact UTF-8 bytes for the callback.
+
+This is intentionally independent of terminal scrollback. If the report is
+missing, malformed, empty, conflicting, or belongs to another turn, CAO retains
+the worker/report evidence in retry or manual-recovery state and does not create
+a successful callback.
+
+Legacy Codex `notify` configuration names one external command. Assigned workers
+therefore reserve the per-run CAO notify override, emitted after agent-profile
+`codexConfig`, so a profile cannot silently replace callback capture. Ordinary
+Codex terminals that were not created by `assign` keep their configured notifier.
+
 ## Configuration
 
 CAO's Codex provider launches `codex` with tmux-compatible flags and relies on your existing Codex CLI configuration/authentication.
@@ -169,7 +191,7 @@ The `codexConfig` field on an agent profile is a map of Codex config overrides t
 - **Keys** may be dotted paths into Codex's config schema (e.g. `model_reasoning_effort`, `service_tier`, `features.fast_mode`).
 - **Values** are serialized to TOML scalars: strings are quoted, booleans and numbers are emitted bare. So `model_reasoning_effort: "xhigh"` becomes `-c model_reasoning_effort="xhigh"` and `features.fast_mode: true` becomes `-c features.fast_mode=true`.
 - Overrides are applied in **both** the default `--yolo` path and the `--profile <codexProfile>` path, so effort/fast-mode knobs work whether or not a named profile governs sandbox/approvals.
-- `codexConfig` **composes** with `codexProfile`. Because Codex applies CLI `-c` overrides last, a key set in both wins from `codexConfig`.
+- `codexConfig` **composes** with `codexProfile`. Because Codex applies CLI `-c` overrides last, a key set in both wins from `codexConfig`, except that assigned workers reserve the later per-run `notify` override for authoritative callback capture.
 - Scope is per-session: nothing is written to the user's global `~/.codex/config.toml`.
 
 Example — a developer agent pinned to high reasoning effort and fast mode:

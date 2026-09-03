@@ -16,7 +16,8 @@ Two components:
 **1. `test/providers/fixtures/bin/mock_cli`** — a ~60-line bash REPL.
 
 - Prints a banner (`MockCli ready.`), prints the prompt char `❯ `, reads stdin.
-- On each input line: sleeps `--delay-ms` (default 50ms), echoes `> MOCK: <input>`, reprints the prompt.
+- On each input line: sleeps `--delay-ms` (default 50ms), emits a deterministic assistant response, optionally publishes a structured completion report, then reprints the prompt.
+- The exact task `Reply with exactly SYNTHETIC_CALLBACK_SMOKE_OK` produces the distinct response `SYNTHETIC_CALLBACK_SMOKE_OK`. This prevents the no-send callback E2E from passing tautologically by echoing the assignment prompt.
 - Magic strings for failure-mode injection:
   - `/exit` or `/quit` → clean exit with `goodbye`
   - `__mock_error__` → emit `ERROR: mock failure injected` (drives state to ERROR)
@@ -26,13 +27,14 @@ Two components:
 **2. `src/cli_agent_orchestrator/providers/mock_cli.py`** — a ~95-line provider.
 
 - Subclasses `BaseProvider`.
-- `initialize()` waits for shell → spawns `mock_cli --delay-ms N` via `tmux_client.send_keys` → waits for IDLE/COMPLETED.
+- `initialize()` waits for shell → spawns `mock_cli --delay-ms N` via `tmux_client.send_keys` → waits for IDLE/COMPLETED. Assigned workers also receive their immutable terminal/completion identities and the current Python executable so the binary can publish its structured report.
 - `get_status()` strips ANSI then pattern-matches:
   - `ERROR: mock failure injected` present → ERROR
   - no `❯ ` visible → PROCESSING
   - `> MOCK:` + `❯ ` present → COMPLETED
   - just `❯ ` → IDLE
 - `extract_last_message_from_script()` returns the payload of the last `> MOCK: <text>` line.
+- `get_completion_report()` reads the same provider-neutral retained report contract used by Codex; it never derives callback text from the display parser.
 - Registered in `ProviderType.MOCK_CLI = "mock_cli"` and `ProviderManager.create_provider()` like any other provider.
 
 That's it. No model API, no settings.json mangling, no auth flow, no PATH lookup in production.

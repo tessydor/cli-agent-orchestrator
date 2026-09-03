@@ -142,6 +142,9 @@ class TestCreateTerminal:
         assert len(persisted["assignment_id"]) == 32
         assert len(persisted["completion_id"]) == 32
         assert persisted["assignment_id"] != persisted["completion_id"]
+        assert mock_provider_manager.create_provider.call_args.kwargs["completion_id"] == (
+            persisted["completion_id"]
+        )
         mock_completion_service.register_assignment.assert_called_once_with("test1234")
 
     @pytest.mark.asyncio
@@ -1453,6 +1456,53 @@ class TestSendInput:
             submit_delay=0.3,
         )
         mock_update.assert_called_once_with("test1234")
+
+    @patch("cli_agent_orchestrator.services.provider_completion_report.bind_completion_dispatch")
+    @patch("cli_agent_orchestrator.services.terminal_service.inject_memory_context")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_assigned_worker_callback")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_assign_binds_exact_post_injection_input_before_external_paste(
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_pm,
+        _mock_update,
+        mock_status_monitor,
+        mock_get_callback,
+        mock_inject,
+        mock_bind,
+    ):
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+            "provider": "codex",
+        }
+        callback = MagicMock()
+        callback.completion_id = "0" * 32
+        mock_get_callback.return_value = callback
+        injected = "<cao-memory>trusted context</cao-memory>\n\nassigned task"
+        mock_inject.return_value = injected
+        provider = mock_pm.get_provider.return_value
+        provider.paste_enter_count = 2
+        provider.paste_submit_delay = 0.3
+        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+
+        ordered = MagicMock()
+        ordered.attach_mock(mock_bind, "bind")
+        ordered.attach_mock(mock_tmux.send_keys, "send_keys")
+        send_input(
+            "test1234",
+            "assigned task",
+            orchestration_type=OrchestrationType.ASSIGN,
+        )
+
+        mock_bind.assert_called_once_with("codex", "test1234", "0" * 32, injected)
+        calls = [call[0] for call in ordered.mock_calls]
+        assert calls.index("bind") < calls.index("send_keys")
 
     @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")

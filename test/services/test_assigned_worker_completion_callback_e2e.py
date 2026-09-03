@@ -5,9 +5,11 @@ fresh localhost port, and managed subprocesses.  It never contacts or restarts a
 operator's production cao-server.
 """
 
+import hashlib
 import shutil
 import sqlite3
 import time
+import uuid
 from pathlib import Path
 from test.fixtures.cao_server import _pick_free_port, _start_cao_server
 
@@ -26,6 +28,7 @@ def _wait_for_one_delivered_callback(
             with sqlite3.connect(database_path) as connection:
                 row = connection.execute(
                     "SELECT c.delivery_state, c.attempt_count, c.final_result, "
+                    "c.final_result_sha256, "
                     "i.id, i.status, i.origin "
                     "FROM assigned_worker_callbacks AS c "
                     "JOIN inbox AS i ON i.id = c.inbox_message_id "
@@ -38,7 +41,7 @@ def _wait_for_one_delivered_callback(
                     (caller_id,),
                 ).fetchone()[0]
             last_state = (row, count)
-            if row is not None and row[0] == "acknowledged" and row[4] == "delivered":
+            if row is not None and row[0] == "acknowledged" and row[5] == "delivered":
                 assert count == 1
                 return row
         except sqlite3.OperationalError:
@@ -71,7 +74,7 @@ def test_no_send_completion_arrives_once_and_restart_does_not_duplicate(tmp_path
     port = _pick_free_port()
     first_server = _start_cao_server(isolated_home, port, deadline=15.0)
     restarted_server = None
-    session_name = "callback-v1-synthetic"
+    session_name = f"callback-final-result-{uuid.uuid4().hex[:8]}"
     actual_session = None
     try:
         supervisor_response = requests.post(
@@ -97,7 +100,7 @@ def test_no_send_completion_arrives_once_and_restart_does_not_duplicate(tmp_path
                 "defer_init": "true",
             },
             json={
-                "initial_message": "synthetic-no-send-final-report",
+                "initial_message": "Reply with exactly SYNTHETIC_CALLBACK_SMOKE_OK",
                 "initial_message_orchestration_type": "assign",
             },
             timeout=10,
@@ -107,8 +110,20 @@ def test_no_send_completion_arrives_once_and_restart_does_not_duplicate(tmp_path
 
         callback = _wait_for_one_delivered_callback(first_server.db_path, supervisor_id)
         assert callback[1] == 1
-        assert callback[2] == "synthetic-no-send-final-report"
-        assert callback[5] == "server_completion"
+        assert callback[2] == "SYNTHETIC_CALLBACK_SMOKE_OK"
+        assert callback[3] == hashlib.sha256(b"SYNTHETIC_CALLBACK_SMOKE_OK").hexdigest()
+        assert callback[6] == "server_completion"
+
+        # The mock's actual assistant output differs from the assignment prompt.
+        # This independent display read is evidence only; callback capture above
+        # came from the mock's structured provider report.
+        worker_output = requests.get(
+            f"{first_server.url}/terminals/{worker_id}/output",
+            params={"mode": "last"},
+            timeout=5,
+        )
+        assert worker_output.status_code == 200, worker_output.text
+        assert worker_output.json()["output"] == "SYNTHETIC_CALLBACK_SMOKE_OK"
 
         # This is the first and only supervisor read. Arrival was driven by the
         # server's status event and inbox wakeup, not supervisor polling.
@@ -119,7 +134,8 @@ def test_no_send_completion_arrives_once_and_restart_does_not_duplicate(tmp_path
             timeout=5,
         )
         assert output_response.status_code == 200, output_response.text
-        assert "synthetic-no-send-final-report" in output_response.json()["output"]
+        assert "SYNTHETIC_CALLBACK_SMOKE_OK" in output_response.json()["output"]
+        assert "Reply with exactly" not in output_response.json()["output"]
 
         audit_response = requests.get(
             f"{first_server.url}/assigned-workers/{worker_id}/completion-callback",
@@ -142,11 +158,16 @@ def test_no_send_completion_arrives_once_and_restart_does_not_duplicate(tmp_path
         assert _server_callback_count(restarted_server.db_path, supervisor_id) == 1
         with sqlite3.connect(restarted_server.db_path) as connection:
             state = connection.execute(
-                "SELECT delivery_state, attempt_count, final_result "
+                "SELECT delivery_state, attempt_count, final_result, final_result_sha256 "
                 "FROM assigned_worker_callbacks WHERE worker_terminal_id = ?",
                 (worker_id,),
             ).fetchone()
-        assert state == ("acknowledged", 1, "synthetic-no-send-final-report")
+        assert state == (
+            "acknowledged",
+            1,
+            "SYNTHETIC_CALLBACK_SMOKE_OK",
+            hashlib.sha256(b"SYNTHETIC_CALLBACK_SMOKE_OK").hexdigest(),
+        )
     finally:
         if actual_session is not None:
             try:

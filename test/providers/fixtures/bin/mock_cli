@@ -21,10 +21,19 @@ set -u
 
 DELAY_MS=50
 PROMPT=$'\xe2\x9d\xaf '   # "❯ "  — same prompt char family as Claude Code
+TERMINAL_ID=""
+COMPLETION_ID=""
+REPORT_PYTHON=""
+REPORT_SOURCE_ROOT=""
+TURN_ID=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --delay-ms) DELAY_MS="${2:?--delay-ms requires a value}"; shift 2 ;;
+        --terminal-id) TERMINAL_ID="${2:?--terminal-id requires a value}"; shift 2 ;;
+        --completion-id) COMPLETION_ID="${2:?--completion-id requires a value}"; shift 2 ;;
+        --report-python) REPORT_PYTHON="${2:?--report-python requires a value}"; shift 2 ;;
+        --report-source-root) REPORT_SOURCE_ROOT="${2:?--report-source-root requires a value}"; shift 2 ;;
         --version)  echo "mock_cli 0.1.0"; exit 0 ;;
         --help)
             cat <<'EOF'
@@ -73,7 +82,26 @@ while IFS= read -r line; do
             ;;
         *)
             sleep "$DELAY_SEC"
-            echo "> MOCK: $clean_line"
+            response="$clean_line"
+            if [[ "$clean_line" == "Reply with exactly SYNTHETIC_CALLBACK_SMOKE_OK" ]]; then
+                response="SYNTHETIC_CALLBACK_SMOKE_OK"
+            fi
+            echo "> MOCK: $response"
+            TURN_ID=$((TURN_ID + 1))
+            if [[ -n "$TERMINAL_ID" && -n "$COMPLETION_ID" && -n "$REPORT_PYTHON" && -n "$REPORT_SOURCE_ROOT" ]]; then
+                # Emit a structured provider report independently of pane text.
+                # This mirrors a native completion hook and lets the E2E prove
+                # callback capture does not read the echoed assignment prompt.
+                PYTHONPATH="$REPORT_SOURCE_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+                    "$REPORT_PYTHON" -m cli_agent_orchestrator.services.provider_completion_report \
+                    --provider mock_cli \
+                    --terminal-id "$TERMINAL_ID" \
+                    --completion-id "$COMPLETION_ID" \
+                    --turn-id "turn-$TURN_ID" \
+                    --input-message "$clean_line" \
+                    --final-response "$response" \
+                    >/dev/null 2>&1
+            fi
             printf '%s' "$PROMPT"
             ;;
     esac

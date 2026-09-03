@@ -9,6 +9,7 @@ from cli_agent_orchestrator.models.agent_profile import (
     ContainerConfig,
     ContainerPathMap,
 )
+from cli_agent_orchestrator.models.provider_completion import ProviderCompletionUnavailableError
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 
@@ -73,6 +74,13 @@ class TestBaseProvider:
         assert provider.extract_last_message_from_script("test") == "extracted message"
         assert provider.exit_cli() == "/exit"
         provider.cleanup()  # Should not raise
+
+    def test_completion_report_fails_closed_without_native_adapter(self):
+        """Providers must opt in explicitly; pane extraction is not a fallback."""
+        provider = ConcreteProvider("term-123", "session-1", "window-0")
+
+        with pytest.raises(ProviderCompletionUnavailableError):
+            provider.get_completion_report("completion-123")
 
 
 def _profile(*pairs: tuple[str, str]) -> AgentProfile:

@@ -36,6 +36,7 @@ from cli_agent_orchestrator.clients.database import create_terminal as db_create
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (
     delete_terminals_by_session,
+    get_assigned_worker_callback,
     get_terminal_metadata,
     list_siblings_by_group_prefix,
     update_last_active,
@@ -539,6 +540,7 @@ async def create_terminal(
             skill_prompt=skill_prompt,
             model=model or (profile.model if profile else None),
             engine=resolved_engine,
+            completion_id=completion_id,
         )
 
         # Deferred-init path: return fast so callers (e.g. MCP assign) do not
@@ -1378,6 +1380,23 @@ def send_input(
         # internal <cao-memory> block that we paste into the TUI.
         original_message = message
         message = inject_memory_context(message, terminal_id)
+
+        if orchestration_value == OrchestrationType.ASSIGN.value:
+            callback = get_assigned_worker_callback(terminal_id)
+            if callback is not None:
+                # Bind the exact post-injection bytes before the external paste
+                # can occur. Provider completion reports must correlate to this
+                # immutable completion and one of its bounded dispatch attempts.
+                from cli_agent_orchestrator.services.provider_completion_report import (
+                    bind_completion_dispatch,
+                )
+
+                bind_completion_dispatch(
+                    metadata["provider"],
+                    terminal_id,
+                    callback.completion_id,
+                    message,
+                )
 
         # Check how many Enter keys the provider needs after paste
         enter_count = provider.paste_enter_count if provider else 1

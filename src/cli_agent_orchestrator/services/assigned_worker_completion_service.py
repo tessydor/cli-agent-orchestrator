@@ -8,7 +8,6 @@ can safely resume after any committed phase.
 """
 
 import asyncio
-import hashlib
 import logging
 import re
 import threading
@@ -40,6 +39,12 @@ from cli_agent_orchestrator.models.assigned_worker import (
     format_server_completion_message,
 )
 from cli_agent_orchestrator.models.inbox import InboxMessageOrigin
+from cli_agent_orchestrator.models.provider_completion import (
+    ProviderCompletionInvalidError,
+    ProviderCompletionReport,
+    ProviderCompletionUnavailableError,
+    utf8_sha256,
+)
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.manager import provider_manager
@@ -364,6 +369,15 @@ class AssignedWorkerCompletionService:
             record = mark_assigned_worker_dispatched(worker_terminal_id)
             if record is None:
                 return
+            captured = self._capture_dispatched_result(record, retry_unavailable=False)
+            if captured is not None and captured.lifecycle == AssignmentLifecycle.COMPLETED:
+                self._release_capture_barrier(worker_terminal_id)
+                self._drive_delivery(captured)
+                return
+            refreshed = get_assigned_worker_callback(worker_terminal_id)
+            if refreshed is None or refreshed.delivery_state in _DELIVERY_TERMINAL_STATES:
+                return
+            record = refreshed
             status = self._detect_live_status(record)
             if status in (TerminalStatus.COMPLETED, TerminalStatus.ERROR):
                 self._handle_status_locked(record, status)
@@ -398,29 +412,10 @@ class AssignedWorkerCompletionService:
             return
 
         if record.lifecycle == AssignmentLifecycle.DISPATCHED:
-            try:
-                final_result = self._capture_final_result(record.worker_terminal_id)
-                digest = hashlib.sha256(final_result.encode("utf-8")).hexdigest()
-                captured = capture_assigned_worker_completion(
-                    record.worker_terminal_id,
-                    final_result,
-                    digest,
-                    f"assigned-worker-callback:{record.assignment_id}",
-                )
-            except Exception as exc:  # output/backend failure is retryable
-                logger.warning(
-                    "Could not capture final report for assigned worker %s: %s",
-                    record.worker_terminal_id,
-                    exc,
-                    exc_info=True,
-                )
-                self._mark_retryable(
-                    record,
-                    f"Final report capture failed: {type(exc).__name__}: {exc}",
-                    CompletionReceiverState.UNKNOWN,
-                )
+            captured = self._capture_dispatched_result(record, retry_unavailable=True)
+            if captured is None:
                 return
-            if captured is None or captured.lifecycle != AssignmentLifecycle.COMPLETED:
+            if captured.lifecycle != AssignmentLifecycle.COMPLETED:
                 return
             record = captured
 
@@ -430,17 +425,97 @@ class AssignedWorkerCompletionService:
             self._release_capture_barrier(record.worker_terminal_id)
         self._drive_delivery(record)
 
+    def _capture_dispatched_result(
+        self,
+        record: AssignedWorkerCallback,
+        *,
+        retry_unavailable: bool,
+    ) -> Optional[AssignedWorkerCallback]:
+        """Persist one provider-authored report or fail closed.
+
+        An absent report can be a normal race because Codex launches its notify
+        command asynchronously.  A malformed, empty, conflicting, or wrongly
+        correlated report is permanent for the immutable completion identity
+        and therefore requires manual recovery rather than repeated guessing.
+        """
+        try:
+            final_result = self._capture_final_result(record.worker_terminal_id)
+            digest = utf8_sha256(final_result)
+            return capture_assigned_worker_completion(
+                record.worker_terminal_id,
+                final_result,
+                digest,
+                f"assigned-worker-callback:{record.assignment_id}",
+            )
+        except ProviderCompletionUnavailableError as exc:
+            if retry_unavailable:
+                self._mark_retryable(
+                    record,
+                    f"Authoritative final report is not available yet: {exc}",
+                    CompletionReceiverState.UNKNOWN,
+                )
+            return None
+        except ProviderCompletionInvalidError as exc:
+            logger.error(
+                "Rejected authoritative completion for assigned worker %s: %s",
+                record.worker_terminal_id,
+                exc,
+            )
+            mark_assignment_manual_recovery(
+                record.assignment_id,
+                f"Authoritative final report rejected: {type(exc).__name__}: {exc}; "
+                "terminal and report evidence retained for manual recovery",
+            )
+            return None
+        except Exception as exc:
+            logger.warning(
+                "Could not capture authoritative final report for assigned worker %s: %s",
+                record.worker_terminal_id,
+                exc,
+                exc_info=True,
+            )
+            self._mark_retryable(
+                record,
+                f"Authoritative final report capture failed: {type(exc).__name__}: {exc}",
+                CompletionReceiverState.UNKNOWN,
+            )
+            return None
+
     @staticmethod
     def _capture_final_result(worker_terminal_id: str) -> str:
-        """Extract the provider's final response while its terminal is retained."""
-        # Lazy import avoids terminal_service -> this service -> terminal_service
-        # during the delete-time retirement hook.
-        from cli_agent_orchestrator.services import terminal_service
-
-        result = terminal_service.get_output(worker_terminal_id, terminal_service.OutputMode.LAST)
-        if not isinstance(result, str):
-            raise TypeError("provider final output was not text")
-        return result
+        """Return only a correlated provider-native final assistant response."""
+        record = get_assigned_worker_callback(worker_terminal_id)
+        if record is None:
+            raise ProviderCompletionUnavailableError(
+                f"assigned completion for terminal {worker_terminal_id} is unavailable"
+            )
+        provider = provider_manager.get_provider(worker_terminal_id)
+        if provider is None:
+            raise ProviderCompletionUnavailableError(
+                f"provider for assigned terminal {worker_terminal_id} is unavailable"
+            )
+        report = provider.get_completion_report(record.completion_id)
+        if not isinstance(report, ProviderCompletionReport):
+            raise ProviderCompletionInvalidError(
+                "provider adapter returned a non-contract completion report"
+            )
+        metadata = get_terminal_metadata(worker_terminal_id)
+        expected_provider = metadata.get("provider") if metadata is not None else None
+        if (
+            report.provider != expected_provider
+            or report.terminal_id != worker_terminal_id
+            or report.completion_id != record.completion_id
+        ):
+            raise ProviderCompletionInvalidError(
+                "provider report identity does not match the dispatched worker completion"
+            )
+        if not report.final_response.strip():
+            raise ProviderCompletionInvalidError(
+                "provider report has no authoritative non-empty assistant response"
+            )
+        if report.final_response_sha256 != utf8_sha256(report.final_response):
+            raise ProviderCompletionInvalidError("provider report response digest is invalid")
+        return report.final_response
 
     def _classify_receiver(
         self, record: AssignedWorkerCallback
@@ -631,6 +706,22 @@ class AssignedWorkerCompletionService:
             if record.lifecycle in (AssignmentLifecycle.FAILED, AssignmentLifecycle.CANCELLED):
                 return
 
+            # The retained structured report is itself authoritative completion
+            # evidence, so restart recovery does not depend on a pane still
+            # rendering the old COMPLETED frame.  Missing reports fall through
+            # to live status; malformed/cross-turn reports fail closed inside
+            # _capture_dispatched_result.
+            if record.lifecycle == AssignmentLifecycle.DISPATCHED:
+                captured = self._capture_dispatched_result(record, retry_unavailable=True)
+                if captured is not None and captured.lifecycle == AssignmentLifecycle.COMPLETED:
+                    self._release_capture_barrier(worker_terminal_id)
+                    self._drive_delivery(captured)
+                    return
+                refreshed = get_assigned_worker_callback(worker_terminal_id)
+                if refreshed is None or refreshed.delivery_state in _DELIVERY_TERMINAL_STATES:
+                    return
+                record = refreshed
+
             status = self._detect_live_status(record)
             # Provider state after restart is not proof that the assigned prompt
             # was accepted: startup chrome or a stale previous turn can also be
@@ -723,10 +814,10 @@ class AssignedWorkerCompletionService:
     def prepare_terminal_retirement(self, worker_terminal_id: str) -> bool:
         """Capture a completed report before teardown, or record true cancellation.
 
-        Returns ``False`` only when the terminal is visibly COMPLETED but final
-        report capture could not be made durable; callers must retain the worker
-        and allow a retry.  Once the report is captured, receiver delivery may
-        continue after worker retirement because every needed byte is in SQLite.
+        Returns ``False`` whenever authoritative evidence is still retryable or
+        requires manual recovery; callers must retain the worker. Once the
+        report is captured, receiver delivery may continue after worker
+        retirement because every needed response byte is in SQLite.
         """
         with self._worker_lock(worker_terminal_id):
             record = get_assigned_worker_callback(worker_terminal_id)
@@ -758,6 +849,35 @@ class AssignedWorkerCompletionService:
                     "for manual recovery",
                 )
                 return False
+
+            # A retained provider report is stronger evidence than a pane that
+            # has already returned to an idle prompt.  Recover it before
+            # interpreting IDLE as cancellation during terminal teardown.  A
+            # positive provider ERROR still wins: failed turns must never be
+            # promoted to successful completions merely because stale or
+            # contradictory report evidence exists.
+            if (
+                record.lifecycle == AssignmentLifecycle.DISPATCHED
+                and status != TerminalStatus.ERROR
+            ):
+                captured = self._capture_dispatched_result(record, retry_unavailable=False)
+                if captured is not None and captured.lifecycle == AssignmentLifecycle.COMPLETED:
+                    self._release_capture_barrier(worker_terminal_id)
+                    self._drive_delivery(captured)
+                    return True
+
+                refreshed = get_assigned_worker_callback(worker_terminal_id)
+                if refreshed is None:
+                    return True
+                if refreshed.lifecycle == AssignmentLifecycle.UNRESOLVED:
+                    return False
+                # Preserve retryable capture failures as recoverable evidence;
+                # teardown would otherwise erase the only handle available to
+                # a later reconciliation pass.
+                if refreshed.delivery_state == CompletionDeliveryState.RETRYABLE:
+                    return False
+                record = refreshed
+
             if status == TerminalStatus.COMPLETED:
                 self._handle_status_locked(record, status)
                 updated = get_assigned_worker_callback(worker_terminal_id)

@@ -5,12 +5,14 @@ import logging
 import os
 import re
 import shlex
+import sys
 import time
 from pathlib import Path
 from typing import Any, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.models.provider_completion import ProviderCompletionReport
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
@@ -799,6 +801,7 @@ class CodexProvider(BaseProvider):
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
         model: Optional[str] = None,
+        completion_id: Optional[str] = None,
     ):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
@@ -806,6 +809,10 @@ class CodexProvider(BaseProvider):
         self._agent_profile = agent_profile
         # Explicit per-call override for profile.model, see _build_codex_command.
         self._model = model
+        # Present only for an assigned worker created with a durable callback
+        # identity.  It is embedded in Codex's native notify command so the
+        # external structured report cannot drift to another CAO assignment.
+        self._completion_id = completion_id
 
     @property
     def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:
@@ -1024,6 +1031,27 @@ class CodexProvider(BaseProvider):
                 for key, value in profile.codexConfig.items():
                     command_parts.extend(["-c", _toml_override(key, value)])
 
+        if self._completion_id is not None:
+            # Codex's documented ``notify`` program receives one JSON argument
+            # at the native agent-turn-complete boundary.  Emit this override
+            # after profile codexConfig so callback correctness cannot be
+            # silently replaced by a profile-level desktop notifier.  Ordinary
+            # (non-assigned) Codex terminals preserve their existing notify
+            # configuration unchanged.
+            notify_argv = [
+                sys.executable,
+                "-m",
+                "cli_agent_orchestrator.services.provider_completion_report",
+                "--provider",
+                "codex",
+                "--terminal-id",
+                self.terminal_id,
+                "--completion-id",
+                self._completion_id,
+            ]
+            notify_toml = "[" + ", ".join(_toml_scalar(value) for value in notify_argv) + "]"
+            command_parts.extend(["-c", f"notify={notify_toml}"])
+
         # Suppress the startup update dialog at the source. Placed last so it
         # wins even if a profile sets check_for_update_on_startup=true.
         command_parts.extend(["-c", "check_for_update_on_startup=false"])
@@ -1032,6 +1060,14 @@ class CodexProvider(BaseProvider):
         if developer_instructions_fragment is not None:
             command = f"{command} {developer_instructions_fragment}"
         return command
+
+    def get_completion_report(self, completion_id: str) -> ProviderCompletionReport:
+        """Load Codex's retained native agent-turn-complete report."""
+        from cli_agent_orchestrator.services.provider_completion_report import (
+            load_completion_report,
+        )
+
+        return load_completion_report("codex", self.terminal_id, completion_id)
 
     async def _handle_trust_prompt(self, timeout: float = 20.0) -> None:
         """Dismiss startup prompts that block readiness.

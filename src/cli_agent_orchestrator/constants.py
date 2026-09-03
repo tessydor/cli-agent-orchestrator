@@ -140,6 +140,13 @@ FIFO_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
 # new files. Created lazily (0o700) on first use by the lock helper.
 LOCK_DIR = CAO_HOME_DIR / "locks"
 
+# Durable, provider-authored assigned-worker completion reports.  These are
+# deliberately separate from terminal logs: a terminal transcript is display
+# evidence, while this directory contains the structured provider contract used
+# to authorize a successful callback.  The report service creates it lazily with
+# owner-only permissions.
+PROVIDER_COMPLETION_REPORT_DIR = CAO_HOME_DIR / "provider-completion-reports"
+
 # =============================================================================
 # Event-Driven State Detection Configuration
 # =============================================================================
