@@ -90,7 +90,8 @@ class AgentProfile(BaseModel):
     # launch (e.g. {"model_reasoning_effort": "xhigh", "service_tier": "fast",
     # "features.fast_mode": True}). Keys may be dotted paths into Codex's
     # config.toml schema; values are serialized to TOML scalars (strings are
-    # quoted, bools/numbers emitted bare). Applied in both the default --yolo
+    # quoted, bools/numbers emitted bare), with ``notify`` accepting Codex's
+    # string-array argv shape. Applied in both the default --yolo
     # path and the --profile <codexProfile> path, so per-agent knobs like
     # reasoning effort or fast mode need no global ~/.codex/config.toml edits
     # or named profile files. Composes with codexProfile; because Codex applies

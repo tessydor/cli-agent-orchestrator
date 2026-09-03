@@ -63,6 +63,35 @@ def _server_callback_count(database_path: Path, caller_id: str) -> int:
         )
 
 
+def _synthetic_callback_row_counts(
+    database_path: Path, worker_id: str, caller_id: str
+) -> tuple[int, int, int]:
+    """Return callback, linked-inbox, and explicit-worker-message counts."""
+    with sqlite3.connect(database_path) as connection:
+        callback_rows = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM assigned_worker_callbacks WHERE worker_terminal_id = ?",
+                (worker_id,),
+            ).fetchone()[0]
+        )
+        linked_inbox_rows = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM assigned_worker_callbacks AS c "
+                "JOIN inbox AS i ON i.id = c.inbox_message_id "
+                "WHERE c.worker_terminal_id = ?",
+                (worker_id,),
+            ).fetchone()[0]
+        )
+        explicit_worker_messages = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM inbox "
+                "WHERE sender_id = ? AND receiver_id = ? AND origin = 'explicit'",
+                (worker_id, caller_id),
+            ).fetchone()[0]
+        )
+    return callback_rows, linked_inbox_rows, explicit_worker_messages
+
+
 @pytest.mark.e2e
 def test_no_send_completion_arrives_once_and_restart_does_not_duplicate(tmp_path):
     if shutil.which("tmux") is None:
@@ -113,6 +142,14 @@ def test_no_send_completion_arrives_once_and_restart_does_not_duplicate(tmp_path
         assert callback[2] == "SYNTHETIC_CALLBACK_SMOKE_OK"
         assert callback[3] == hashlib.sha256(b"SYNTHETIC_CALLBACK_SMOKE_OK").hexdigest()
         assert callback[6] == "server_completion"
+        # The one callback links to exactly one server-generated inbox row,
+        # and there is no explicit worker->supervisor message from which the
+        # result could have been copied.
+        assert _synthetic_callback_row_counts(first_server.db_path, worker_id, supervisor_id) == (
+            1,
+            1,
+            0,
+        )
 
         # The mock's actual assistant output differs from the assignment prompt.
         # This independent display read is evidence only; callback capture above
@@ -156,6 +193,9 @@ def test_no_send_completion_arrives_once_and_restart_does_not_duplicate(tmp_path
         restarted_server = _start_cao_server(isolated_home, port, deadline=15.0)
         time.sleep(1.0)
         assert _server_callback_count(restarted_server.db_path, supervisor_id) == 1
+        assert _synthetic_callback_row_counts(
+            restarted_server.db_path, worker_id, supervisor_id
+        ) == (1, 1, 0)
         with sqlite3.connect(restarted_server.db_path) as connection:
             state = connection.execute(
                 "SELECT delivery_state, attempt_count, final_result, final_result_sha256 "

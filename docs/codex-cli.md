@@ -85,10 +85,25 @@ missing, malformed, empty, conflicting, or belongs to another turn, CAO retains
 the worker/report evidence in retry or manual-recovery state and does not create
 a successful callback.
 
-Legacy Codex `notify` configuration names one external command. Assigned workers
-therefore reserve the per-run CAO notify override, emitted after agent-profile
-`codexConfig`, so a profile cannot silently replace callback capture. Ordinary
-Codex terminals that were not created by `assign` keep their configured notifier.
+Codex `notify` configuration names one argv, rather than an additive list of
+handlers. For assigned workers, CAO resolves the effective system, user,
+selected-profile, and `codexConfig` notifier using Codex's precedence, then
+installs one per-run fan-out argv. Resolution runs in a short launcher inside
+the worker pane, after shell startup establishes the exact `HOME`/`CODEX_HOME`
+that Codex will use; the launcher then replaces itself with Codex. The adapter
+atomically retains CAO's report first and launches the previous notifier second
+with the identical JSON argument, inherited environment, null standard streams,
+and no shell. A notifier spawn failure cannot roll back the CAO report; a CAO
+validation failure still attempts the previous notifier. As with native Codex
+notify, the forwarded process is fire-and-forget, so its later exit status is
+not interpreted.
+
+Managed Codex defaults outrank command-line overrides. If
+`/etc/codex/managed_config.toml` sets `notify`, CAO rejects assigned-worker launch
+instead of either clobbering the managed command or pretending capture can run.
+Malformed effective notifier argv is rejected the same way. Ordinary Codex
+terminals that were not created by `assign` keep their configured notifier
+without the fan-out adapter.
 
 ## Configuration
 
@@ -189,9 +204,9 @@ approval_policy = "never"
 The `codexConfig` field on an agent profile is a map of Codex config overrides that CAO passes as `-c key=value` flags at launch — the same mechanism used for `developer_instructions` and `mcpServers`. It lets a profile set per-agent Codex knobs (reasoning effort, service tier, fast mode, model, …) **without editing the global `~/.codex/config.toml` or maintaining named profile files**.
 
 - **Keys** may be dotted paths into Codex's config schema (e.g. `model_reasoning_effort`, `service_tier`, `features.fast_mode`).
-- **Values** are serialized to TOML scalars: strings are quoted, booleans and numbers are emitted bare. So `model_reasoning_effort: "xhigh"` becomes `-c model_reasoning_effort="xhigh"` and `features.fast_mode: true` becomes `-c features.fast_mode=true`.
+- **Values** are serialized to TOML scalars: strings are quoted, booleans and numbers are emitted bare. The `notify` key is the one supported string-array exception because Codex defines it as argv. So `model_reasoning_effort: "xhigh"` becomes `-c model_reasoning_effort="xhigh"` and `features.fast_mode: true` becomes `-c features.fast_mode=true`.
 - Overrides are applied in **both** the default `--yolo` path and the `--profile <codexProfile>` path, so effort/fast-mode knobs work whether or not a named profile governs sandbox/approvals.
-- `codexConfig` **composes** with `codexProfile`. Because Codex applies CLI `-c` overrides last, a key set in both wins from `codexConfig`, except that assigned workers reserve the later per-run `notify` override for authoritative callback capture.
+- `codexConfig` **composes** with `codexProfile`. Because Codex applies CLI `-c` overrides last, a key set in both wins from `codexConfig`. For an assigned worker, an effective `codexConfig.notify` argv is forwarded by CAO's later fan-out override instead of being discarded.
 - Scope is per-session: nothing is written to the user's global `~/.codex/config.toml`.
 
 Example — a developer agent pinned to high reasoning effort and fast mode:

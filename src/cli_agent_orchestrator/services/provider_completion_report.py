@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -467,6 +468,7 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--provider", choices=("codex", "mock_cli"), required=True)
     parser.add_argument("--terminal-id", required=True)
     parser.add_argument("--completion-id", required=True)
+    parser.add_argument("--forward-notify-json")
     parser.add_argument("--turn-id")
     parser.add_argument("--input-message")
     parser.add_argument("--final-response")
@@ -474,9 +476,48 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _forward_codex_notification(forward_argv_json: str, notification_json: str) -> None:
+    """Launch the previously effective Codex notifier without a shell.
+
+    Codex's native notifier is fire-and-forget: it appends the notification as
+    one argv element, redirects all standard streams to null, and only observes
+    whether spawning succeeded.  Preserve those semantics rather than waiting
+    for, interpreting, or accidentally shell-expanding the user's notifier.
+    """
+    if len(forward_argv_json.encode("utf-8", errors="strict")) > MAX_REPORT_BYTES:
+        raise ProviderCompletionInvalidError("forwarded Codex notify argv exceeds size limit")
+    try:
+        raw_argv = json.loads(forward_argv_json)
+    except json.JSONDecodeError as exc:
+        raise ProviderCompletionInvalidError("forwarded Codex notify argv is malformed") from exc
+    if (
+        not isinstance(raw_argv, list)
+        or not raw_argv
+        or not all(isinstance(value, str) for value in raw_argv)
+        or not raw_argv[0]
+        or any("\x00" in value for value in raw_argv)
+    ):
+        raise ProviderCompletionInvalidError("forwarded Codex notify argv is invalid")
+
+    subprocess.Popen(
+        [*raw_argv, notification_json],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        shell=False,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    """CLI entry point; errors are silent to avoid leaking provider content."""
+    """CLI entry point; errors are silent to avoid leaking provider content.
+
+    For Codex composition, capture is attempted before forwarding.  Forwarding
+    is still attempted after malformed/uncorrelated capture so CAO never
+    suppresses an existing notifier, while a forwarding spawn failure cannot
+    undo an already atomically retained CAO report.
+    """
     args = _parse_args(sys.argv[1:] if argv is None else argv)
+    failed = False
     try:
         if args.provider == "codex":
             if args.notification_json is None:
@@ -501,8 +542,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
     except (ProviderCompletionError, UnicodeError, json.JSONDecodeError, OSError, ValueError):
         logger.exception("Authoritative provider completion ingestion failed")
-        return 1
-    return 0
+        failed = True
+
+    if (
+        args.provider == "codex"
+        and args.forward_notify_json is not None
+        and args.notification_json is not None
+    ):
+        try:
+            _forward_codex_notification(args.forward_notify_json, args.notification_json)
+        except (ProviderCompletionError, UnicodeError, OSError, ValueError):
+            logger.exception("Forwarding the existing Codex notifier failed")
+            failed = True
+
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised by process-level E2E

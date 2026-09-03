@@ -6,6 +6,7 @@ import hashlib
 import json
 import stat
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -208,3 +209,102 @@ def test_codex_hook_cli_rejects_missing_or_malformed_payload_without_writing() -
     assert reports.main(common) == 1
     assert reports.main([*common, "not-json"]) == 1
     assert reports.main([*common, json.dumps(_codex_payload())]) == 0
+
+
+@patch("cli_agent_orchestrator.services.provider_completion_report.subprocess.Popen")
+def test_composed_notify_forwards_identical_json_as_direct_argv(mock_popen) -> None:
+    _bind()
+    notification_json = json.dumps(_codex_payload(), ensure_ascii=False)
+    forward_argv = [
+        "/opt/notifier with spaces/bin/notify",
+        "--literal",
+        "semicolon; dollar$(not-a-shell)",
+    ]
+    result = reports.main(
+        [
+            "--provider",
+            "codex",
+            "--terminal-id",
+            TERMINAL_ID,
+            "--completion-id",
+            COMPLETION_ID,
+            "--forward-notify-json",
+            json.dumps(forward_argv),
+            notification_json,
+        ]
+    )
+
+    assert result == 0
+    mock_popen.assert_called_once_with(
+        [*forward_argv, notification_json],
+        stdin=reports.subprocess.DEVNULL,
+        stdout=reports.subprocess.DEVNULL,
+        stderr=reports.subprocess.DEVNULL,
+        shell=False,
+    )
+    mock_popen.return_value.wait.assert_not_called()
+    mock_popen.return_value.poll.assert_not_called()
+    assert (
+        reports.load_completion_report("codex", TERMINAL_ID, COMPLETION_ID).final_response
+        == "SYNTHETIC_CALLBACK_SMOKE_OK"
+    )
+
+
+@patch(
+    "cli_agent_orchestrator.services.provider_completion_report.subprocess.Popen",
+    side_effect=OSError("notifier spawn failed"),
+)
+def test_forward_spawn_failure_cannot_undo_cao_capture(mock_popen) -> None:
+    _bind()
+    notification_json = json.dumps(_codex_payload())
+
+    result = reports.main(
+        [
+            "--provider",
+            "codex",
+            "--terminal-id",
+            TERMINAL_ID,
+            "--completion-id",
+            COMPLETION_ID,
+            "--forward-notify-json",
+            json.dumps(["missing-notifier"]),
+            notification_json,
+        ]
+    )
+
+    assert result == 1
+    mock_popen.assert_called_once()
+    report = reports.load_completion_report("codex", TERMINAL_ID, COMPLETION_ID)
+    assert report.final_response == "SYNTHETIC_CALLBACK_SMOKE_OK"
+
+
+@patch("cli_agent_orchestrator.services.provider_completion_report.subprocess.Popen")
+def test_capture_failure_does_not_suppress_existing_notifier(mock_popen) -> None:
+    _bind()
+    malformed_completion = json.dumps(_codex_payload(response=""))
+    forward_argv = ["existing-notifier", "--still-runs"]
+
+    result = reports.main(
+        [
+            "--provider",
+            "codex",
+            "--terminal-id",
+            TERMINAL_ID,
+            "--completion-id",
+            COMPLETION_ID,
+            "--forward-notify-json",
+            json.dumps(forward_argv),
+            malformed_completion,
+        ]
+    )
+
+    assert result == 1
+    mock_popen.assert_called_once_with(
+        [*forward_argv, malformed_completion],
+        stdin=reports.subprocess.DEVNULL,
+        stdout=reports.subprocess.DEVNULL,
+        stderr=reports.subprocess.DEVNULL,
+        shell=False,
+    )
+    with pytest.raises(ProviderCompletionUnavailableError):
+        reports.load_completion_report("codex", TERMINAL_ID, COMPLETION_ID)
