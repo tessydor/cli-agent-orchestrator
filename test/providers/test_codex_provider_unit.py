@@ -1,5 +1,6 @@
 """Unit tests for Codex provider."""
 
+import json
 import os
 import re
 import shlex
@@ -8,8 +9,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib  # type: ignore[no-redef]
+
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.providers import codex as codex_provider
 from cli_agent_orchestrator.providers.codex import (
     APPROVAL_PROMPT_FOOTER,
     CodexProvider,
@@ -18,6 +25,7 @@ from cli_agent_orchestrator.providers.codex import (
     _has_approval_modal_in_bottom,
     _has_approval_prompt_in_bottom,
     _has_startup_idle_composer,
+    _resolve_existing_codex_notify,
     _toml_override,
     _toml_scalar,
 )
@@ -94,6 +102,19 @@ class TestCodexProviderInitialization:
 
 
 class TestCodexBuildCommand:
+    @pytest.fixture(autouse=True)
+    def isolated_codex_config(self, tmp_path, monkeypatch):
+        """Keep completion-command tests independent of operator Codex config."""
+        codex_home = tmp_path / "codex-home"
+        codex_home.mkdir()
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+        monkeypatch.setattr(
+            codex_provider, "CODEX_SYSTEM_CONFIG_PATH", tmp_path / "system-config.toml"
+        )
+        monkeypatch.setattr(
+            codex_provider, "CODEX_MANAGED_CONFIG_PATH", tmp_path / "managed-config.toml"
+        )
+
     def test_build_command_no_profile(self):
         provider = CodexProvider("test1234", "test-session", "window-0", None)
         command = provider._build_codex_command()
@@ -101,6 +122,114 @@ class TestCodexBuildCommand:
             "codex --yolo --no-alt-screen --disable shell_snapshot"
             " -c check_for_update_on_startup=false"
         )
+
+    def test_assigned_worker_wraps_codex_with_completion_launcher(self):
+        provider = CodexProvider(
+            "deadbeef",
+            "test-session",
+            "window-0",
+            None,
+            completion_id="a" * 32,
+        )
+
+        args = shlex.split(provider._build_codex_command())
+        assert args[:3] == [
+            codex_provider.sys.executable,
+            "-m",
+            "cli_agent_orchestrator.services.codex_completion_launcher",
+        ]
+        assert args[args.index("--terminal-id") + 1] == "deadbeef"
+        assert args[args.index("--completion-id") + 1] == "a" * 32
+        wrapped_start = args.index("--") + 1
+        assert args[wrapped_start : wrapped_start + 4] == [
+            "codex",
+            "--yolo",
+            "--no-alt-screen",
+            "--disable",
+        ]
+        assert not any(value.startswith("notify=") for value in args)
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_assigned_worker_composes_profile_notify_as_direct_argv(self, mock_load):
+        profile = MagicMock()
+        profile.model = None
+        profile.system_prompt = None
+        profile.mcpServers = None
+        profile.codexProfile = None
+        original_notify = [
+            "/opt/profile notifier/bin/notify",
+            "--literal",
+            "semicolon; dollar$(not-a-shell)",
+        ]
+        profile.codexConfig = {"notify": original_notify}
+        mock_load.return_value = profile
+        provider = CodexProvider(
+            "deadbeef",
+            "test-session",
+            "window-0",
+            "developer",
+            completion_id="b" * 32,
+        )
+
+        args = shlex.split(provider._build_codex_command())
+
+        # The old argv is one opaque JSON argument to the in-pane launcher,
+        # preserving spaces and shell metacharacters as literal bytes.  The
+        # profile's direct notify override is omitted from wrapped Codex argv.
+        inline_index = args.index("--inline-notify-json")
+        assert json.loads(args[inline_index + 1]) == original_notify
+        wrapped_start = args.index("--") + 1
+        assert not any(value.startswith("notify=") for value in args[wrapped_start:])
+
+    def test_selected_codex_profile_notify_wins_user_and_system_layers(self):
+        codex_home = Path(os.environ["CODEX_HOME"])
+        codex_provider.CODEX_SYSTEM_CONFIG_PATH.write_text(
+            'notify = ["system-notifier"]\n', encoding="utf-8"
+        )
+        (codex_home / "config.toml").write_text('notify = ["user-notifier"]\n', encoding="utf-8")
+        (codex_home / "reviewer.config.toml").write_text(
+            'notify = ["profile-notifier", "--flag"]\n', encoding="utf-8"
+        )
+        profile = MagicMock()
+        profile.model = None
+        profile.system_prompt = None
+        profile.mcpServers = None
+        profile.codexProfile = "reviewer"
+        profile.codexConfig = {}
+        assert _resolve_existing_codex_notify(
+            profile_name="reviewer", inline_config=profile.codexConfig
+        ) == ["profile-notifier", "--flag"]
+
+    def test_inline_notify_wins_selected_profile_for_forwarding(self):
+        codex_home = Path(os.environ["CODEX_HOME"])
+        (codex_home / "reviewer.config.toml").write_text(
+            'notify = ["profile-notifier"]\n', encoding="utf-8"
+        )
+        profile = MagicMock()
+        profile.model = None
+        profile.system_prompt = None
+        profile.mcpServers = None
+        profile.codexProfile = "reviewer"
+        profile.codexConfig = {"notify": ["inline-notifier", "--inline"]}
+        assert _resolve_existing_codex_notify(
+            profile_name="reviewer", inline_config=profile.codexConfig
+        ) == [
+            "inline-notifier",
+            "--inline",
+        ]
+
+    def test_managed_notify_conflict_rejects_assigned_worker_launch(self):
+        codex_provider.CODEX_MANAGED_CONFIG_PATH.write_text(
+            'notify = ["managed-notifier"]\n', encoding="utf-8"
+        )
+        with pytest.raises(ProviderError, match="managed Codex config.*sets notify"):
+            _resolve_existing_codex_notify(profile_name=None, inline_config=None)
+
+    def test_malformed_existing_notify_rejects_assigned_worker_launch(self):
+        codex_home = Path(os.environ["CODEX_HOME"])
+        (codex_home / "config.toml").write_text('notify = "not-an-argv-array"\n', encoding="utf-8")
+        with pytest.raises(ProviderError, match="array of strings"):
+            _resolve_existing_codex_notify(profile_name=None, inline_config=None)
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_build_command_with_skill_prompt(self, mock_load_profile, tmp_path):
@@ -839,6 +968,27 @@ class TestCodexProviderCodexConfig:
         assert 'model_reasoning_effort="xhigh"' in command
         assert 'service_tier="fast"' in command
         assert "features.fast_mode=true" in command
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_codex_config_notify_array_is_preserved_for_ordinary_terminal(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = None
+        mock_profile.codexConfig = {"notify": ["desktop-notifier", "--flag"]}
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        args = shlex.split(provider._build_codex_command())
+        notify_override = next(
+            args[index + 1]
+            for index, value in enumerate(args)
+            if value == "-c" and args[index + 1].startswith("notify=")
+        )
+
+        assert tomllib.loads(notify_override)["notify"] == ["desktop-notifier", "--flag"]
+        assert "provider_completion_report" not in notify_override
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_codex_config_composes_with_codex_profile(self, mock_load):

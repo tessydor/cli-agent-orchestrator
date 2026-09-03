@@ -22,9 +22,12 @@ import logging
 import os
 import re
 import shlex
+import sys
+from pathlib import Path
 from typing import List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.models.provider_completion import ProviderCompletionReport
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
@@ -68,16 +71,32 @@ class MockCliProvider(BaseProvider):
         window_name: str,
         allowed_tools: Optional[List[str]] = None,
         delay_ms: int = 50,
+        completion_id: Optional[str] = None,
     ) -> None:
         super().__init__(terminal_id, session_name, window_name, allowed_tools)
         self._delay_ms = delay_ms
+        self._completion_id = completion_id
 
     async def initialize(self) -> bool:
         """Launch the ``mock_cli`` binary inside the tmux window."""
         if not await wait_for_shell(self.terminal_id, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
-        command = shlex.join([self.BINARY_NAME, "--delay-ms", str(self._delay_ms)])
+        command_parts = [self.BINARY_NAME, "--delay-ms", str(self._delay_ms)]
+        if self._completion_id is not None:
+            command_parts.extend(
+                [
+                    "--terminal-id",
+                    self.terminal_id,
+                    "--completion-id",
+                    self._completion_id,
+                    "--report-python",
+                    sys.executable,
+                    "--report-source-root",
+                    str(Path(__file__).resolve().parents[2]),
+                ]
+            )
+        command = shlex.join(command_parts)
         get_backend().send_keys(self.session_name, self.window_name, command)
 
         if not await wait_until_status(
@@ -130,6 +149,14 @@ class MockCliProvider(BaseProvider):
 
     def get_idle_pattern_for_log(self) -> str:
         return IDLE_PROMPT_PATTERN_LOG
+
+    def get_completion_report(self, completion_id: str) -> ProviderCompletionReport:
+        """Load the mock binary's structured completion report."""
+        from cli_agent_orchestrator.services.provider_completion_report import (
+            load_completion_report,
+        )
+
+        return load_completion_report("mock_cli", self.terminal_id, completion_id)
 
     def exit_cli(self) -> str:
         return "/exit"

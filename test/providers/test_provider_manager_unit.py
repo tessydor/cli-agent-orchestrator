@@ -27,6 +27,23 @@ def test_create_provider_codex_stores_mapping():
     assert manager.get_provider("t1") is provider
 
 
+def test_create_provider_codex_forwards_completion_identity():
+    manager = ProviderManager()
+    completion_id = "a" * 32
+
+    provider = manager.create_provider(
+        ProviderType.CODEX.value,
+        terminal_id="deadbeef",
+        tmux_session="s1",
+        tmux_window="w1",
+        agent_profile=None,
+        completion_id=completion_id,
+    )
+
+    assert isinstance(provider, CodexProvider)
+    assert provider._completion_id == completion_id
+
+
 def test_create_provider_copilot_stores_mapping():
     manager = ProviderManager()
     provider = manager.create_provider(

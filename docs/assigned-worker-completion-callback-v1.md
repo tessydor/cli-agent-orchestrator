@@ -2,8 +2,7 @@
 
 This design makes successful `assign` completion observable to the persisted
 caller even when the worker model never invokes `send_message`. It is based on
-commit `0b02db7a04af4b7a5519dea383a663a0400517d6`; it does not require a newer CAO
-base.
+the CAO 2.4.1 maintenance lineage; it does not require or include CAO 2.5.0.
 
 ## Contract
 
@@ -26,13 +25,29 @@ manual-recovery read independently validates the routing digest, result SHA-256
 and reference, lifecycle/delivery shape, timestamp ordering, and linked inbox
 evidence. A mismatch fails closed without returning report text.
 
-Only a provider-derived `COMPLETED` state after the assigned input was durably
-marked `DISPATCHED` can capture success. Text printed by the model is not a
-completion signal. In particular, a `PROCESSING` or `COMPLETED` provider state
-observed after restart does not prove that an `ASSIGNED` prompt was accepted.
-Such a record becomes auditable `UNRESOLVED` / `MANUAL_RECOVERY`, and its
-terminal remains the recovery handle. `ERROR`, creation failure, and retirement
-before success become `FAILED` or `CANCELLED` and never emit a success callback.
+Successful capture requires both durable `DISPATCHED` proof and an authoritative
+provider completion report correlated to that assignment. Before each assigned
+paste, CAO binds a SHA-256 digest of the exact post-injection task bytes to the
+immutable `(provider, worker_terminal_id, completion_id)` identity. A provider
+adapter may then return only a structured native successful-turn report whose
+final input message matches one of those bounded dispatch attempts. The report
+retains the provider session/turn identity and the exact final assistant response.
+
+Terminal history and provider display extraction are never result fallbacks.
+They may still drive terminal status, but assignment text, injected context,
+earlier transcript content, and synthetic "no response" placeholders cannot
+populate `final_result`. Codex implements the contract with its native
+`agent-turn-complete` `notify` JSON (`thread-id`, `turn-id`, `input-messages`, and
+`last-assistant-message`). The report subprocess and callback service hash the
+exact strict UTF-8 response bytes without trimming or Unicode normalization.
+
+No report yet is `RETRYABLE`, including the short race while Codex's asynchronous
+notify subprocess publishes its file. Empty, malformed, conflicting, or
+incorrectly correlated retained reports become auditable `UNRESOLVED` /
+`MANUAL_RECOVERY`; their terminal and report evidence remain recovery handles.
+A provider without an authoritative adapter also fails closed instead of using
+its pane parser. `ERROR`, creation failure, cancellation, and retirement before
+success become `FAILED` or `CANCELLED` and never emit a success callback.
 
 ## State machine
 
@@ -79,7 +94,8 @@ boundaries:
 | Interrupted point | Recovery behavior |
 | --- | --- |
 | Before dispatch proof | Retain `UNRESOLVED`; never infer dispatch. |
-| After persisted dispatch | Retry provider status and final capture. |
+| After persisted dispatch | Retry authoritative report capture; never scrape history. |
+| After provider report, before callback capture | Recover from the retained structured report even if pane status is gone. |
 | After capture, before inbox insert | Resume from the retained report. |
 | Legacy inbox commit, before link | Retain and reuse the unique row. |
 | Legacy link, before acknowledgement | Verify and acknowledge that row. |
@@ -139,7 +155,8 @@ exception after `send_input` begins cannot prove whether its external paste
 occurred; an unproven callback becomes `UNRESOLVED` / `MANUAL_RECOVERY` and is
 retained instead of being falsely classified as never dispatched.
 
-Captured callback rows, linked inbox evidence, and even unlinked server rows at
+Captured callback rows, provider completion reports, dispatch-correlation
+digests, linked inbox evidence, and even unlinked server rows at
 the legacy insert-before-link crash boundary are exempt from age cleanup.
 Uncaptured workers also retain their `<terminal>.log`, `<terminal>.scrollback`,
 and `<terminal>.snapshot.json` recovery artifacts. Ordinary and unlinked
@@ -230,9 +247,14 @@ reports for operator recovery rather than dropping V1 schema objects.
   legitimate-looking, self-consistent mutation of mutable lifecycle/delivery
   fields by a privileged database writer; such a raw SQL lifecycle transition
   can be accepted without removing the route/result triggers.
-- Final extraction remains provider-specific and bounded by the provider's
-  existing extraction rules. Extraction errors are retryable and block worker
-  retirement rather than discarding the terminal.
-- The patch intentionally remains based on the installed provenance commit.
-  Later `main` has substantial orchestration changes, so forward-port conflicts
-  must be resolved deliberately rather than by changing the V1 base.
+- The provider-neutral contract fails closed for providers that do not yet have
+  a native structured completion adapter. This correction implements Codex; the
+  deterministic test-only `mock_cli` adapter exercises the same boundary in CI.
+- Assigned Codex workers reserve the per-run `notify` override for callback
+  correctness. Because legacy Codex `notify` accepts one command rather than a
+  composable command list, this override takes precedence over a profile/global
+  desktop notifier for that worker. Ordinary non-assigned Codex terminals are
+  unchanged.
+- The patch intentionally remains on the verified CAO 2.4.1 maintenance
+  lineage. Forward ports must be resolved deliberately rather than changing the
+  maintenance base.

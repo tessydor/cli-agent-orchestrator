@@ -68,6 +68,43 @@ The provider automatically extracts the last assistant response from terminal ou
 
 This works for both the label format (`assistant: response`) and Codex's native bullet format (`• response with multiple bullets`).
 
+Message extraction is a display/API feature only. Assigned-worker completion
+callbacks do not use it as a source of `final_result`.
+
+### Authoritative assigned-worker completion
+
+For an assigned Codex worker, CAO adds a per-run `notify` command. Codex invokes
+that command with its structured `agent-turn-complete` JSON after a successful
+agent turn. CAO validates the native `thread-id` and `turn-id`, requires a
+non-empty `last-assistant-message`, and exactly correlates the final structured
+`input-messages` entry to the task bytes bound before dispatch. It then persists
+only `last-assistant-message` and hashes its exact UTF-8 bytes for the callback.
+
+This is intentionally independent of terminal scrollback. If the report is
+missing, malformed, empty, conflicting, or belongs to another turn, CAO retains
+the worker/report evidence in retry or manual-recovery state and does not create
+a successful callback.
+
+Codex `notify` configuration names one argv, rather than an additive list of
+handlers. For assigned workers, CAO resolves the effective system, user,
+selected-profile, and `codexConfig` notifier using Codex's precedence, then
+installs one per-run fan-out argv. Resolution runs in a short launcher inside
+the worker pane, after shell startup establishes the exact `HOME`/`CODEX_HOME`
+that Codex will use; the launcher then replaces itself with Codex. The adapter
+atomically retains CAO's report first and launches the previous notifier second
+with the identical JSON argument, inherited environment, null standard streams,
+and no shell. A notifier spawn failure cannot roll back the CAO report; a CAO
+validation failure still attempts the previous notifier. As with native Codex
+notify, the forwarded process is fire-and-forget, so its later exit status is
+not interpreted.
+
+Managed Codex defaults outrank command-line overrides. If
+`/etc/codex/managed_config.toml` sets `notify`, CAO rejects assigned-worker launch
+instead of either clobbering the managed command or pretending capture can run.
+Malformed effective notifier argv is rejected the same way. Ordinary Codex
+terminals that were not created by `assign` keep their configured notifier
+without the fan-out adapter.
+
 ## Configuration
 
 CAO's Codex provider launches `codex` with tmux-compatible flags and relies on your existing Codex CLI configuration/authentication.
@@ -167,9 +204,9 @@ approval_policy = "never"
 The `codexConfig` field on an agent profile is a map of Codex config overrides that CAO passes as `-c key=value` flags at launch — the same mechanism used for `developer_instructions` and `mcpServers`. It lets a profile set per-agent Codex knobs (reasoning effort, service tier, fast mode, model, …) **without editing the global `~/.codex/config.toml` or maintaining named profile files**.
 
 - **Keys** may be dotted paths into Codex's config schema (e.g. `model_reasoning_effort`, `service_tier`, `features.fast_mode`).
-- **Values** are serialized to TOML scalars: strings are quoted, booleans and numbers are emitted bare. So `model_reasoning_effort: "xhigh"` becomes `-c model_reasoning_effort="xhigh"` and `features.fast_mode: true` becomes `-c features.fast_mode=true`.
+- **Values** are serialized to TOML scalars: strings are quoted, booleans and numbers are emitted bare. The `notify` key is the one supported string-array exception because Codex defines it as argv. So `model_reasoning_effort: "xhigh"` becomes `-c model_reasoning_effort="xhigh"` and `features.fast_mode: true` becomes `-c features.fast_mode=true`.
 - Overrides are applied in **both** the default `--yolo` path and the `--profile <codexProfile>` path, so effort/fast-mode knobs work whether or not a named profile governs sandbox/approvals.
-- `codexConfig` **composes** with `codexProfile`. Because Codex applies CLI `-c` overrides last, a key set in both wins from `codexConfig`.
+- `codexConfig` **composes** with `codexProfile`. Because Codex applies CLI `-c` overrides last, a key set in both wins from `codexConfig`. For an assigned worker, an effective `codexConfig.notify` argv is forwarded by CAO's later fan-out override instead of being discarded.
 - Scope is per-session: nothing is written to the user's global `~/.codex/config.toml`.
 
 Example — a developer agent pinned to high reasoning effort and fast mode:

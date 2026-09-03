@@ -72,7 +72,7 @@ import stat
 import tempfile
 import time
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Callable, Iterator, Optional
 
 from cli_agent_orchestrator.constants import LOCK_DIR
 
@@ -196,6 +196,7 @@ def locked_atomic_rewrite(
     *,
     encoding: str = "utf-8",
     lock_timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
+    file_mode: Optional[int] = None,
 ) -> None:
     """Read-modify-write ``target`` atomically and safely across processes.
 
@@ -217,6 +218,9 @@ def locked_atomic_rewrite(
             ``LockTimeoutError``. Use a bounded timeout (rather than an
             indefinite block) so a crashed holder or a genuine deadlock
             surfaces as a clear error instead of hanging the caller.
+        file_mode: Explicit permission bits for the published file. When
+            omitted, preserve an existing target's mode or use the process
+            umask for a new target.
 
     Raises:
         LockTimeoutError: If the lock is not acquired within
@@ -238,7 +242,7 @@ def locked_atomic_rewrite(
 
     with _file_lock(lock_path, lock_timeout):
         existing = target.read_text(encoding=encoding) if target.exists() else ""
-        _atomic_publish(target, compute_new_content(existing), encoding)
+        _atomic_publish(target, compute_new_content(existing), encoding, file_mode=file_mode)
 
 
 def locked_atomic_write(
@@ -248,6 +252,7 @@ def locked_atomic_write(
     encoding: str = "utf-8",
     lock_timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
     overwrite: bool = True,
+    file_mode: Optional[int] = None,
 ) -> None:
     """Replace ``target``'s entire contents atomically and safely across processes.
 
@@ -274,6 +279,9 @@ def locked_atomic_write(
             observe an absent file. Callers must not pre-check with
             ``target.exists()`` themselves: that test would sit outside this
             critical section and reintroduce the race.
+        file_mode: Explicit permission bits for the published file. When
+            omitted, preserve an existing target's mode or use the process
+            umask for a new target.
 
     Raises:
         FileExistsError: If ``target`` exists and ``overwrite`` is False.
@@ -290,10 +298,16 @@ def locked_atomic_write(
         # both write, so the second silently clobbers the first.
         if not overwrite and target.exists():
             raise FileExistsError(f"{target} already exists")
-        _atomic_publish(target, content, encoding)
+        _atomic_publish(target, content, encoding, file_mode=file_mode)
 
 
-def _atomic_publish(target: Path, content: str, encoding: str) -> None:
+def _atomic_publish(
+    target: Path,
+    content: str,
+    encoding: str,
+    *,
+    file_mode: Optional[int] = None,
+) -> None:
     """Write ``content`` to ``target`` via a unique temp file + ``os.replace``.
 
     Shared by :func:`locked_atomic_rewrite` and :func:`locked_atomic_write`.
@@ -303,7 +317,7 @@ def _atomic_publish(target: Path, content: str, encoding: str) -> None:
     # Capture the mode to apply to the published file BEFORE we write —
     # tempfile.mkstemp creates the temp at 0600, so without this fixup the
     # os.replace below would downgrade a user-authored 0644 file to 0600.
-    mode = _target_mode(target)
+    mode = _target_mode(target) if file_mode is None else file_mode
 
     # Unique temp file in the SAME directory as target (same filesystem,
     # so the final os.replace stays atomic) rather than a fixed

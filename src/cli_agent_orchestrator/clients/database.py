@@ -3069,7 +3069,7 @@ def mark_assignment_manual_recovery(
     assignment_id: str,
     error: str,
 ) -> Optional[AssignedWorkerCallback]:
-    """Fail closed when restart status cannot prove task-input dispatch.
+    """Fail closed when durable evidence cannot prove one safe outcome.
 
     The terminal is deliberately retained as the recovery handle.  This is a
     terminal audit state for automation, but unlike FAILED/CANCELLED it does not
@@ -3085,7 +3085,10 @@ def mark_assignment_manual_recovery(
         if row is None:
             return None
         _validate_assigned_worker_callback_row(db, row)
-        if row.lifecycle != AssignmentLifecycle.ASSIGNED.value:
+        if row.lifecycle not in (
+            AssignmentLifecycle.ASSIGNED.value,
+            AssignmentLifecycle.DISPATCHED.value,
+        ):
             return _assigned_worker_callback_from_row(row)
         row.lifecycle = AssignmentLifecycle.UNRESOLVED.value
         row.delivery_state = CompletionDeliveryState.MANUAL_RECOVERY.value

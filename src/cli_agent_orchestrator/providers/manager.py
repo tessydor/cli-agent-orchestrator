@@ -41,6 +41,7 @@ class ProviderManager:
         skill_prompt: Optional[str] = None,
         model: Optional[str] = None,
         engine: Optional[KiroEngine] = None,
+        completion_id: Optional[str] = None,
     ) -> BaseProvider:
         """Create and store provider instance."""
         try:
@@ -79,6 +80,7 @@ class ProviderManager:
                     allowed_tools,
                     skill_prompt=skill_prompt,
                     model=model,
+                    completion_id=completion_id,
                 )
             elif provider_type == ProviderType.COPILOT_CLI.value:
                 provider = CopilotCliProvider(
@@ -165,6 +167,7 @@ class ProviderManager:
                     tmux_session,
                     tmux_window,
                     allowed_tools,
+                    completion_id=completion_id,
                 )
             else:
                 raise ValueError(f"Unknown provider type: {provider_type}")

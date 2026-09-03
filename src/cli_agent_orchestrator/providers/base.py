@@ -29,6 +29,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 
 if TYPE_CHECKING:
     from cli_agent_orchestrator.models.agent_profile import AgentProfile
+    from cli_agent_orchestrator.models.provider_completion import ProviderCompletionReport
 
 logger = logging.getLogger(__name__)
 
@@ -258,6 +259,22 @@ class BaseProvider(ABC):
             str: Extracted last message from the provider
         """
         pass
+
+    def get_completion_report(self, completion_id: str) -> "ProviderCompletionReport":
+        """Return a native, authoritative report for an assigned completion.
+
+        Display-oriented transcript extraction is deliberately not a fallback:
+        providers must opt in with a structured completion boundary.  Until an
+        adapter implements this contract, assigned-worker callbacks fail closed.
+        """
+        from cli_agent_orchestrator.models.provider_completion import (
+            ProviderCompletionUnavailableError,
+        )
+
+        raise ProviderCompletionUnavailableError(
+            f"{type(self).__name__} has no authoritative completion-report adapter "
+            f"for {completion_id}"
+        )
 
     @abstractmethod
     def exit_cli(self) -> str:

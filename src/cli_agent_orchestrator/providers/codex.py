@@ -1,16 +1,24 @@
 """Codex CLI provider implementation."""
 
 import asyncio
+import json
 import logging
 import os
 import re
 import shlex
+import sys
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional, cast
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib  # type: ignore[no-redef]
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.models.provider_completion import ProviderCompletionReport
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
@@ -20,6 +28,16 @@ from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_sta
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
+
+# ``notify`` is one scalar setting, not an additive list of handlers.  Assigned
+# Codex workers therefore have to resolve the lower-precedence effective value
+# before installing CAO's fan-out adapter as the final CLI override.  Project
+# config is intentionally absent: Codex rejects/ignores ``notify`` there.
+CODEX_SYSTEM_CONFIG_PATH = Path("/etc/codex/config.toml")
+CODEX_MANAGED_CONFIG_PATH = Path("/etc/codex/managed_config.toml")
+MAX_CODEX_CONFIG_BYTES = 8 * 1024 * 1024
+_CONFIG_VALUE_MISSING = object()
+_CODEX_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 # Regex patterns for Codex output analysis
 ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
@@ -356,6 +374,111 @@ def _toml_scalar(value: Any) -> str:
         .replace("\n", "\\n")
     )
     return f'"{escaped}"'
+
+
+def _validate_notify_argv(value: Any, *, source: str) -> list[str]:
+    """Validate Codex's shell-free ``notify`` argv contract.
+
+    An empty array explicitly disables the legacy notifier.  When present, the
+    first element must name a program; later empty arguments remain valid argv.
+    NUL cannot be passed to ``execve`` and is rejected here instead of failing
+    after an assigned worker has already started.
+    """
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ProviderError(f"Codex notify in {source} must be an array of strings")
+    if value and not value[0]:
+        raise ProviderError(f"Codex notify in {source} has an empty executable")
+    if any("\x00" in item for item in value):
+        raise ProviderError(f"Codex notify in {source} contains a NUL byte")
+    return list(value)
+
+
+def _toml_notify_argv(value: Any, *, source: str) -> str:
+    """Serialize a validated Codex notifier argv as a TOML string array."""
+    argv = _validate_notify_argv(value, source=source)
+    return "[" + ", ".join(_toml_scalar(item) for item in argv) + "]"
+
+
+def _codex_home_dir() -> Path:
+    configured = os.environ.get("CODEX_HOME")
+    return Path(configured).expanduser() if configured else Path.home() / ".codex"
+
+
+def _read_codex_notify(path: Path, *, source: str) -> object:
+    """Read one config layer and return its validated notify value if set."""
+    try:
+        size = path.stat().st_size
+    except FileNotFoundError:
+        return _CONFIG_VALUE_MISSING
+    except OSError as exc:
+        raise ProviderError(f"Failed to inspect Codex {source}: {exc}") from exc
+    if size > MAX_CODEX_CONFIG_BYTES:
+        raise ProviderError(f"Codex {source} exceeds the supported size limit")
+    try:
+        raw = path.read_bytes()
+        if len(raw) > MAX_CODEX_CONFIG_BYTES:
+            raise ProviderError(f"Codex {source} exceeds the supported size limit")
+        config = tomllib.loads(raw.decode("utf-8", errors="strict"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
+        raise ProviderError(f"Failed to parse Codex {source}: {exc}") from exc
+    value = config.get("notify", _CONFIG_VALUE_MISSING)
+    if value is _CONFIG_VALUE_MISSING:
+        return value
+    return _validate_notify_argv(value, source=source)
+
+
+def _resolve_existing_codex_notify(
+    *,
+    profile_name: Optional[str],
+    inline_config: Optional[Mapping[str, Any]],
+) -> Optional[list[str]]:
+    """Resolve the notifier CAO must forward before overriding ``notify``.
+
+    Codex precedence, from low to high here, is system config, user config,
+    selected profile, and CLI ``-c`` overrides.  Project-local ``notify`` is
+    intentionally ignored by Codex.  A managed default is higher precedence
+    than CAO's CLI override; if it sets ``notify`` at all, the capture adapter
+    cannot be guaranteed to run, so assigned-worker launch fails closed.
+    """
+    managed = _read_codex_notify(
+        CODEX_MANAGED_CONFIG_PATH,
+        source=f"managed config {CODEX_MANAGED_CONFIG_PATH}",
+    )
+    if managed is not _CONFIG_VALUE_MISSING:
+        raise ProviderError(
+            "Cannot install authoritative assigned-worker completion capture because "
+            f"managed Codex config {CODEX_MANAGED_CONFIG_PATH} sets notify"
+        )
+
+    codex_home = _codex_home_dir()
+    layers = [
+        (CODEX_SYSTEM_CONFIG_PATH, f"system config {CODEX_SYSTEM_CONFIG_PATH}"),
+        (codex_home / "config.toml", f"user config {codex_home / 'config.toml'}"),
+    ]
+    if profile_name is not None:
+        if not _CODEX_PROFILE_NAME_RE.fullmatch(profile_name):
+            raise ProviderError(
+                "Codex profile names used for assigned-worker completion capture may contain "
+                "only letters, numbers, underscores, and hyphens"
+            )
+        profile_path = codex_home / f"{profile_name}.config.toml"
+        layers.append((profile_path, f"profile config {profile_path}"))
+
+    effective: object = _CONFIG_VALUE_MISSING
+    for path, source in layers:
+        configured = _read_codex_notify(path, source=source)
+        if configured is not _CONFIG_VALUE_MISSING:
+            effective = configured
+
+    if inline_config is not None and "notify" in inline_config:
+        effective = _validate_notify_argv(
+            inline_config["notify"], source="agent profile codexConfig"
+        )
+
+    if effective is _CONFIG_VALUE_MISSING or not effective:
+        return None
+    # All assignments to ``effective`` above pass _validate_notify_argv.
+    return cast(list[str], effective)
 
 
 # codexConfig keys are dotted CONFIG PATHS ("features.fast_mode") — dots are
@@ -799,6 +922,7 @@ class CodexProvider(BaseProvider):
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
         model: Optional[str] = None,
+        completion_id: Optional[str] = None,
     ):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
@@ -806,6 +930,10 @@ class CodexProvider(BaseProvider):
         self._agent_profile = agent_profile
         # Explicit per-call override for profile.model, see _build_codex_command.
         self._model = model
+        # Present only for an assigned worker created with a durable callback
+        # identity.  It is embedded in Codex's native notify command so the
+        # external structured report cannot drift to another CAO assignment.
+        self._completion_id = completion_id
 
     @property
     def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:
@@ -855,8 +983,10 @@ class CodexProvider(BaseProvider):
 
         if profile and profile.codexProfile and not yolo:
             command_parts = ["codex", "--profile", profile.codexProfile]
+            selected_profile_name = profile.codexProfile
         else:
             command_parts = ["codex", "--yolo"]
+            selected_profile_name = None
         command_parts.extend(["--no-alt-screen", "--disable", "shell_snapshot"])
 
         # self._model is an explicit per-call override (handoff/assign's own
@@ -1022,16 +1152,70 @@ class CodexProvider(BaseProvider):
             # overrides and the profile/config defaults on key conflicts.
             if profile.codexConfig:
                 for key, value in profile.codexConfig.items():
+                    if key == "notify":
+                        _validate_config_key(key, source="codexConfig", allow_dots=True)
+                        # Assigned workers install one fan-out notifier below;
+                        # its argv contains this effective command for exact
+                        # forwarding.  Ordinary Codex terminals keep the direct
+                        # profile override unchanged.
+                        if self._completion_id is None:
+                            command_parts.extend(
+                                [
+                                    "-c",
+                                    "notify="
+                                    + _toml_notify_argv(value, source="agent profile codexConfig"),
+                                ]
+                            )
+                        continue
                     command_parts.extend(["-c", _toml_override(key, value)])
 
         # Suppress the startup update dialog at the source. Placed last so it
         # wins even if a profile sets check_for_update_on_startup=true.
         command_parts.extend(["-c", "check_for_update_on_startup=false"])
 
-        command = shlex.join(command_parts)
+        if self._completion_id is not None:
+            # Resolve the previously effective Codex notifier inside the pane,
+            # after shell startup has established the exact HOME/CODEX_HOME
+            # that Codex itself will see.  The launcher then execs ``codex``
+            # with one composed notify override; neither Codex nor notifier
+            # argv is passed through a shell by the launcher.
+            launcher_parts = [
+                sys.executable,
+                "-m",
+                "cli_agent_orchestrator.services.codex_completion_launcher",
+                "--terminal-id",
+                self.terminal_id,
+                "--completion-id",
+                self._completion_id,
+            ]
+            if selected_profile_name is not None:
+                launcher_parts.extend(["--profile-name", selected_profile_name])
+            if profile is not None and profile.codexConfig and "notify" in profile.codexConfig:
+                launcher_parts.extend(
+                    [
+                        "--inline-notify-json",
+                        json.dumps(
+                            profile.codexConfig["notify"],
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                    ]
+                )
+            launcher_parts.extend(["--", *command_parts])
+            command = shlex.join(launcher_parts)
+        else:
+            command = shlex.join(command_parts)
         if developer_instructions_fragment is not None:
             command = f"{command} {developer_instructions_fragment}"
         return command
+
+    def get_completion_report(self, completion_id: str) -> ProviderCompletionReport:
+        """Load Codex's retained native agent-turn-complete report."""
+        from cli_agent_orchestrator.services.provider_completion_report import (
+            load_completion_report,
+        )
+
+        return load_completion_report("codex", self.terminal_id, completion_id)
 
     async def _handle_trust_prompt(self, timeout: float = 20.0) -> None:
         """Dismiss startup prompts that block readiness.

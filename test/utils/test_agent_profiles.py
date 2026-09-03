@@ -652,6 +652,9 @@ class TestCodexConfigParsing:
             '  model_reasoning_effort: "xhigh"\n'
             '  service_tier: "fast"\n'
             "  features.fast_mode: true\n"
+            "  notify:\n"
+            "    - desktop-notifier\n"
+            "    - --flag\n"
             "---\n"
             "System prompt content"
         )
@@ -662,6 +665,7 @@ class TestCodexConfigParsing:
             "model_reasoning_effort": "xhigh",
             "service_tier": "fast",
             "features.fast_mode": True,
+            "notify": ["desktop-notifier", "--flag"],
         }
 
     def test_codex_config_defaults_to_none_when_absent(self):
