@@ -26,6 +26,9 @@ COMPLETION_ID=""
 REPORT_PYTHON=""
 REPORT_SOURCE_ROOT=""
 TURN_ID=0
+SYNTHETIC_CALLBACK_TASK=$'SYNTHETIC CAO CALLBACK SMOKE TEST ONLY.\nDo not call send_message.\nReturn exactly:\nSYNTHETIC_CALLBACK_SMOKE_OK'
+SYNTHETIC_CALLBACK_TASK_FIRST_LINE="SYNTHETIC CAO CALLBACK SMOKE TEST ONLY."
+pending_synthetic_task=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -61,6 +64,25 @@ while IFS= read -r line; do
     clean_line="${line#$'\x1b[200~'}"
     clean_line="${clean_line%$'\x1b[201~'}"
 
+    # The shell fixture receives multiline pastes one line at a time on some
+    # tmux versions. Reassemble the exact callback smoke assignment so it is
+    # represented by one provider turn and one correlated completion report.
+    if [[ -n "$pending_synthetic_task" ]]; then
+        pending_synthetic_task+=$'\n'"$clean_line"
+        if [[ "$pending_synthetic_task" == "$SYNTHETIC_CALLBACK_TASK" ]]; then
+            clean_line="$pending_synthetic_task"
+            pending_synthetic_task=""
+        elif [[ "$SYNTHETIC_CALLBACK_TASK" == "$pending_synthetic_task"* ]]; then
+            continue
+        else
+            clean_line="$pending_synthetic_task"
+            pending_synthetic_task=""
+        fi
+    elif [[ "$clean_line" == "$SYNTHETIC_CALLBACK_TASK_FIRST_LINE" ]]; then
+        pending_synthetic_task="$clean_line"
+        continue
+    fi
+
     case "$clean_line" in
         /exit|/quit)
             echo "goodbye"
@@ -83,7 +105,7 @@ while IFS= read -r line; do
         *)
             sleep "$DELAY_SEC"
             response="$clean_line"
-            if [[ "$clean_line" == "Reply with exactly SYNTHETIC_CALLBACK_SMOKE_OK" ]]; then
+            if [[ "$clean_line" == "Reply with exactly SYNTHETIC_CALLBACK_SMOKE_OK" || "$clean_line" == "$SYNTHETIC_CALLBACK_TASK" ]]; then
                 response="SYNTHETIC_CALLBACK_SMOKE_OK"
             fi
             echo "> MOCK: $response"

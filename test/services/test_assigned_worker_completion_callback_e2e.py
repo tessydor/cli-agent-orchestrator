@@ -12,9 +12,26 @@ import time
 import uuid
 from pathlib import Path
 from test.fixtures.cao_server import _pick_free_port, _start_cao_server
+from unittest.mock import patch
 
 import pytest
 import requests
+
+from cli_agent_orchestrator.models.provider_completion import (
+    ProviderCompletionReport,
+    input_messages_sha256,
+)
+from cli_agent_orchestrator.services import provider_completion_report as completion_reports
+
+SYNTHETIC_TASK = (
+    "SYNTHETIC CAO CALLBACK SMOKE TEST ONLY.\n"
+    "Do not call send_message.\n"
+    "Return exactly:\n"
+    "SYNTHETIC_CALLBACK_SMOKE_OK"
+)
+SYNTHETIC_RESULT = "SYNTHETIC_CALLBACK_SMOKE_OK"
+SYNTHETIC_TASK_SHA256 = hashlib.sha256(SYNTHETIC_TASK.encode("utf-8")).hexdigest()
+SYNTHETIC_RESULT_SHA256 = hashlib.sha256(SYNTHETIC_RESULT.encode("utf-8")).hexdigest()
 
 
 def _wait_for_one_delivered_callback(
@@ -92,6 +109,15 @@ def _synthetic_callback_row_counts(
     return callback_rows, linked_inbox_rows, explicit_worker_messages
 
 
+def _load_isolated_completion_report(
+    isolated_home: Path, worker_id: str, completion_id: str
+) -> ProviderCompletionReport:
+    """Load the subprocess-owned report through the production validator."""
+    report_root = isolated_home / ".aws" / "cli-agent-orchestrator" / "provider-completion-reports"
+    with patch.object(completion_reports, "PROVIDER_COMPLETION_REPORT_DIR", report_root):
+        return completion_reports.load_completion_report("mock_cli", worker_id, completion_id)
+
+
 @pytest.mark.e2e
 def test_no_send_completion_arrives_once_and_restart_does_not_duplicate(tmp_path):
     if shutil.which("tmux") is None:
@@ -129,7 +155,7 @@ def test_no_send_completion_arrives_once_and_restart_does_not_duplicate(tmp_path
                 "defer_init": "true",
             },
             json={
-                "initial_message": "Reply with exactly SYNTHETIC_CALLBACK_SMOKE_OK",
+                "initial_message": SYNTHETIC_TASK,
                 "initial_message_orchestration_type": "assign",
             },
             timeout=10,
@@ -139,8 +165,10 @@ def test_no_send_completion_arrives_once_and_restart_does_not_duplicate(tmp_path
 
         callback = _wait_for_one_delivered_callback(first_server.db_path, supervisor_id)
         assert callback[1] == 1
-        assert callback[2] == "SYNTHETIC_CALLBACK_SMOKE_OK"
-        assert callback[3] == hashlib.sha256(b"SYNTHETIC_CALLBACK_SMOKE_OK").hexdigest()
+        assert callback[2] == SYNTHETIC_RESULT
+        assert callback[3] == SYNTHETIC_RESULT_SHA256
+        assert callback[2] != SYNTHETIC_TASK
+        assert all(line not in callback[2] for line in SYNTHETIC_TASK.splitlines()[:-1])
         assert callback[6] == "server_completion"
         # The one callback links to exactly one server-generated inbox row,
         # and there is no explicit worker->supervisor message from which the
@@ -160,7 +188,7 @@ def test_no_send_completion_arrives_once_and_restart_does_not_duplicate(tmp_path
             timeout=5,
         )
         assert worker_output.status_code == 200, worker_output.text
-        assert worker_output.json()["output"] == "SYNTHETIC_CALLBACK_SMOKE_OK"
+        assert worker_output.json()["output"] == SYNTHETIC_RESULT
 
         # This is the first and only supervisor read. Arrival was driven by the
         # server's status event and inbox wakeup, not supervisor polling.
@@ -171,15 +199,27 @@ def test_no_send_completion_arrives_once_and_restart_does_not_duplicate(tmp_path
             timeout=5,
         )
         assert output_response.status_code == 200, output_response.text
-        assert "SYNTHETIC_CALLBACK_SMOKE_OK" in output_response.json()["output"]
-        assert "Reply with exactly" not in output_response.json()["output"]
+        assert SYNTHETIC_RESULT in output_response.json()["output"]
+        assert all(
+            line not in output_response.json()["output"]
+            for line in SYNTHETIC_TASK.splitlines()[:-1]
+        )
 
         audit_response = requests.get(
             f"{first_server.url}/assigned-workers/{worker_id}/completion-callback",
             timeout=5,
         )
         assert audit_response.status_code == 200, audit_response.text
-        assert audit_response.json()["delivery_state"] == "acknowledged"
+        audit = audit_response.json()
+        assert audit["delivery_state"] == "acknowledged"
+
+        authoritative_report = _load_isolated_completion_report(
+            isolated_home, worker_id, audit["completion_id"]
+        )
+        assert authoritative_report.dispatched_input_sha256 == SYNTHETIC_TASK_SHA256
+        assert authoritative_report.input_messages_sha256 == input_messages_sha256([SYNTHETIC_TASK])
+        assert authoritative_report.final_response == SYNTHETIC_RESULT
+        assert authoritative_report.final_response_sha256 == SYNTHETIC_RESULT_SHA256
 
         # Tear down only the isolated synthetic session before stopping its
         # isolated server; callback/report rows intentionally survive.
@@ -196,6 +236,11 @@ def test_no_send_completion_arrives_once_and_restart_does_not_duplicate(tmp_path
         assert _synthetic_callback_row_counts(
             restarted_server.db_path, worker_id, supervisor_id
         ) == (1, 1, 0)
+        recovered_report = _load_isolated_completion_report(
+            isolated_home, worker_id, audit["completion_id"]
+        )
+        assert recovered_report == authoritative_report
+        assert recovered_report.final_response == SYNTHETIC_RESULT
         with sqlite3.connect(restarted_server.db_path) as connection:
             state = connection.execute(
                 "SELECT delivery_state, attempt_count, final_result, final_result_sha256 "
@@ -205,8 +250,8 @@ def test_no_send_completion_arrives_once_and_restart_does_not_duplicate(tmp_path
         assert state == (
             "acknowledged",
             1,
-            "SYNTHETIC_CALLBACK_SMOKE_OK",
-            hashlib.sha256(b"SYNTHETIC_CALLBACK_SMOKE_OK").hexdigest(),
+            SYNTHETIC_RESULT,
+            SYNTHETIC_RESULT_SHA256,
         )
     finally:
         if actual_session is not None:
