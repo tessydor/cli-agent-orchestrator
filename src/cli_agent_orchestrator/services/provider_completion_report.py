@@ -1,9 +1,11 @@
 """Durable ingestion and retrieval of authoritative provider completion data.
 
 The module is also the process entry point used by provider-native completion
-hooks.  Codex appends one structured JSON argument to the configured command at
-its successful ``agent-turn-complete`` boundary.  That subprocess validates and
-atomically retains the report; callback delivery later reads it through the
+hooks and launch adapters.  Codex appends one structured JSON argument to its
+configured ``agent-turn-complete`` command.  Assigned Claude Code workers run
+through the supported CLI ``stream-json`` interface, whose authoritative
+``ResultMessage`` is validated and retained before it is exposed to terminal
+status processing.  Callback delivery later reads either source through the
 provider-neutral ``BaseProvider.get_completion_report`` contract.
 
 No terminal history, assignment prompt parsing, or response-text heuristic is
@@ -21,6 +23,7 @@ import os
 import re
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -48,6 +51,51 @@ _COMPLETION_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 _PROVIDER_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _PROVIDER_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,256}$")
 _SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
+
+# Claude Code 2.1.259's installed ResultMessage union.  Keeping this closed set
+# makes a future incompatible wire change fail closed instead of silently
+# promoting a new terminal outcome to success.
+_CLAUDE_RESULT_SUBTYPES = frozenset(
+    {
+        "success",
+        "error_during_execution",
+        "error_max_turns",
+        "error_max_budget_usd",
+        "error_max_structured_output_retries",
+    }
+)
+_CLAUDE_CANCELLED_TERMINAL_REASONS = frozenset({"aborted_streaming", "aborted_tools"})
+_COMPLETION_STATES = frozenset({"success", "failure", "cancelled", "terminated"})
+
+# UUIDv5 identities are derived from CAO's immutable terminal/completion route
+# and the exact bound dispatch digest.  They are valid Claude SDK identifiers,
+# stable across server-side recovery, and cannot collide across assignments
+# unless every correlated CAO identity is also identical.
+_CLAUDE_COMPLETION_NAMESPACE = uuid.UUID("9f3dbf1e-ea10-4f73-8a91-496f2bb43f23")
+
+
+def claude_session_id(terminal_id: str, completion_id: str) -> str:
+    """Return the deterministic Claude session UUID for one CAO completion."""
+    _validate_identity("claude_code", terminal_id, completion_id)
+    return str(
+        uuid.uuid5(
+            _CLAUDE_COMPLETION_NAMESPACE,
+            f"claude-session:{terminal_id}:{completion_id}",
+        )
+    )
+
+
+def claude_input_id(terminal_id: str, completion_id: str, dispatch_sha256: str) -> str:
+    """Return the Claude user-message UUID bound to exact dispatched bytes."""
+    _validate_identity("claude_code", terminal_id, completion_id)
+    if not _SHA256_RE.fullmatch(dispatch_sha256):
+        raise ProviderCompletionInvalidError("Claude dispatch digest is malformed")
+    return str(
+        uuid.uuid5(
+            _CLAUDE_COMPLETION_NAMESPACE,
+            f"claude-input:{terminal_id}:{completion_id}:{dispatch_sha256}",
+        )
+    )
 
 
 def _report_root() -> Path:
@@ -212,6 +260,199 @@ def _validate_provider_id(value: str, *, field: str) -> str:
     return value
 
 
+def _validate_claude_uuid(value: str, *, field: str) -> str:
+    """Validate the canonical UUID strings exposed by Claude's SDK stream."""
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError) as exc:
+        raise ProviderCompletionInvalidError(
+            f"Claude completion field {field!r} is not a UUID"
+        ) from exc
+    if str(parsed) != value:
+        raise ProviderCompletionInvalidError(
+            f"Claude completion field {field!r} is not a canonical UUID"
+        )
+    return value
+
+
+def _classify_claude_outcome(
+    *,
+    subtype: str,
+    is_error: bool,
+    terminal_reason: str | None,
+    result: str,
+) -> str:
+    """Map Claude 2.1.259 ResultMessage fields to CAO's terminal outcome."""
+    if subtype == "success" and is_error is False and terminal_reason == "completed":
+        if not result.strip():
+            raise ProviderCompletionInvalidError(
+                "Claude completion has no authoritative non-empty assistant result"
+            )
+        return "success"
+    if terminal_reason in _CLAUDE_CANCELLED_TERMINAL_REASONS:
+        return "cancelled"
+    if subtype != "success" or is_error is True:
+        return "failure"
+    # Non-error ResultMessages such as max-turn/tool-deferred/background
+    # boundaries are terminal for this assigned turn but are not successful
+    # final answers and are not cancellations.
+    return "terminated"
+
+
+def _bound_dispatch_digests(
+    provider: str,
+    terminal_id: str,
+    completion_id: str,
+) -> list[str]:
+    """Load the immutable exact-input digests for one completion identity."""
+    dispatch_path, _, _ = _paths(provider, terminal_id, completion_id)
+    payload = _load_json_object(dispatch_path, label="dispatch correlation")
+    expected_identity = (SCHEMA_VERSION, provider, terminal_id, completion_id)
+    actual_identity = (
+        payload.get("schema_version"),
+        payload.get("provider"),
+        payload.get("terminal_id"),
+        payload.get("completion_id"),
+    )
+    if actual_identity != expected_identity:
+        raise ProviderCompletionCorrelationError(
+            "authoritative dispatch identity does not match the assigned completion"
+        )
+    digests = payload.get("dispatched_input_sha256")
+    if (
+        not isinstance(digests, list)
+        or not digests
+        or not all(isinstance(value, str) and _SHA256_RE.fullmatch(value) for value in digests)
+    ):
+        raise ProviderCompletionInvalidError("dispatch correlation digests are malformed")
+    return digests
+
+
+def _match_claude_dispatch(
+    terminal_id: str,
+    completion_id: str,
+    result_message: Mapping[str, Any],
+) -> tuple[str, str] | None:
+    """Match a Claude result input UUID to exactly one bound dispatch digest.
+
+    ``None`` means this is a different turn in the same long-lived stream.  A
+    result claiming the assigned input plus any additional batched/queued input
+    is ambiguous and is rejected: its final text no longer answers only the
+    exact dispatched assignment.
+    """
+    user_message_uuid = result_message.get("user_message_uuid")
+    if user_message_uuid is None:
+        return None
+    if not isinstance(user_message_uuid, str):
+        raise ProviderCompletionInvalidError("Claude result user_message_uuid is malformed")
+    _validate_claude_uuid(user_message_uuid, field="user_message_uuid")
+
+    digests = _bound_dispatch_digests("claude_code", terminal_id, completion_id)
+    candidates = [
+        (digest, claude_input_id(terminal_id, completion_id, digest)) for digest in digests
+    ]
+    matches = [candidate for candidate in candidates if candidate[1] == user_message_uuid]
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise ProviderCompletionCorrelationError(
+            "Claude result input identity ambiguously matches dispatch attempts"
+        )
+
+    user_message_uuids = result_message.get("user_message_uuids")
+    if user_message_uuids is not None:
+        if not isinstance(user_message_uuids, list) or not all(
+            isinstance(value, str) for value in user_message_uuids
+        ):
+            raise ProviderCompletionInvalidError("Claude result user_message_uuids is malformed")
+        for value in user_message_uuids:
+            _validate_claude_uuid(value, field="user_message_uuids")
+        if user_message_uuids != [user_message_uuid]:
+            raise ProviderCompletionCorrelationError(
+                "Claude result combined the assigned input with another user message"
+            )
+    return matches[0]
+
+
+def ingest_claude_completion(
+    terminal_id: str,
+    completion_id: str,
+    result_message: Mapping[str, Any],
+) -> ProviderCompletionReport | None:
+    """Validate and retain one Claude Code 2.1.259 structured ResultMessage.
+
+    A result for another input in the same streaming session returns ``None``;
+    it is not evidence about this assignment.  Once the assigned input UUID is
+    claimed, every session, batch, result, outcome, and response field is
+    validated before an immutable report is written.
+    """
+    provider = "claude_code"
+    _validate_identity(provider, terminal_id, completion_id)
+    if result_message.get("type") != "result":
+        raise ProviderCompletionInvalidError("Claude completion is not a ResultMessage")
+
+    provider_session_id = _validate_claude_uuid(
+        _required_string(result_message, "session_id"), field="session_id"
+    )
+    provider_turn_id = _validate_claude_uuid(_required_string(result_message, "uuid"), field="uuid")
+    provider_result_subtype = _required_string(result_message, "subtype")
+    if provider_result_subtype not in _CLAUDE_RESULT_SUBTYPES:
+        raise ProviderCompletionInvalidError("Claude result subtype is unsupported")
+    is_error = result_message.get("is_error")
+    if not isinstance(is_error, bool):
+        raise ProviderCompletionInvalidError("Claude result is_error is malformed")
+
+    provider_terminal_reason = result_message.get("terminal_reason")
+    if provider_terminal_reason is not None:
+        if not isinstance(provider_terminal_reason, str):
+            raise ProviderCompletionInvalidError("Claude terminal_reason is malformed")
+        _validate_provider_id(provider_terminal_reason, field="terminal_reason")
+
+    matched = _match_claude_dispatch(terminal_id, completion_id, result_message)
+    if matched is None:
+        return None
+    dispatched_input_sha256, provider_input_id = matched
+
+    expected_session_id = claude_session_id(terminal_id, completion_id)
+    if provider_session_id != expected_session_id:
+        raise ProviderCompletionCorrelationError(
+            "Claude result session does not match the dispatched worker session"
+        )
+
+    raw_result = result_message.get("result", "")
+    if not isinstance(raw_result, str):
+        raise ProviderCompletionInvalidError("Claude result text is malformed")
+
+    completion_state = _classify_claude_outcome(
+        subtype=provider_result_subtype,
+        is_error=is_error,
+        terminal_reason=provider_terminal_reason,
+        result=raw_result,
+    )
+
+    report = ProviderCompletionReport(
+        provider=provider,
+        terminal_id=terminal_id,
+        completion_id=completion_id,
+        provider_session_id=provider_session_id,
+        provider_turn_id=provider_turn_id,
+        input_messages_sha256=input_messages_sha256([provider_input_id]),
+        dispatched_input_sha256=dispatched_input_sha256,
+        final_response=raw_result,
+        final_response_sha256=utf8_sha256(raw_result),
+        source_reference=(
+            f"provider-completion:{provider}:{provider_session_id}:{provider_turn_id}"
+        ),
+        completion_state=completion_state,
+        provider_input_id=provider_input_id,
+        provider_result_subtype=provider_result_subtype,
+        provider_terminal_reason=provider_terminal_reason,
+        provider_is_error=is_error,
+    )
+    _persist_report(report)
+    return report
+
+
 def ingest_codex_completion(
     terminal_id: str,
     completion_id: str,
@@ -323,7 +564,7 @@ def _ingest_test_completion(
 
 
 def _report_payload(report: ProviderCompletionReport) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "provider": report.provider,
         "terminal_id": report.terminal_id,
@@ -336,6 +577,20 @@ def _report_payload(report: ProviderCompletionReport) -> dict[str, Any]:
         "final_response_sha256": report.final_response_sha256,
         "source_reference": report.source_reference,
     }
+    if report.provider == "claude_code":
+        # Additive fields are written only for Claude reports.  Re-emitting an
+        # old Codex notification must remain byte-identical to a pre-adapter V1
+        # report so immutable duplicate handling does not manufacture a conflict.
+        payload.update(
+            {
+                "completion_state": report.completion_state,
+                "provider_input_id": report.provider_input_id,
+                "provider_result_subtype": report.provider_result_subtype,
+                "provider_terminal_reason": report.provider_terminal_reason,
+                "provider_is_error": report.provider_is_error,
+            }
+        )
+    return payload
 
 
 def _persist_report(report: ProviderCompletionReport) -> None:
@@ -431,8 +686,16 @@ def load_completion_report(
     )
     if any(not isinstance(report_payload.get(key), str) for key in required_text):
         raise ProviderCompletionInvalidError("provider completion report fields are malformed")
+    if provider == "claude_code" and "completion_state" not in report_payload:
+        raise ProviderCompletionInvalidError("Claude provider completion state is missing")
+    completion_state = report_payload.get("completion_state", "success")
+    if completion_state not in _COMPLETION_STATES:
+        raise ProviderCompletionInvalidError("provider completion state is invalid")
+    if provider != "claude_code" and completion_state != "success":
+        raise ProviderCompletionInvalidError("legacy provider report has a non-success state")
+
     final_response = report_payload["final_response"]
-    if not final_response.strip():
+    if completion_state == "success" and not final_response.strip():
         raise ProviderCompletionInvalidError(
             "provider completion has no authoritative non-empty assistant response"
         )
@@ -449,6 +712,61 @@ def load_completion_report(
     if report_payload["source_reference"] != expected_reference:
         raise ProviderCompletionInvalidError("provider completion source reference is invalid")
 
+    provider_input_id: str | None = None
+    provider_result_subtype: str | None = None
+    provider_terminal_reason: str | None = None
+    provider_is_error: bool | None = None
+    if provider == "claude_code":
+        required_claude_fields = {
+            "provider_input_id",
+            "provider_result_subtype",
+            "provider_terminal_reason",
+            "provider_is_error",
+        }
+        if not required_claude_fields.issubset(report_payload):
+            raise ProviderCompletionInvalidError("Claude provider report fields are missing")
+        provider_input_id = report_payload.get("provider_input_id")
+        provider_result_subtype = report_payload.get("provider_result_subtype")
+        provider_terminal_reason = report_payload.get("provider_terminal_reason")
+        provider_is_error = report_payload.get("provider_is_error")
+        if not isinstance(provider_input_id, str):
+            raise ProviderCompletionInvalidError("Claude provider input identity is malformed")
+        _validate_claude_uuid(report_payload["provider_session_id"], field="provider_session_id")
+        _validate_claude_uuid(report_payload["provider_turn_id"], field="provider_turn_id")
+        _validate_claude_uuid(provider_input_id, field="provider_input_id")
+        if (
+            not isinstance(provider_result_subtype, str)
+            or provider_result_subtype not in _CLAUDE_RESULT_SUBTYPES
+        ):
+            raise ProviderCompletionInvalidError("Claude result subtype is malformed")
+        if provider_terminal_reason is not None:
+            if not isinstance(provider_terminal_reason, str):
+                raise ProviderCompletionInvalidError("Claude terminal reason is malformed")
+            _validate_provider_id(provider_terminal_reason, field="provider_terminal_reason")
+        if not isinstance(provider_is_error, bool):
+            raise ProviderCompletionInvalidError("Claude result is_error is malformed")
+
+        expected_state = _classify_claude_outcome(
+            subtype=provider_result_subtype,
+            is_error=provider_is_error,
+            terminal_reason=provider_terminal_reason,
+            result=final_response,
+        )
+        if completion_state != expected_state:
+            raise ProviderCompletionInvalidError(
+                "Claude completion state contradicts its ResultMessage evidence"
+            )
+
+        expected_input_ids = {
+            claude_input_id(terminal_id, completion_id, digest) for digest in digests
+        }
+        if provider_input_id not in expected_input_ids or report_payload[
+            "input_messages_sha256"
+        ] != input_messages_sha256([provider_input_id]):
+            raise ProviderCompletionCorrelationError(
+                "Claude report input identity does not match the exact dispatched task"
+            )
+
     return ProviderCompletionReport(
         provider=provider,
         terminal_id=terminal_id,
@@ -460,6 +778,11 @@ def load_completion_report(
         final_response=final_response,
         final_response_sha256=report_payload["final_response_sha256"],
         source_reference=report_payload["source_reference"],
+        completion_state=completion_state,
+        provider_input_id=provider_input_id,
+        provider_result_subtype=provider_result_subtype,
+        provider_terminal_reason=provider_terminal_reason,
+        provider_is_error=provider_is_error,
     )
 
 

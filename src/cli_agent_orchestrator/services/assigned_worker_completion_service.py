@@ -42,6 +42,7 @@ from cli_agent_orchestrator.models.inbox import InboxMessageOrigin
 from cli_agent_orchestrator.models.provider_completion import (
     ProviderCompletionInvalidError,
     ProviderCompletionReport,
+    ProviderCompletionTerminalOutcomeError,
     ProviderCompletionUnavailableError,
     utf8_sha256,
 )
@@ -434,7 +435,8 @@ class AssignedWorkerCompletionService:
         """Persist one provider-authored report or fail closed.
 
         An absent report can be a normal race because Codex launches its notify
-        command asynchronously.  A malformed, empty, conflicting, or wrongly
+        command asynchronously and Claude's launcher persists before publishing
+        the final stream event. A malformed, empty, conflicting, or wrongly
         correlated report is permanent for the immutable completion identity
         and therefore requires manual recovery rather than repeated guessing.
         """
@@ -454,6 +456,23 @@ class AssignedWorkerCompletionService:
                     f"Authoritative final report is not available yet: {exc}",
                     CompletionReceiverState.UNKNOWN,
                 )
+            return None
+        except ProviderCompletionTerminalOutcomeError as exc:
+            lifecycle = (
+                AssignmentLifecycle.CANCELLED
+                if exc.completion_state == "cancelled"
+                else AssignmentLifecycle.FAILED
+            )
+            mark_completion_terminal_error(
+                record.assignment_id,
+                "Authoritative provider result was not successful: "
+                f"state={exc.completion_state}, "
+                f"subtype={exc.provider_result_subtype}, "
+                f"terminal_reason={exc.provider_terminal_reason}",
+                CompletionReceiverState.UNKNOWN,
+                lifecycle=lifecycle,
+            )
+            self._release_capture_barrier(record.worker_terminal_id)
             return None
         except ProviderCompletionInvalidError as exc:
             logger.error(
@@ -508,6 +527,12 @@ class AssignedWorkerCompletionService:
         ):
             raise ProviderCompletionInvalidError(
                 "provider report identity does not match the dispatched worker completion"
+            )
+        if report.completion_state != "success":
+            raise ProviderCompletionTerminalOutcomeError(
+                report.completion_state,
+                report.provider_result_subtype,
+                report.provider_terminal_reason,
             )
         if not report.final_response.strip():
             raise ProviderCompletionInvalidError(

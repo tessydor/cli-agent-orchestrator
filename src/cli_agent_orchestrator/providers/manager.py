@@ -3,7 +3,10 @@
 import logging
 from typing import Dict, List, Optional
 
-from cli_agent_orchestrator.clients.database import get_terminal_metadata
+from cli_agent_orchestrator.clients.database import (
+    get_assigned_worker_callback,
+    get_terminal_metadata,
+)
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.providers.antigravity_cli import AntigravityCliProvider
@@ -70,6 +73,7 @@ class ProviderManager:
                     allowed_tools,
                     skill_prompt=skill_prompt,
                     model=model,
+                    completion_id=completion_id,
                 )
             elif provider_type == ProviderType.CODEX.value:
                 provider = CodexProvider(
@@ -218,6 +222,8 @@ class ProviderManager:
         if persisted_engine == KiroEngine.KAS:
             raise KiroPhase0KASError(profile_has_v2_policy=False)
 
+        callback = get_assigned_worker_callback(terminal_id)
+
         # Create provider on-demand
         provider = self.create_provider(
             metadata["provider"],
@@ -226,6 +232,7 @@ class ProviderManager:
             metadata["tmux_window"],
             metadata["agent_profile"],
             engine=persisted_engine,
+            completion_id=callback.completion_id if callback is not None else None,
         )
         # Restore shell_command baseline from DB so get_status() can detect kiro exit.
         # The terminal already exists in the DB, so its CLI has long since

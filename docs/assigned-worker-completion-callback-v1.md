@@ -34,12 +34,15 @@ final input message matches one of those bounded dispatch attempts. The report
 retains the provider session/turn identity and the exact final assistant response.
 
 Terminal history and provider display extraction are never result fallbacks.
-They may still drive terminal status, but assignment text, injected context,
-earlier transcript content, and synthetic "no response" placeholders cannot
-populate `final_result`. Codex implements the contract with its native
-`agent-turn-complete` `notify` JSON (`thread-id`, `turn-id`, `input-messages`, and
-`last-assistant-message`). The report subprocess and callback service hash the
-exact strict UTF-8 response bytes without trimming or Unicode normalization.
+Assignment text, injected context, earlier transcript content, and synthetic
+"no response" placeholders cannot populate `final_result`. Codex implements the
+contract with its native `agent-turn-complete` `notify` JSON (`thread-id`,
+`turn-id`, `input-messages`, and `last-assistant-message`). Assigned Claude Code
+workers implement it with the 2.1.259 Agent SDK control handshake and CLI
+`stream-json` `ResultMessage` (`session_id`, result `uuid`, assignment input UUID,
+`subtype`, `is_error`, `terminal_reason`, and exact `result`). The report
+subprocess/adapter and callback service hash the exact strict UTF-8 response
+bytes without trimming or Unicode normalization.
 
 No report yet is `RETRYABLE`, including the short race while Codex's asynchronous
 notify subprocess publishes its file. Empty, malformed, conflicting, or
@@ -248,8 +251,12 @@ reports for operator recovery rather than dropping V1 schema objects.
   fields by a privileged database writer; such a raw SQL lifecycle transition
   can be accepted without removing the route/result triggers.
 - The provider-neutral contract fails closed for providers that do not yet have
-  a native structured completion adapter. This correction implements Codex; the
-  deterministic test-only `mock_cli` adapter exercises the same boundary in CI.
+  a native structured completion adapter. V1 supports Codex native notify and
+  assigned Claude Code 2.1.259 ResultMessage ingestion; the deterministic
+  test-only `mock_cli` adapter exercises the same boundary in CI.
+- Claude's adapter intentionally recognizes a closed 2.1.259 ResultMessage
+  subtype contract. A future incompatible structured schema remains fail-closed
+  until separately audited; there is no TUI/history compatibility fallback.
 - Assigned Codex workers reserve the per-run `notify` override for callback
   correctness. Because legacy Codex `notify` accepts one command rather than a
   composable command list, this override takes precedence over a profile/global

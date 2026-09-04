@@ -237,6 +237,21 @@ class BaseProvider(ABC):
         """
         return False
 
+    def encode_terminal_input(self, message: str, orchestration_type: str = "") -> str:
+        """Encode one logical CAO message for the provider's terminal protocol.
+
+        Interactive providers consume the original text.  A provider using a
+        structured stdin protocol may override this hook, but the caller must
+        bind completion correlation against ``message`` *before* invoking it so
+        wire framing never changes the exact dispatched-task digest.
+        """
+        return message
+
+    @property
+    def force_bracketed_paste(self) -> bool:
+        """Whether terminal delivery should request bracketed-paste framing."""
+        return True
+
     @property
     def extraction_retries(self) -> int:
         """Number of extraction retries for transient TUI rendering issues.
