@@ -1398,6 +1398,22 @@ def send_input(
                     message,
                 )
 
+        # Provider wire encoding happens only after the exact logical task
+        # bytes above are bound.  Assigned Claude Code uses one-line SDK JSONL
+        # so multiline/Unicode task content reaches stream-json without tmux
+        # treating embedded newlines as separate submissions.
+        terminal_input = message
+        force_bracketed_paste = True
+        if provider:
+            encoded_input = provider.encode_terminal_input(message, orchestration_value)
+            # Defensive compatibility for third-party/test provider doubles
+            # that predate the optional structured-input hook.
+            if isinstance(encoded_input, str):
+                terminal_input = encoded_input
+            provider_bracketed_paste = provider.force_bracketed_paste
+            if isinstance(provider_bracketed_paste, bool):
+                force_bracketed_paste = provider_bracketed_paste
+
         # Check how many Enter keys the provider needs after paste
         enter_count = provider.paste_enter_count if provider else 1
 
@@ -1437,9 +1453,9 @@ def send_input(
         get_backend().send_keys(
             metadata["tmux_session"],
             metadata["tmux_window"],
-            message,
+            terminal_input,
             enter_count=enter_count,
-            force_bracketed_paste=True,
+            force_bracketed_paste=force_bracketed_paste,
             submit_delay=provider.paste_submit_delay if provider else 0.3,
         )
 

@@ -38,9 +38,61 @@ curl -X POST "http://localhost:9889/sessions?provider=claude_code&agent_profile=
 
 ## Features
 
+### Authoritative assigned-worker completion
+
+An `assign`-created Claude worker uses Claude Code's supported structured SDK
+transport instead of the interactive TUI:
+
+```text
+claude --print --input-format stream-json --output-format stream-json --verbose \
+  --session-id <CAO-bound-UUID>
+```
+
+CAO launches that command with real stdin/stdout pipes, performs the Agent SDK
+`control_request: initialize` handshake, then sends each logical CAO message as
+one SDK `user` JSONL record. The assignment record carries a deterministic UUID
+derived from the immutable terminal ID, completion ID, and SHA-256 of the exact
+post-injection task bytes. Claude echoes that UUID in `user_message_uuid` (and,
+when present, `user_message_uuids`) on its terminal `ResultMessage`.
+
+The adapter was audited and exercised against installed Claude Code 2.1.259. It
+retains only fields exposed by that interface:
+
+- `session_id`, result `uuid`, `user_message_uuid`, and optional
+  `user_message_uuids` correlation identities;
+- `subtype`, `is_error`, and `terminal_reason` outcome evidence; and
+- the exact `result` string and SHA-256 of its strict UTF-8 bytes.
+
+A successful callback requires `subtype=success`, `is_error=false`,
+`terminal_reason=completed`, a non-empty exact result, the expected deterministic
+session, and exactly one matching assigned-input identity. Error subtypes are
+retained as failures; `aborted_streaming` and `aborted_tools` are retained as
+cancellations; other non-success terminal boundaries are retained as
+terminations. None can create a success callback.
+
+The launch adapter atomically stores the report before publishing a small
+response-free completion edge to status monitoring. That edge is only a wakeup:
+the assigned-worker completion service independently reloads and validates the
+retained provider report. The initialize control response is consumed rather
+than written to terminal logs because it can contain account and capability
+metadata.
+
+There is deliberately no callback fallback to capture-pane, scrollback, TUI
+message extraction, assignment text, prompt echo, transcript content, or a
+last-line heuristic. Unknown or malformed structured fields fail closed. A
+later Claude version whose ResultMessage contract changes must be audited before
+the adapter's closed validation is broadened.
+
+Ordinary operator-launched Claude terminals remain on the interactive TUI path.
+Explicit `send_message` is also unchanged. If an equivalent explicit final wins
+the existing completion-id transaction before the automatic report is handled,
+CAO preserves intermediate explicit messages and suppresses duplicate final
+callback semantics.
+
 ### Status Detection
 
-The Claude Code provider detects terminal states by analyzing output patterns:
+For ordinary interactive terminals, the Claude Code provider detects terminal
+states by analyzing output patterns:
 
 - **IDLE**: Terminal shows `>` or `❯` prompt, ready for input
 - **PROCESSING**: Spinner characters visible (`✶`, `✢`, `✽`, `✻`, `·`, `✳`) with ellipsis and status text
@@ -52,7 +104,9 @@ Status detection checks patterns in priority order: PROCESSING → WAITING_USER_
 
 ### Message Extraction
 
-The provider extracts the last assistant response by finding the `⏺` response marker:
+For ordinary interactive uses, the provider can extract the last assistant
+response by finding the `⏺` response marker. This parser is never used to create
+an assigned-worker completion callback:
 
 1. Find all `⏺` markers in the output
 2. Take the last one (final response)
@@ -79,7 +133,7 @@ When launched with an agent profile (e.g., `--agents code_supervisor`), CAO:
 
 1. Loads the profile from the agent store
 2. Extracts the system prompt from the Markdown content
-3. Passes it via `--append-system-prompt` (newlines escaped to `\n` for tmux compatibility)
+3. Passes it via a private `--append-system-prompt-file`
 4. Injects MCP servers via `--mcp-config` JSON if the profile defines `mcpServers`
 
 ### Launch Command
@@ -154,6 +208,23 @@ native_agent: my-native-agent
 ## End-to-End Testing
 
 The E2E test suite validates handoff, assign, and send_message flows for Claude Code.
+
+The completion adapter also has an opt-in process-level test that launches the
+real configured Claude profiles while relocating every CAO-owned file and the
+SQLite database to a temporary directory:
+
+```bash
+CAO_RUN_ACTUAL_CLAUDE_E2E=1 \
+CAO_ACTUAL_CLAUDE_HOME=/path/to/provider-home \
+CAO_ACTUAL_AGENT_STORE=/path/to/cao/agent-store \
+uv run pytest -o addopts='' -m e2e \
+  test/services/test_claude_code_completion_callback_actual_e2e.py -vv
+```
+
+The test uses the exact four-line synthetic assignment embedded in the test,
+asserts zero explicit worker messages, one report/callback/inbox row per worker,
+exact response bytes and hash, and retained-report equality after an isolated
+server restart. It must never be pointed at a production CAO home.
 
 ### Running Claude Code E2E Tests
 

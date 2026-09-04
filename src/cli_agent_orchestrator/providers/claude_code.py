@@ -8,13 +8,16 @@ import os
 import re
 import shlex
 import stat
+import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Optional
 
 if TYPE_CHECKING:
     from cli_agent_orchestrator.models.agent_profile import AgentProfile
+    from cli_agent_orchestrator.models.provider_completion import ProviderCompletionReport
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
@@ -253,6 +256,7 @@ class ClaudeCodeProvider(BaseProvider):
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
         model: Optional[str] = None,
+        completion_id: Optional[str] = None,
     ):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
@@ -262,6 +266,12 @@ class ClaudeCodeProvider(BaseProvider):
         # --model resolution below) -- e.g. a handoff/assign caller pinning a
         # specific model for one worker without needing a dedicated profile.
         self._model = model
+        # Only assigned workers receive this identity.  They use Claude's
+        # supported stream-json/ResultMessage path; ordinary operator-launched
+        # terminals retain the existing interactive TUI unchanged.
+        self._completion_id = completion_id
+        self._completion_input_id: Optional[str] = None
+        self.supports_screen_detection = completion_id is None
         # Native-status dispatch tracking (_task_dispatched + flush-wait timers)
         # lives on BaseProvider and is consumed by _resolve_native_status().
         self._input_generation: int = 0
@@ -465,6 +475,36 @@ class ClaudeCodeProvider(BaseProvider):
             disallowed = get_disallowed_tools("claude_code", self._allowed_tools)
             for tool in disallowed:
                 command_parts.extend(["--disallowedTools", tool])
+
+        if self._completion_id is not None:
+            from cli_agent_orchestrator.services.provider_completion_report import (
+                claude_session_id,
+            )
+
+            session_id = claude_session_id(self.terminal_id, self._completion_id)
+            command_parts.extend(
+                [
+                    "--print",
+                    "--input-format",
+                    "stream-json",
+                    "--output-format",
+                    "stream-json",
+                    "--verbose",
+                    "--session-id",
+                    session_id,
+                ]
+            )
+            command_parts = [
+                sys.executable,
+                "-m",
+                "cli_agent_orchestrator.services.claude_completion_launcher",
+                "--terminal-id",
+                self.terminal_id,
+                "--completion-id",
+                self._completion_id,
+                "--",
+                *command_parts,
+            ]
 
         # Use shlex.join() for proper shell escaping of all arguments
         # This correctly handles multiline strings, quotes, and special characters
@@ -690,7 +730,8 @@ class ClaudeCodeProvider(BaseProvider):
         # Not exhaustive: wait_for_shell's own backend polling, _load_profile(),
         # and _build_claude_command's temp-file I/O above/below are still
         # loop-side -- tens of ms each, not the multi-second pileup #451 fixes.
-        await asyncio.to_thread(self._ensure_skip_bypass_prompt_setting)
+        if self._completion_id is None:
+            await asyncio.to_thread(self._ensure_skip_bypass_prompt_setting)
 
         # Build properly escaped command string
         command = self._build_claude_command(profile)
@@ -705,6 +746,23 @@ class ClaudeCodeProvider(BaseProvider):
         await asyncio.to_thread(
             get_backend().send_keys, self.session_name, self.window_name, command
         )
+
+        if self._completion_id is not None:
+            # Headless SDK mode skips both interactive startup dialogs.  Its
+            # successful initialize control response is the positive
+            # input-ready signal; waiting for TUI chrome here would time out by
+            # construction.
+            if not await wait_until_status(
+                self.terminal_id,
+                {TerminalStatus.IDLE},
+                timeout=init_timeout,
+                polling_interval=1.0,
+            ):
+                raise TimeoutError(
+                    f"Claude Code structured initialization timed out after {init_timeout}s"
+                )
+            self._initialized = True
+            return True
 
         # Handle startup prompts (bypass permissions + workspace trust).
         # Pass the resolved timeout as the outer cap so a containerized profile's
@@ -772,6 +830,9 @@ class ClaudeCodeProvider(BaseProvider):
         Uses capture-pane (rendered screen) rather than the pipe-pane buffer:
         stability of the RENDERED output is the actual readiness signal.
         """
+        if self._completion_id is not None:
+            return True
+
         poll = 0.5
         deadline = time.monotonic() + timeout
         previous: Optional[str] = None
@@ -798,6 +859,71 @@ class ClaudeCodeProvider(BaseProvider):
             self.terminal_id,
         )
         return False
+
+    def _get_structured_status(self, output: str) -> TerminalStatus:
+        """Derive status only from assigned-worker JSONL event envelopes.
+
+        Result text is never extracted here.  The launcher persists the same
+        correlated ResultMessage before forwarding its line; this parser merely
+        publishes the lifecycle edge that asks the completion service to load
+        that retained report.
+        """
+        from cli_agent_orchestrator.services.claude_completion_launcher import (
+            ADAPTER_COMPLETION_MARKER,
+            ADAPTER_ERROR_MARKER,
+            ADAPTER_READY_MARKER,
+        )
+        from cli_agent_orchestrator.services.provider_completion_report import (
+            claude_session_id,
+        )
+
+        if self._completion_id is None:
+            return TerminalStatus.UNKNOWN
+        expected_session_id = claude_session_id(self.terminal_id, self._completion_id)
+        status = TerminalStatus.UNKNOWN
+        saw_structured_activity = False
+
+        for raw_line in output.splitlines():
+            line = raw_line.strip()
+            if line == ADAPTER_ERROR_MARKER:
+                return TerminalStatus.ERROR
+            if line == ADAPTER_COMPLETION_MARKER:
+                return TerminalStatus.COMPLETED
+            if line == ADAPTER_READY_MARKER:
+                status = TerminalStatus.IDLE
+                continue
+            if not line.startswith("{"):
+                continue
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(message, dict):
+                continue
+
+            session_id = message.get("session_id")
+            if session_id != expected_session_id:
+                continue
+            message_type = message.get("type")
+            if message_type == "system" and message.get("subtype") == "init":
+                status = TerminalStatus.IDLE
+                continue
+
+            saw_structured_activity = True
+            if message_type != "result" or self._completion_input_id is None:
+                continue
+            if message.get("user_message_uuid") != self._completion_input_id:
+                # A background/injected/explicit later turn in the same stream
+                # cannot satisfy the immutable assigned input identity.
+                continue
+            user_message_uuids = message.get("user_message_uuids")
+            if user_message_uuids is not None and user_message_uuids != [self._completion_input_id]:
+                return TerminalStatus.ERROR
+            return TerminalStatus.COMPLETED
+
+        if self._task_dispatched and (saw_structured_activity or status == TerminalStatus.IDLE):
+            return TerminalStatus.PROCESSING
+        return status
 
     def get_status(self, output: str) -> TerminalStatus:
         """Get Claude Code status.
@@ -826,6 +952,12 @@ class ClaudeCodeProvider(BaseProvider):
         native = self._resolve_native_status(output)
         if native is not None:
             return native
+
+        if self._completion_id is not None:
+            output = self._resolve_buffer(output)
+            if not output:
+                return TerminalStatus.UNKNOWN
+            return self._get_structured_status(output)
 
         # herdr never pushes a buffer (pipe_pane is a no-op there); read live
         # pane content instead of falling through to "no output" on every call.
@@ -1167,13 +1299,60 @@ class ClaudeCodeProvider(BaseProvider):
         return TerminalStatus.UNKNOWN
 
     @property
+    def paste_enter_count(self) -> int:
+        # The SDK protocol consumes one JSON object per line. A second Enter
+        # would submit a blank, malformed record after every CAO message.
+        return 1 if self._completion_id is not None else 2
+
+    @property
     def paste_submit_delay(self) -> float:
+        if self._completion_id is not None:
+            # SDK JSONL is line-delimited and has no Ink paste-settle phase.
+            return 0.0
         # The newest Claude Code Ink TUI needs noticeably longer than the 0.3s
         # default to settle a bracketed paste before an Enter counts as "submit"
         # rather than a literal newline; a too-early Enter is swallowed and the
         # message sits unsubmitted in the prompt box (observed on Claude Code with
         # the "/effort" + shift+tab bypass UI). 2.0s is conservative.
         return 2.0
+
+    @property
+    def force_bracketed_paste(self) -> bool:
+        # The assigned stream consumes one-line JSONL, not a terminal editor.
+        # Bracket markers would make the JSON record malformed.
+        return self._completion_id is None
+
+    def encode_terminal_input(self, message: str, orchestration_type: str = "") -> str:
+        """Encode assigned-worker input as a correlated Claude SDK user message."""
+        if self._completion_id is None:
+            return message
+
+        from cli_agent_orchestrator.services.provider_completion_report import (
+            claude_input_id,
+            claude_session_id,
+        )
+
+        session_id = claude_session_id(self.terminal_id, self._completion_id)
+        dispatch_digest = hashlib.sha256(message.encode("utf-8", errors="strict")).hexdigest()
+        if orchestration_type == "assign":
+            input_id = claude_input_id(self.terminal_id, self._completion_id, dispatch_digest)
+            self._completion_input_id = input_id
+        else:
+            # Explicit/inbox turns stay supported but can never claim the one
+            # immutable assignment input identity.
+            input_id = str(uuid.uuid4())
+
+        return json.dumps(
+            {
+                "type": "user",
+                "message": {"role": "user", "content": message},
+                "parent_tool_use_id": None,
+                "session_id": session_id,
+                "uuid": input_id,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
 
     @property
     def accepts_input_while_processing(self) -> bool:
@@ -1212,6 +1391,10 @@ class ClaudeCodeProvider(BaseProvider):
         Uses tail-hash instead of raw length because the tmux sliding window
         is not monotonically growing.
         """
+        if self._completion_id is not None:
+            self._input_generation += 1
+            super().mark_input_received()
+            return
         output = get_backend().get_history(self.session_name, self.window_name) or ""
         self._snapshot_tail_hash = self._tail_hash(output, self._TAIL_HASH_LINES)
         self._snapshot_last_response = self._extract_last_response_text(output)
@@ -1288,8 +1471,18 @@ class ClaudeCodeProvider(BaseProvider):
         final_answer = re.sub(ANSI_CODE_PATTERN, "", final_answer)
         return final_answer.strip()
 
+    def get_completion_report(self, completion_id: str) -> "ProviderCompletionReport":
+        """Load Claude's retained, correlated structured ResultMessage report."""
+        from cli_agent_orchestrator.services.provider_completion_report import (
+            load_completion_report,
+        )
+
+        return load_completion_report("claude_code", self.terminal_id, completion_id)
+
     def exit_cli(self) -> str:
         """Get the command to exit Claude Code."""
+        if self._completion_id is not None:
+            return "C-d"
         return "/exit"
 
     def cleanup(self) -> None:

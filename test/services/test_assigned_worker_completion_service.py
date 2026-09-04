@@ -20,7 +20,11 @@ from cli_agent_orchestrator.models.assigned_worker import (
     CompletionReceiverState,
 )
 from cli_agent_orchestrator.models.inbox import InboxMessageOrigin, MessageStatus, OrchestrationType
-from cli_agent_orchestrator.models.provider_completion import ProviderCompletionUnavailableError
+from cli_agent_orchestrator.models.provider_completion import (
+    ProviderCompletionReport,
+    ProviderCompletionUnavailableError,
+    utf8_sha256,
+)
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.mock_cli import MockCliProvider
 from cli_agent_orchestrator.services import assigned_worker_completion_service as completion_mod
@@ -375,6 +379,58 @@ def test_malformed_retained_report_enters_manual_recovery(callback_db, ids, monk
     assert record.delivery_state == CompletionDeliveryState.MANUAL_RECOVERY
     assert record.final_result is None
     assert "malformed" in (record.last_error or "")
+
+
+@pytest.mark.parametrize(
+    ("completion_state", "terminal_reason", "expected_lifecycle"),
+    (
+        ("failure", "model_error", AssignmentLifecycle.FAILED),
+        ("cancelled", "aborted_streaming", AssignmentLifecycle.CANCELLED),
+        ("terminated", "max_turns", AssignmentLifecycle.FAILED),
+    ),
+)
+def test_authoritative_non_success_outcome_never_emits_callback(
+    callback_db,
+    ids,
+    monkeypatch,
+    completion_state,
+    terminal_reason,
+    expected_lifecycle,
+):
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    assignment = _assignment(worker, caller)
+    provider = MagicMock()
+    provider.get_completion_report.return_value = ProviderCompletionReport(
+        provider="mock_cli",
+        terminal_id=worker,
+        completion_id=assignment.completion_id,
+        provider_session_id=f"session-{worker}",
+        provider_turn_id="turn-outcome",
+        input_messages_sha256="a" * 64,
+        dispatched_input_sha256="b" * 64,
+        final_response="partial provider output",
+        final_response_sha256=utf8_sha256("partial provider output"),
+        source_reference="provider-completion:mock_cli:session:turn",
+        completion_state=completion_state,
+        provider_result_subtype=(
+            "error_during_execution" if completion_state == "failure" else "success"
+        ),
+        provider_terminal_reason=terminal_reason,
+        provider_is_error=completion_state == "failure",
+    )
+    monkeypatch.setitem(completion_mod.provider_manager._providers, worker, provider)
+    service = AssignedWorkerCompletionService()
+
+    service.handle_status_event(worker, TerminalStatus.COMPLETED)
+
+    record = db.get_assigned_worker_callback(worker)
+    assert record is not None
+    assert record.lifecycle == expected_lifecycle
+    assert record.delivery_state == CompletionDeliveryState.TERMINAL_ERROR
+    assert record.final_result is None
+    assert completion_state in (record.last_error or "")
+    assert _messages(caller) == []
 
 
 def test_restart_reconciliation_recovers_retained_provider_report_without_pane_status(
