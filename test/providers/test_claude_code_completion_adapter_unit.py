@@ -16,6 +16,8 @@ from cli_agent_orchestrator.services.claude_completion_launcher import (
     ADAPTER_COMPLETION_MARKER,
     ADAPTER_ERROR_MARKER,
     ADAPTER_READY_MARKER,
+    ADAPTER_TURN_COMPLETION_MARKER,
+    ADAPTER_TURN_ERROR_MARKER,
 )
 from cli_agent_orchestrator.services.provider_completion_report import claude_session_id
 
@@ -188,6 +190,8 @@ def test_ambiguous_or_adapter_rejected_result_is_error() -> None:
         assert provider.get_status(ambiguous) == TerminalStatus.ERROR
         assert provider.get_status(ADAPTER_ERROR_MARKER) == TerminalStatus.ERROR
         assert provider.get_status(ADAPTER_COMPLETION_MARKER) == TerminalStatus.COMPLETED
+        assert provider.get_status(ADAPTER_TURN_ERROR_MARKER) == TerminalStatus.ERROR
+        assert provider.get_status(ADAPTER_TURN_COMPLETION_MARKER) == TerminalStatus.COMPLETED
 
 
 def test_successful_control_handshake_is_structured_idle() -> None:

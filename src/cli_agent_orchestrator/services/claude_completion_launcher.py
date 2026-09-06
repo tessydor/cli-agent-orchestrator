@@ -31,6 +31,7 @@ from typing import BinaryIO, cast
 from cli_agent_orchestrator.models.provider_completion import ProviderCompletionError
 from cli_agent_orchestrator.services.provider_completion_report import (
     MAX_REPORT_BYTES,
+    claude_session_id,
     ingest_claude_completion,
 )
 
@@ -44,6 +45,17 @@ ADAPTER_ERROR_MARKER = "CAO_CLAUDE_COMPLETION_ADAPTER_ERROR_V1"
 # small lifecycle edge remains visible even when the provider's JSON result line
 # is larger than StatusMonitor's rolling buffer. It never carries response text.
 ADAPTER_COMPLETION_MARKER = "CAO_CLAUDE_COMPLETION_RETAINED_V1"
+# Emitted after any later, non-assignment turn in the same structured Claude
+# session reaches a successful ResultMessage.  Follow-up inbox messages use a
+# fresh input UUID and therefore must not overwrite or impersonate the one
+# immutable assigned-worker completion report, but their terminal lifecycle
+# still needs a compact boundary so StatusMonitor can leave PROCESSING and
+# deliver the next queued message.
+ADAPTER_TURN_COMPLETION_MARKER = "CAO_CLAUDE_TURN_COMPLETED_V1"
+# A later turn can also terminate unsuccessfully.  Keep that distinct from a
+# malformed authoritative assignment report while still surfacing ERROR to the
+# status pipeline.
+ADAPTER_TURN_ERROR_MARKER = "CAO_CLAUDE_TURN_ERROR_V1"
 # Claude's stream-json process does not publish ``system/init`` until it has
 # input. The Agent SDK solves that bootstrap with its documented initialize
 # control request. This marker is emitted only after the matching successful
@@ -100,6 +112,31 @@ def _capture_result_line(terminal_id: str, completion_id: str, raw_line: bytes) 
     if isinstance(message, dict) and message.get("type") == "result":
         return ingest_claude_completion(terminal_id, completion_id, message) is not None
     return False
+
+
+def _result_boundary_for_session(raw_line: bytes, expected_session_id: str) -> str | None:
+    """Classify a ResultMessage belonging to this persistent Claude stream.
+
+    This boundary is lifecycle-only.  It deliberately does not retain response
+    text and cannot satisfy the immutable assignment callback; that stronger
+    correlation remains exclusively in ``_capture_result_line``.
+    """
+    if len(raw_line) > MAX_REPORT_BYTES:
+        raise ValueError("Claude structured output line exceeds completion size limit")
+    decoded = raw_line.decode("utf-8", errors="strict")
+    try:
+        message = json.loads(decoded)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(message, dict) or message.get("type") != "result":
+        return None
+    if message.get("session_id") != expected_session_id:
+        return None
+    if message.get("is_error") is True:
+        return "error"
+    if message.get("subtype") not in (None, "success"):
+        return "error"
+    return "success"
 
 
 def _is_successful_initialize_response(raw_line: bytes, request_id: str) -> bool:
@@ -223,6 +260,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise OSError("Claude stdout pipe was not created")
 
         initialize_request_id = f"cao-init-{args.completion_id}"
+        expected_session_id = claude_session_id(args.terminal_id, args.completion_id)
         # Match ClaudeAgentSDKClient's supported bootstrap ordering: initialize
         # first, then allow user records onto the same pipe.
         _write_initialize_request(child, initialize_request_id)
@@ -238,6 +276,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 correlated_result = _capture_result_line(
                     args.terminal_id, args.completion_id, raw_line
                 )
+                result_boundary = _result_boundary_for_session(raw_line, expected_session_id)
                 saw_correlated_result = correlated_result or saw_correlated_result
             except (ProviderCompletionError, UnicodeError, OSError, ValueError):
                 # Never echo the rejected ResultMessage: status processing must
@@ -260,6 +299,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 # adapter-owned edge after the potentially multi-megabyte JSON
                 # record makes completion detection independent of buffer size.
                 _write_stdout((ADAPTER_COMPLETION_MARKER + "\n").encode("ascii"))
+            elif result_boundary == "success":
+                _write_stdout((ADAPTER_TURN_COMPLETION_MARKER + "\n").encode("ascii"))
+            elif result_boundary == "error":
+                _write_stdout((ADAPTER_TURN_ERROR_MARKER + "\n").encode("ascii"))
 
         return_code = child.wait()
         if saw_correlated_result:
