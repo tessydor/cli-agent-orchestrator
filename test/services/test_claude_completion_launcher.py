@@ -73,6 +73,25 @@ def test_unrelated_result_is_forwardable_but_not_correlated() -> None:
         assert launcher._capture_result_line(TERMINAL_ID, COMPLETION_ID, raw) is False
 
 
+def test_later_result_is_a_session_lifecycle_boundary_without_claiming_callback() -> None:
+    session_id = launcher.claude_session_id(TERMINAL_ID, COMPLETION_ID)
+    success = json.dumps(
+        {
+            "type": "result",
+            "session_id": session_id,
+            "user_message_uuid": "99999999-8888-4777-8666-555555555555",
+            "subtype": "success",
+            "is_error": False,
+        }
+    ).encode()
+    failure = success.replace(b'"success"', b'"error"')
+    wrong_session = success.replace(session_id.encode(), b"0" * len(session_id))
+
+    assert launcher._result_boundary_for_session(success, session_id) == "success"
+    assert launcher._result_boundary_for_session(failure, session_id) == "error"
+    assert launcher._result_boundary_for_session(wrong_session, session_id) is None
+
+
 def test_initialize_control_response_requires_exact_request_and_success() -> None:
     request_id = f"cao-init-{COMPLETION_ID}"
     matching = json.dumps(
@@ -135,6 +154,7 @@ def test_main_persists_correlated_result_before_forwarding(monkeypatch: pytest.M
     with (
         patch.object(launcher.subprocess, "Popen", return_value=child) as popen,
         patch.object(launcher, "_capture_result_line", side_effect=capture),
+        patch.object(launcher, "_result_boundary_for_session", return_value=None),
         patch.object(launcher, "_is_successful_initialize_response", return_value=False),
         patch.object(launcher, "_start_stdin_forwarder"),
         patch.object(launcher, "_write_stdout", side_effect=forward),
@@ -171,6 +191,7 @@ def test_main_consumes_initialize_metadata_and_emits_only_ready_marker() -> None
         patch.object(launcher.subprocess, "Popen", return_value=child),
         patch.object(launcher, "_is_successful_initialize_response", return_value=True),
         patch.object(launcher, "_capture_result_line", return_value=False),
+        patch.object(launcher, "_result_boundary_for_session", return_value=None),
         patch.object(launcher, "_start_stdin_forwarder"),
         patch.object(launcher, "_write_stdout", side_effect=forwarded.append),
         patch.object(launcher.signal, "getsignal", return_value=object()),
@@ -217,6 +238,7 @@ def test_eof_without_correlated_result_emits_error_boundary(return_code: int) ->
     with (
         patch.object(launcher.subprocess, "Popen", return_value=child),
         patch.object(launcher, "_capture_result_line", return_value=False),
+        patch.object(launcher, "_result_boundary_for_session", return_value=None),
         patch.object(launcher, "_is_successful_initialize_response", return_value=False),
         patch.object(launcher, "_start_stdin_forwarder"),
         patch.object(launcher, "_write_stdout", side_effect=forwarded.append),
@@ -227,6 +249,36 @@ def test_eof_without_correlated_result_emits_error_boundary(return_code: int) ->
 
     assert forwarded[-1] == (launcher.ADAPTER_ERROR_MARKER + "\n").encode("ascii")
     assert len(forwarded) == 2
+
+
+def test_main_emits_compact_completion_boundary_for_later_turn() -> None:
+    initial_line = b'{"type":"result","session_id":"ignored","subtype":"success"}\n'
+    later_line = b'{"type":"result","session_id":"ignored","subtype":"success"}\n'
+    child = _Child([initial_line, later_line])
+    forwarded: list[bytes] = []
+
+    with (
+        patch.object(launcher.subprocess, "Popen", return_value=child),
+        patch.object(launcher, "_is_successful_initialize_response", return_value=False),
+        patch.object(launcher, "_capture_result_line", side_effect=[True, False]),
+        patch.object(
+            launcher,
+            "_result_boundary_for_session",
+            side_effect=["success", "success"],
+        ),
+        patch.object(launcher, "_start_stdin_forwarder"),
+        patch.object(launcher, "_write_stdout", side_effect=forwarded.append),
+        patch.object(launcher.signal, "getsignal", return_value=object()),
+        patch.object(launcher.signal, "signal"),
+    ):
+        assert launcher.main(ARGV) == 0
+
+    assert forwarded == [
+        initial_line,
+        (launcher.ADAPTER_COMPLETION_MARKER + "\n").encode("ascii"),
+        later_line,
+        (launcher.ADAPTER_TURN_COMPLETION_MARKER + "\n").encode("ascii"),
+    ]
 
 
 def test_stop_child_escalates_only_after_bounded_terminate_timeout() -> None:

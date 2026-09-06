@@ -872,6 +872,8 @@ class ClaudeCodeProvider(BaseProvider):
             ADAPTER_COMPLETION_MARKER,
             ADAPTER_ERROR_MARKER,
             ADAPTER_READY_MARKER,
+            ADAPTER_TURN_COMPLETION_MARKER,
+            ADAPTER_TURN_ERROR_MARKER,
         )
         from cli_agent_orchestrator.services.provider_completion_report import (
             claude_session_id,
@@ -885,9 +887,9 @@ class ClaudeCodeProvider(BaseProvider):
 
         for raw_line in output.splitlines():
             line = raw_line.strip()
-            if line == ADAPTER_ERROR_MARKER:
+            if line in (ADAPTER_ERROR_MARKER, ADAPTER_TURN_ERROR_MARKER):
                 return TerminalStatus.ERROR
-            if line == ADAPTER_COMPLETION_MARKER:
+            if line in (ADAPTER_COMPLETION_MARKER, ADAPTER_TURN_COMPLETION_MARKER):
                 return TerminalStatus.COMPLETED
             if line == ADAPTER_READY_MARKER:
                 status = TerminalStatus.IDLE
