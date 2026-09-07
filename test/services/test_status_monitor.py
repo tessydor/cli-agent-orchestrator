@@ -475,3 +475,42 @@ class TestProcessChunkBufferTruncation:
         sm_large._detect_status = lambda tid, buf: TerminalStatus.UNKNOWN
         sm_large._process_chunk("t1", payload)
         assert "MARKER" in sm_large.get_buffer("t1")
+
+
+class TestColdTmuxStatus:
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_quiet_retained_pane_is_detected_without_input(self, backend_get, manager):
+        backend = _backend(False)
+        backend_get.return_value = backend
+        backend.get_history.return_value = "retained terminal screen"
+        provider = manager.get_provider.return_value
+        provider.session_name = "session"
+        provider.window_name = "worker"
+        provider.get_status.return_value = TerminalStatus.ERROR
+        monitor = StatusMonitor()
+        assert monitor.get_status("worker") == TerminalStatus.ERROR
+        backend.get_history.assert_called_once_with("session", "worker", full_history=True)
+        provider.get_status.assert_called_once_with("retained terminal screen")
+        provider.send_input.assert_not_called()
+        assert "worker" not in monitor._last_status
+
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_live_status_rechecked_until_output_pipeline_starts(self, backend_get, manager):
+        backend_get.return_value = _backend(False)
+        manager.get_provider.return_value.get_status.side_effect = [
+            TerminalStatus.PROCESSING,
+            TerminalStatus.IDLE,
+        ]
+        monitor = StatusMonitor()
+        assert monitor.get_status("brain") == TerminalStatus.PROCESSING
+        assert monitor.get_status("brain") == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_missing_pane_stays_unknown(self, backend_get, manager):
+        backend = _backend(False)
+        backend.get_history.side_effect = RuntimeError("pane missing")
+        backend_get.return_value = backend
+        assert StatusMonitor().get_status("gone") == TerminalStatus.UNKNOWN

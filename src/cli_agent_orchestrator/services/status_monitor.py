@@ -606,6 +606,21 @@ class StatusMonitor:
             else:
                 buffer = ""
 
+        if cached == TerminalStatus.UNKNOWN:
+            # An idle retained pane produces no output after API restart.
+            # Derive a live status without sending input or trusting old cache.
+            # Leave it uncached: normal output owns the event-driven lifecycle.
+            try:
+                provider = provider_manager.get_provider(terminal_id)
+                if provider is not None:
+                    history = get_backend().get_history(
+                        provider.session_name, provider.window_name, full_history=True
+                    )
+                    return provider.get_status(history)
+            except Exception:
+                logger.debug("Restart status unavailable for %s", terminal_id, exc_info=True)
+            return TerminalStatus.UNKNOWN
+
         if cached == TerminalStatus.PROCESSING and buffer:
             fresh = self._detect_status(terminal_id, buffer)
             logger.debug(

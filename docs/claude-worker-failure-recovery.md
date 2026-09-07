@@ -21,3 +21,7 @@ Rollback restores the exact backed-up Python modules and restarts the API with t
 ## Limits
 
 The observed user JSON echoed in the terminal log was valid. The exact cause of Claude Code's native SyntaxError has not been established; this correction must not be presented as a proven fix inside the Claude binary. It fixes the subsequent silent-wait and Python-shutdown failures. Arbitrary SIGKILL of the launcher or total host failure cannot emit its marker; retained evidence and service reconciliation remain necessary. A new error notification is operational evidence, not permission to resume financial acquisition.
+
+
+## Cold status recovery
+Live deployment exposed an additional restart seam: the status cache is empty while an idle retained pane produces no output. On UNKNOWN only, StatusMonitor now derives a live provider status from retained pane history. It does not send input or cache a ready state; normal output remains responsible for event-driven updates. Inbox reconciliation can therefore deliver pending failure notices without a manual wake-up. Missing panes remain UNKNOWN.
