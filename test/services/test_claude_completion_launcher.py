@@ -290,3 +290,83 @@ def test_stop_child_escalates_only_after_bounded_terminate_timeout() -> None:
     assert child.terminated is True
     assert child.killed is True
     assert child.wait.call_count == 2
+
+
+def test_nonzero_exit_after_success_is_a_followup_error() -> None:
+    child = _Child([b'{"type":"result"}\n'], return_code=2)
+    forwarded = []
+    with (
+        patch.object(launcher.subprocess, "Popen", return_value=child),
+        patch.object(launcher, "_is_successful_initialize_response", return_value=False),
+        patch.object(launcher, "_capture_result_line", return_value=True),
+        patch.object(launcher, "_result_boundary_for_session", return_value="success"),
+        patch.object(launcher, "_start_stdin_forwarder"),
+        patch.object(launcher, "_write_stdout", side_effect=forwarded.append),
+    ):
+        assert launcher.main(ARGV) == 2
+    assert forwarded[-2:] == [
+        (launcher.ADAPTER_COMPLETION_MARKER + "\n").encode(),
+        (launcher.ADAPTER_TURN_ERROR_MARKER + "\n").encode(),
+    ]
+
+
+def test_stdin_pipe_relay_can_stop_without_eof() -> None:
+    import os
+    import time
+
+    source_r, source_w = os.pipe()
+    sink_r, sink_w = os.pipe()
+    source = os.fdopen(source_r, "rb")
+    sink = os.fdopen(sink_w, "wb")
+    child = MagicMock(stdin=sink)
+    try:
+        thread = launcher._start_stdin_forwarder(child, source)
+        raw = b'{"type":"user","message":"still waiting"}\n'
+        os.write(source_w, raw)
+        assert os.read(sink_r, len(raw)) == raw
+        started = time.monotonic()
+        thread.stop()
+        assert not thread.is_alive()
+        assert not thread.daemon
+        assert time.monotonic() - started < 1.5
+    finally:
+        source.close()
+        sink.close()
+        os.close(source_w)
+        os.close(sink_r)
+
+
+def test_real_launcher_process_exits_after_child_crash_with_stdin_open(tmp_path):
+    import os
+    import sys
+
+    fake = tmp_path / "claude"
+    fake.write_text(
+        "#!"
+        + sys.executable
+        + '\nimport sys\nprint(\'{"type":"result"}\', flush=True)\nsys.exit(2)\n'
+    )
+    fake.chmod(0o700)
+    script = (
+        "from cli_agent_orchestrator.services import claude_completion_launcher as m; "
+        "m.ingest_claude_completion=lambda *args: object(); "
+        "raise SystemExit(m.main(" + repr(ARGV[:-2] + [str(fake)]) + "))"
+    )
+    env = dict(os.environ, CAO_HOME_DIR=str(tmp_path / "isolated-cao"))
+    process = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    try:
+        # Intentionally keep stdin open: old buffered daemon reader aborts at shutdown.
+        assert process.wait(timeout=8) == 2
+        stdout, stderr = process.communicate(timeout=2)
+        assert (launcher.ADAPTER_TURN_ERROR_MARKER + "\n").encode() in stdout
+        assert b"Fatal Python error" not in stderr
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=2)

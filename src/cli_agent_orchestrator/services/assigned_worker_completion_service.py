@@ -25,6 +25,7 @@ from cli_agent_orchestrator.clients.database import (
     get_terminal_metadata,
     list_protected_assigned_worker_callbacks,
     list_reconcilable_assigned_worker_callbacks,
+    list_retained_assigned_worker_callbacks,
     mark_assigned_worker_dispatched,
     mark_assignment_manual_recovery,
     mark_completion_retryable,
@@ -83,6 +84,7 @@ class AssignedWorkerCompletionService:
         self._worker_locks: dict[str, threading.RLock] = {}
         self._worker_locks_guard = threading.Lock()
         self._known_workers: set[str] = set()
+        self._failure_notice_pending: set[str] = set()
         self._capture_barriers: dict[str, threading.Event] = {}
         self._retry_initial_delay = retry_initial_delay
         self._retry_max_delay = retry_max_delay
@@ -296,9 +298,9 @@ class AssignedWorkerCompletionService:
                     self._schedule_retry_on_loop(worker_terminal_id, loop)
                     continue
 
-                if (
-                    record is not None
-                    and record.delivery_state == CompletionDeliveryState.RETRYABLE
+                if record is not None and (
+                    record.delivery_state == CompletionDeliveryState.RETRYABLE
+                    or worker_terminal_id in self._failure_notice_pending
                 ):
                     # Failure paths normally request this themselves. This check
                     # closes any exception/order seam without creating a duplicate
@@ -393,6 +395,10 @@ class AssignedWorkerCompletionService:
 
     def _handle_status_locked(self, record: AssignedWorkerCallback, status: TerminalStatus) -> None:
         if status == TerminalStatus.ERROR:
+            # Commit a separate SYSTEM notice before transitioning the original
+            # assignment. A follow-up failure never rewrites its successful report.
+            if not self._notify_worker_failure(record):
+                return
             if record.lifecycle != AssignmentLifecycle.COMPLETED:
                 mark_completion_terminal_error(
                     record.assignment_id,
@@ -719,11 +725,51 @@ class AssignedWorkerCompletionService:
                 exc_info=True,
             )
 
+    def _notify_worker_failure(self, record: AssignedWorkerCallback) -> bool:
+        """Durable, idempotent failure notification; never a success callback."""
+        if get_terminal_metadata(record.caller_id) is None:
+            self._failure_notice_pending.discard(record.worker_terminal_id)
+            return True
+        message = (
+            "CAO_WORKER_FAILED: worker="
+            + record.worker_terminal_id
+            + "; assignment="
+            + record.assignment_id
+            + ". The provider/transport entered ERROR. Do not wait for a reply or "
+            "send more input to this terminal. Any previous final report is retained; "
+            "the current turn is not proven complete. Inspect retained evidence and "
+            "choose recovery explicitly. No retry or replacement has been started."
+        )
+        try:
+            create_inbox_message(
+                record.worker_terminal_id,
+                record.caller_id,
+                message,
+                origin=InboxMessageOrigin.SYSTEM,
+                assignment_id=record.assignment_id,
+                idempotency_key=f"assigned-worker-failure:{record.completion_id}",
+            )
+        except Exception:
+            self._failure_notice_pending.add(record.worker_terminal_id)
+            self._request_retry(record.worker_terminal_id)
+            logger.warning(
+                "Worker failure notice enqueue deferred for %s", record.worker_terminal_id
+            )
+            return False
+        self._failure_notice_pending.discard(record.worker_terminal_id)
+        self._attempt_immediate_inbox_delivery(record.caller_id)
+        return True
+
     def reconcile_worker(self, worker_terminal_id: str) -> None:
         """Reconcile one worker from durable state and live provider status."""
         with self._worker_lock(worker_terminal_id):
             record = get_assigned_worker_callback(worker_terminal_id)
-            if record is None or record.delivery_state in _DELIVERY_TERMINAL_STATES:
+            if record is None:
+                return
+            if worker_terminal_id in self._failure_notice_pending:
+                self._handle_status_locked(record, TerminalStatus.ERROR)
+                return
+            if record.delivery_state in _DELIVERY_TERMINAL_STATES:
                 return
             if record.lifecycle == AssignmentLifecycle.COMPLETED:
                 self._drive_delivery(record)
@@ -775,6 +821,18 @@ class AssignedWorkerCompletionService:
 
     def reconcile_pending(self) -> None:
         """Recover interrupted captures/enqueues without any supervisor polling."""
+        # Recover failure delivery even when the original success callback was
+        # already acknowledged. This scan runs only on service reconciliation,
+        # never polls a model or restarts an assignment.
+        for retained in list_retained_assigned_worker_callbacks():
+            try:
+                if self._detect_live_status(retained) == TerminalStatus.ERROR:
+                    self.handle_status_event(retained.worker_terminal_id, TerminalStatus.ERROR)
+            except Exception:
+                logger.warning(
+                    "Retained worker failure reconciliation deferred for %s",
+                    retained.worker_terminal_id,
+                )
         for record in list_reconcilable_assigned_worker_callbacks():
             try:
                 self.register_assignment(record.worker_terminal_id)

@@ -887,10 +887,20 @@ class ClaudeCodeProvider(BaseProvider):
 
         for raw_line in output.splitlines():
             line = raw_line.strip()
+            # These are provider/launcher diagnostic lines, not JSON model text.
+            # Legacy crashed workers may predate the adapter's EOF error marker.
+            if line.startswith(
+                (
+                    "Error parsing streaming input line (",
+                    "Fatal Python error: _enter_buffered_busy:",
+                )
+            ):
+                return TerminalStatus.ERROR
             if line in (ADAPTER_ERROR_MARKER, ADAPTER_TURN_ERROR_MARKER):
                 return TerminalStatus.ERROR
             if line in (ADAPTER_COMPLETION_MARKER, ADAPTER_TURN_COMPLETION_MARKER):
-                return TerminalStatus.COMPLETED
+                status = TerminalStatus.COMPLETED
+                continue
             if line == ADAPTER_READY_MARKER:
                 status = TerminalStatus.IDLE
                 continue
@@ -921,8 +931,10 @@ class ClaudeCodeProvider(BaseProvider):
             user_message_uuids = message.get("user_message_uuids")
             if user_message_uuids is not None and user_message_uuids != [self._completion_input_id]:
                 return TerminalStatus.ERROR
-            return TerminalStatus.COMPLETED
+            status = TerminalStatus.COMPLETED
 
+        if status == TerminalStatus.COMPLETED:
+            return status
         if self._task_dispatched and (saw_structured_activity or status == TerminalStatus.IDLE):
             return TerminalStatus.PROCESSING
         return status
