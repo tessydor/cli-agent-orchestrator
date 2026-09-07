@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
+import termios
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -136,6 +138,78 @@ def test_stdin_forwarder_preserves_jsonl_bytes_and_closes_at_eof() -> None:
     child.stdin.close.assert_called_once_with()
 
 
+def test_stream_stdin_mode_clears_only_canonical_input_and_restores() -> None:
+    master_fd, slave_fd = os.openpty()
+    source = os.fdopen(slave_fd, "rb", buffering=0)
+    mode = None
+    try:
+        original = termios.tcgetattr(source.fileno())
+
+        mode = launcher._stream_stdin_mode(source)
+
+        assert mode is not None
+        streaming = termios.tcgetattr(source.fileno())
+        assert streaming[3] & termios.ICANON == 0
+        assert streaming[3] & termios.ISIG == original[3] & termios.ISIG
+        assert streaming[3] & termios.ECHO == original[3] & termios.ECHO
+        assert streaming[0] == original[0]
+        assert streaming[1] == original[1]
+        assert streaming[2] == original[2]
+        assert streaming[6][termios.VMIN] in (1, b"\x01")
+        assert streaming[6][termios.VTIME] in (0, b"\x00")
+        assert mode.eof_byte == bytes(original[6][termios.VEOF])
+
+        launcher._restore_stdin_mode(mode)
+        mode = None
+        assert termios.tcgetattr(source.fileno()) == original
+    finally:
+        launcher._restore_stdin_mode(mode)
+        source.close()
+        os.close(master_fd)
+
+
+def test_noncanonical_forwarder_preserves_configured_ctrl_d_eof() -> None:
+    master_fd, slave_fd = os.openpty()
+    sink_read_fd, sink_write_fd = os.pipe()
+    source = os.fdopen(slave_fd, "rb", buffering=0)
+    sink = os.fdopen(sink_write_fd, "wb", buffering=0)
+    child = MagicMock(stdin=sink)
+    thread = None
+    try:
+        thread = launcher._start_stdin_forwarder(child, source)
+        os.write(master_fd, b'{"type":"user"}\x04must-not-follow')
+        thread.join(timeout=2)
+
+        assert thread.is_alive() is False
+        assert os.read(sink_read_fd, 4096) == b'{"type":"user"}'
+        assert termios.tcgetattr(source.fileno())[3] & termios.ICANON
+    finally:
+        if thread is not None and thread.is_alive():
+            thread.stop()
+        source.close()
+        sink.close()
+        os.close(master_fd)
+        os.close(sink_read_fd)
+
+
+def test_forwarder_start_failure_restores_original_terminal_mode() -> None:
+    master_fd, slave_fd = os.openpty()
+    source = os.fdopen(slave_fd, "rb", buffering=0)
+    child = MagicMock()
+    try:
+        original = termios.tcgetattr(source.fileno())
+        with (
+            patch.object(launcher._StdinForwarder, "start", side_effect=RuntimeError("start")),
+            pytest.raises(RuntimeError, match="start"),
+        ):
+            launcher._start_stdin_forwarder(child, source)
+
+        assert termios.tcgetattr(source.fileno()) == original
+    finally:
+        source.close()
+        os.close(master_fd)
+
+
 def test_main_persists_correlated_result_before_forwarding(monkeypatch: pytest.MonkeyPatch) -> None:
     lines = [b'{"type":"system"}\n', b'{"type":"result"}\n']
     child = _Child(lines)
@@ -180,6 +254,27 @@ def test_main_persists_correlated_result_before_forwarding(monkeypatch: pytest.M
         "request_id": f"cao-init-{COMPLETION_ID}",
         "request": {"subtype": "initialize"},
     }
+
+
+def test_main_surfaces_terminal_configuration_failure_as_adapter_error() -> None:
+    child = _Child([])
+    forwarded: list[bytes] = []
+
+    with (
+        patch.object(launcher.subprocess, "Popen", return_value=child),
+        patch.object(
+            launcher,
+            "_start_stdin_forwarder",
+            side_effect=termios.error("cannot configure PTY"),
+        ),
+        patch.object(launcher, "_write_stdout", side_effect=forwarded.append),
+        patch.object(launcher.signal, "getsignal", return_value=object()),
+        patch.object(launcher.signal, "signal"),
+    ):
+        assert launcher.main(ARGV) == 1
+
+    assert forwarded == [(launcher.ADAPTER_ERROR_MARKER + "\n").encode("ascii")]
+    assert child.terminated is True
 
 
 def test_main_consumes_initialize_metadata_and_emits_only_ready_marker() -> None:
