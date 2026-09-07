@@ -25,9 +25,11 @@ import select
 import signal
 import subprocess
 import sys
+import termios
 import threading
 from collections.abc import Sequence
-from typing import BinaryIO, cast
+from dataclasses import dataclass
+from typing import Any, BinaryIO, cast
 
 from cli_agent_orchestrator.models.provider_completion import ProviderCompletionError
 from cli_agent_orchestrator.services.provider_completion_report import (
@@ -173,18 +175,99 @@ def _write_initialize_request(child: subprocess.Popen[bytes], request_id: str) -
     child.stdin.flush()
 
 
+@dataclass(frozen=True)
+class _StdinTerminalMode:
+    """Original PTY state retained while stream-json input is in flight."""
+
+    fd: int
+    original_attributes: list[Any]
+    eof_byte: bytes | None
+
+
+def _stream_stdin_mode(source: BinaryIO) -> _StdinTerminalMode | None:
+    """Make a launcher PTY byte-streaming without weakening signal handling.
+
+    Linux's N_TTY canonical discipline accepts at most 4095 bytes before the
+    terminating newline. CAO's JSONL records are not size-bounded to that
+    terminal-editor limit, so the launcher must receive them in noncanonical
+    mode before relaying them to Claude's pipe. Only ``ICANON`` is cleared:
+    ``ISIG`` remains active for foreground Ctrl-C cancellation, and echo plus
+    CR-to-NL translation retain the existing tmux/status behavior.
+
+    Pipes and in-memory sources already preserve arbitrary record lengths and
+    are intentionally left alone.
+    """
+    try:
+        source_fd = source.fileno()
+    except (AttributeError, OSError, ValueError):
+        return None
+    if not os.isatty(source_fd):
+        return None
+
+    original = termios.tcgetattr(source_fd)
+    streaming = original.copy()
+    control_characters = original[6].copy()
+    streaming[6] = control_characters
+    streaming[3] = int(original[3]) & ~termios.ICANON
+    # VMIN/VTIME share slots with canonical-mode control characters on Linux.
+    # Once ICANON is cleared, request each available byte without a read timer.
+    control_characters[termios.VMIN] = 1
+    control_characters[termios.VTIME] = 0
+
+    configured_eof = original[6][termios.VEOF]
+    if isinstance(configured_eof, int):
+        eof_byte = bytes((configured_eof,)) if configured_eof else None
+    else:
+        eof_byte = bytes(configured_eof) or None
+        if eof_byte == b"\x00":
+            eof_byte = None
+
+    # TCSANOW changes no queued bytes. The ready marker is emitted only after
+    # this synchronous setup completes, so assignment delivery cannot race it.
+    mode = _StdinTerminalMode(source_fd, original, eof_byte)
+    termios.tcsetattr(source_fd, termios.TCSANOW, streaming)
+    return mode
+
+
+def _restore_stdin_mode(mode: _StdinTerminalMode | None) -> None:
+    """Restore a PTY mode without masking the launcher's primary outcome."""
+    if mode is None:
+        return
+    try:
+        termios.tcsetattr(mode.fd, termios.TCSANOW, mode.original_attributes)
+    except (OSError, termios.error):
+        # The descriptor can disappear during terminal teardown. Do not replace
+        # a structured provider result with a cleanup exception.
+        logger.exception("Could not restore Claude launcher terminal input mode")
+
+
 class _StdinForwarder(threading.Thread):
     """Cancellable pipe relay; never hold Python's buffered stdin lock at exit."""
 
-    def __init__(self, child: subprocess.Popen[bytes], source: BinaryIO) -> None:
+    def __init__(
+        self,
+        child: subprocess.Popen[bytes],
+        source: BinaryIO,
+        terminal_mode: _StdinTerminalMode | None,
+    ) -> None:
         super().__init__(name="cao-claude-stdin-forwarder", daemon=False)
         self.sink = child.stdin
         self.source = source
+        self.terminal_mode = terminal_mode
         self.stop_event = threading.Event()
 
     def stop(self) -> None:
         self.stop_event.set()
         self.join(timeout=2)
+
+    def _split_at_eof(self, data: bytes) -> tuple[bytes, bool]:
+        """Emulate canonical VEOF now that the PTY returns literal bytes."""
+        if self.terminal_mode is None or self.terminal_mode.eof_byte is None:
+            return data, False
+        eof_index = data.find(self.terminal_mode.eof_byte)
+        if eof_index < 0:
+            return data, False
+        return data[:eof_index], True
 
     def run(self) -> None:
         assert self.sink is not None
@@ -196,8 +279,13 @@ class _StdinForwarder(threading.Thread):
                 for raw_line in iter(self.source.readline, b""):
                     if self.stop_event.is_set():
                         return
-                    self.sink.write(raw_line)
-                    self.sink.flush()
+                    payload, reached_eof = self._split_at_eof(raw_line)
+                    if payload:
+                        self.sink.write(payload)
+                        self.sink.flush()
+                    if reached_eof:
+                        self.sink.close()
+                        return
                 self.sink.close()
                 return
             while not self.stop_event.is_set():
@@ -207,12 +295,18 @@ class _StdinForwarder(threading.Thread):
                 if not data:
                     self.sink.close()
                     return
-                while data and not self.stop_event.is_set():
+                payload, reached_eof = self._split_at_eof(data)
+                while payload and not self.stop_event.is_set():
                     if select.select([], [sink_fd], [], 0.1)[1]:
-                        data = data[os.write(sink_fd, data) :]
+                        payload = payload[os.write(sink_fd, payload) :]
+                if reached_eof:
+                    self.sink.close()
+                    return
         except (BrokenPipeError, OSError, ValueError):
             # No payload is logged. The main loop owns the failure boundary.
             logger.warning("Claude structured stdin forwarding stopped")
+        finally:
+            _restore_stdin_mode(self.terminal_mode)
 
 
 def _start_stdin_forwarder(
@@ -224,8 +318,13 @@ def _start_stdin_forwarder(
         source = getattr(sys.stdin, "buffer", None)
         if source is None:
             raise OSError("launcher stdin has no binary stream")
-    thread = _StdinForwarder(child, source)
-    thread.start()
+    terminal_mode = _stream_stdin_mode(source)
+    try:
+        thread = _StdinForwarder(child, source, terminal_mode)
+        thread.start()
+    except BaseException:
+        _restore_stdin_mode(terminal_mode)
+        raise
     return thread
 
 
@@ -333,7 +432,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.error("Claude stream ended without a correlated ResultMessage")
         _write_stdout((ADAPTER_ERROR_MARKER + "\n").encode("ascii"))
         return return_code if return_code != 0 else 1
-    except (OSError, ValueError):
+    except (OSError, ValueError, termios.error):
         logger.exception("Cannot launch Claude assigned worker completion adapter")
         _write_stdout((ADAPTER_ERROR_MARKER + "\n").encode("ascii"))
         if child is not None:
