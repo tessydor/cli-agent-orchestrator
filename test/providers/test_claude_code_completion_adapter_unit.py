@@ -255,3 +255,31 @@ def test_manager_passes_completion_identity_on_create_and_restart() -> None:
         assert restarted_manager.get_provider(TERMINAL_ID) is restored
 
     assert provider_class.call_args.kwargs["completion_id"] == COMPLETION_ID
+
+
+def test_later_crash_is_not_hidden_by_previous_success() -> None:
+    provider = _assigned_provider()
+    for failure in (
+        ADAPTER_TURN_ERROR_MARKER,
+        "Error parsing streaming input line (type=user, 1676 chars): SyntaxError",
+        "Fatal Python error: _enter_buffered_busy: shutdown",
+    ):
+        assert (
+            provider._get_structured_status(ADAPTER_TURN_COMPLETION_MARKER + "\n" + failure)
+            == TerminalStatus.ERROR
+        )
+
+
+def test_diagnostic_inside_model_json_does_not_forge_error() -> None:
+    provider = _assigned_provider()
+    text = json.dumps(
+        {
+            "type": "assistant",
+            "session_id": claude_session_id(TERMINAL_ID, COMPLETION_ID),
+            "message": "Error parsing streaming input line (synthetic)",
+        }
+    )
+    assert (
+        provider._get_structured_status(text + "\n" + ADAPTER_TURN_COMPLETION_MARKER)
+        == TerminalStatus.COMPLETED
+    )

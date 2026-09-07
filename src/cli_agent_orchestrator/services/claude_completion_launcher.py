@@ -21,6 +21,7 @@ import argparse
 import json
 import logging
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -172,45 +173,58 @@ def _write_initialize_request(child: subprocess.Popen[bytes], request_id: str) -
     child.stdin.flush()
 
 
+class _StdinForwarder(threading.Thread):
+    """Cancellable pipe relay; never hold Python's buffered stdin lock at exit."""
+
+    def __init__(self, child: subprocess.Popen[bytes], source: BinaryIO) -> None:
+        super().__init__(name="cao-claude-stdin-forwarder", daemon=False)
+        self.sink = child.stdin
+        self.source = source
+        self.stop_event = threading.Event()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.join(timeout=2)
+
+    def run(self) -> None:
+        assert self.sink is not None
+        try:
+            try:
+                source_fd, sink_fd = self.source.fileno(), self.sink.fileno()
+            except (AttributeError, OSError, ValueError):
+                # In-memory streams used by embedded callers and unit tests.
+                for raw_line in iter(self.source.readline, b""):
+                    if self.stop_event.is_set():
+                        return
+                    self.sink.write(raw_line)
+                    self.sink.flush()
+                self.sink.close()
+                return
+            while not self.stop_event.is_set():
+                if not select.select([source_fd], [], [], 0.1)[0]:
+                    continue
+                data = os.read(source_fd, 4096)
+                if not data:
+                    self.sink.close()
+                    return
+                while data and not self.stop_event.is_set():
+                    if select.select([], [sink_fd], [], 0.1)[1]:
+                        data = data[os.write(sink_fd, data) :]
+        except (BrokenPipeError, OSError, ValueError):
+            # No payload is logged. The main loop owns the failure boundary.
+            logger.warning("Claude structured stdin forwarding stopped")
+
+
 def _start_stdin_forwarder(
     child: subprocess.Popen[bytes], source: BinaryIO | None = None
-) -> threading.Thread:
-    """Forward terminal JSONL into Claude's non-TTY stdin pipe.
-
-    A daemon thread is intentional: the main thread owns child/output lifetime,
-    while a terminal ``readline`` can remain blocked after the child exits.
-    No input bytes are logged or interpreted here.
-    """
-    sink = child.stdin
-    if sink is None:  # pragma: no cover - guaranteed by stdin=PIPE
+) -> _StdinForwarder:
+    if child.stdin is None:
         raise OSError("Claude stdin pipe was not created")
     if source is None:
-        raw_source = getattr(sys.stdin, "buffer", None)
-        if raw_source is None:  # pragma: no cover - terminal stdin always buffered
+        source = getattr(sys.stdin, "buffer", None)
+        if source is None:
             raise OSError("launcher stdin has no binary stream")
-        source = cast(BinaryIO, raw_source)
-
-    def _forward() -> None:
-        try:
-            while True:
-                raw_line = source.readline()
-                if not raw_line:
-                    sink.close()
-                    return
-                if isinstance(raw_line, str):  # pragma: no cover - embedded text stdin
-                    raw_line = raw_line.encode("utf-8", errors="strict")
-                sink.write(raw_line)
-                sink.flush()
-        except (BrokenPipeError, OSError, ValueError):
-            # The main stdout loop observes child exit and publishes the
-            # adapter error boundary when no correlated ResultMessage exists.
-            logger.exception("Claude structured stdin forwarding stopped")
-
-    thread = threading.Thread(
-        target=_forward,
-        name="cao-claude-stdin-forwarder",
-        daemon=True,
-    )
+    thread = _StdinForwarder(child, source)
     thread.start()
     return thread
 
@@ -241,6 +255,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # the parent must stay alive long enough to retain that ResultMessage.
     previous_sigint = signal.getsignal(signal.SIGINT)
     child: subprocess.Popen[bytes] | None = None
+    forwarder: _StdinForwarder | None = None
     try:
         child_env = dict(os.environ)
         child_env.pop("CLAUDECODE", None)
@@ -264,7 +279,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Match ClaudeAgentSDKClient's supported bootstrap ordering: initialize
         # first, then allow user records onto the same pipe.
         _write_initialize_request(child, initialize_request_id)
-        _start_stdin_forwarder(child)
+        forwarder = _start_stdin_forwarder(child)
 
         saw_correlated_result = False
         ready_published = False
@@ -306,6 +321,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         return_code = child.wait()
         if saw_correlated_result:
+            if return_code != 0:
+                # A previous successful assignment must never mask a later
+                # transport/provider crash while the caller waits for follow-up.
+                _write_stdout((ADAPTER_TURN_ERROR_MARKER + "\n").encode("ascii"))
             return return_code
 
         # A supported assigned-worker turn always terminates with exactly one
@@ -321,6 +340,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             _stop_child(child)
         return 1
     finally:
+        if forwarder is not None:
+            forwarder.stop()
         signal.signal(signal.SIGINT, previous_sigint)
 
 

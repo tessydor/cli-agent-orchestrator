@@ -2680,6 +2680,20 @@ def list_reconcilable_assigned_worker_callbacks() -> List[AssignedWorkerCallback
         return [_assigned_worker_callback_from_row(row) for row in rows]
 
 
+def list_retained_assigned_worker_callbacks() -> List[AssignedWorkerCallback]:
+    """Startup-only failure recovery, including completed workers kept for follow-up."""
+    with SessionLocal() as db:
+        rows = (
+            db.query(AssignedWorkerCallbackModel)
+            .filter(AssignedWorkerCallbackModel.worker_terminal_id.in_(db.query(TerminalModel.id)))
+            .order_by(AssignedWorkerCallbackModel.created_at.asc())
+            .all()
+        )
+        for row in rows:
+            _validate_assigned_worker_callback_row(db, row)
+        return [_assigned_worker_callback_from_row(row) for row in rows]
+
+
 def list_protected_assigned_worker_callbacks() -> List[AssignedWorkerCallback]:
     """List workers whose uncaptured terminal remains a recovery handle."""
     with SessionLocal() as db:

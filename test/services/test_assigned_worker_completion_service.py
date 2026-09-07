@@ -482,7 +482,8 @@ def test_provider_error_wins_and_never_emits_success_callback(
     assert record.lifecycle == AssignmentLifecycle.FAILED
     assert record.delivery_state == CompletionDeliveryState.TERMINAL_ERROR
     assert record.final_result is None
-    assert _messages(caller) == []
+    assert len(_messages(caller)) == 1
+    assert _messages(caller)[0].origin == InboxMessageOrigin.SYSTEM
 
 
 def test_callback_uses_immutable_persisted_caller(callback_db, ids, monkeypatch):
@@ -1534,7 +1535,8 @@ def test_failure_and_cancellation_never_emit_success_callback(callback_db, ids, 
     monkeypatch.setattr(service, "_detect_live_status", lambda _record: TerminalStatus.IDLE)
     assert service.prepare_terminal_retirement(cancelled_worker) is True
 
-    assert _messages(caller) == []
+    assert len(_messages(caller)) == 1
+    assert _messages(caller)[0].origin == InboxMessageOrigin.SYSTEM
     assert db.get_assigned_worker_callback(failed_worker).lifecycle == (  # type: ignore[union-attr]
         AssignmentLifecycle.FAILED
     )
@@ -1766,3 +1768,59 @@ async def test_status_event_delivers_without_supervisor_polling(callback_db, ids
     messages = _messages(caller)
     assert len(messages) == 1
     assert messages[0].origin == InboxMessageOrigin.SERVER_COMPLETION
+
+
+def test_followup_failure_notifies_caller_once_and_preserves_success(callback_db, ids, monkeypatch):
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    _assignment(worker, caller)
+    service = _service(monkeypatch)
+    service.handle_status_event(worker, TerminalStatus.COMPLETED)
+    before = db.get_assigned_worker_callback(worker)
+    service.handle_status_event(worker, TerminalStatus.ERROR)
+    service.handle_status_event(worker, TerminalStatus.ERROR)
+    after = db.get_assigned_worker_callback(worker)
+    assert after == before
+    messages = _messages(caller)
+    notices = [m for m in messages if m.origin == InboxMessageOrigin.SYSTEM]
+    assert len(notices) == 1
+    assert notices[0].message.startswith("CAO_WORKER_FAILED:")
+    assert notices[0].receiver_id == caller
+    assert len([m for m in messages if m.origin == InboxMessageOrigin.SERVER_COMPLETION]) == 1
+
+
+def test_failure_notice_recovers_after_restart(callback_db, ids, monkeypatch):
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    _assignment(worker, caller)
+    service = _service(monkeypatch)
+    service.handle_status_event(worker, TerminalStatus.COMPLETED)
+    restarted = _service(monkeypatch)
+    monkeypatch.setattr(restarted, "_detect_live_status", lambda record: TerminalStatus.ERROR)
+    restarted.reconcile_pending()
+    restarted.reconcile_pending()
+    assert len([m for m in _messages(caller) if m.origin == InboxMessageOrigin.SYSTEM]) == 1
+    assert db.get_assigned_worker_callback(worker).lifecycle == AssignmentLifecycle.COMPLETED
+
+
+def test_failure_notice_retries_database_enqueue_without_restarting_worker(
+    callback_db, ids, monkeypatch
+):
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    _assignment(worker, caller)
+    service = _service(monkeypatch)
+    service.handle_status_event(worker, TerminalStatus.COMPLETED)
+    original = completion_mod.create_inbox_message
+    monkeypatch.setattr(
+        completion_mod,
+        "create_inbox_message",
+        MagicMock(side_effect=RuntimeError("db unavailable")),
+    )
+    retry = MagicMock()
+    monkeypatch.setattr(service, "_request_retry", retry)
+    service.handle_status_event(worker, TerminalStatus.ERROR)
+    retry.assert_called_once_with(worker)
+    monkeypatch.setattr(completion_mod, "create_inbox_message", original)
+    service.reconcile_worker(worker)
+    assert len([m for m in _messages(caller) if m.origin == InboxMessageOrigin.SYSTEM]) == 1
