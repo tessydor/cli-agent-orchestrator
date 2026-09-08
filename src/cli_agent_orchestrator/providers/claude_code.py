@@ -1314,9 +1314,11 @@ class ClaudeCodeProvider(BaseProvider):
 
     @property
     def paste_enter_count(self) -> int:
-        # The SDK protocol consumes one JSON object per line. A second Enter
-        # would submit a blank, malformed record after every CAO message.
-        return 1 if self._completion_id is not None else 2
+        # Submit exactly once. In the native TUI a second Enter can answer a
+        # menu opened by the first submission. Keep the paste-settle delay
+        # below instead of retrying Enter without checking the new UI state.
+        # The SDK protocol likewise requires exactly one JSONL terminator.
+        return 1
 
     @property
     def paste_submit_delay(self) -> float:
