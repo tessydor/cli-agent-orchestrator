@@ -34,6 +34,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class OutputExtractionError(ValueError):
+    """A provider ran but no usable message could be extracted from its output.
+
+    Distinct from the ``ValueError``s that name a bad terminal or provider
+    reference, which are genuine lookup failures. This one means the terminal
+    exists and the step ran; only the response marker was missing from the
+    scrollback.
+
+    Subclasses ``ValueError`` so existing ``except ValueError`` callers keep
+    working; the API boundary catches this narrower type first so an extraction
+    failure is not reported as 404 Not Found (issue #570).
+    """
+
+
 class BaseProvider(ABC):
     """Abstract base class for CLI tool providers.
 
@@ -186,6 +200,15 @@ class BaseProvider(ABC):
         """
         return self.get_status("\n".join(screen_lines))
 
+    def extract_current_composer(self, rendered_pane: str) -> Optional[str]:
+        """Return this provider's current editable composer, when it is known.
+
+        A rendered pane also contains transcript history, so callers must not
+        infer an input boundary from its cursor position alone. Providers opt
+        in only when they can identify their own live composer structure.
+        """
+        return None
+
     @property
     def paste_submit_delay(self) -> float:
         """Seconds to wait after a bracketed paste before sending the Enter key.
@@ -251,6 +274,17 @@ class BaseProvider(ABC):
     def force_bracketed_paste(self) -> bool:
         """Whether terminal delivery should request bracketed-paste framing."""
         return True
+
+    @property
+    def assume_processing_on_dispatch(self) -> bool:
+        """Publish PROCESSING immediately when a task is dispatched.
+
+        Most CLIs repaint quickly enough for their first activity frame to
+        drive the transition. Full-screen TUIs that can remain visually
+        unchanged just after submission opt in so callers cannot observe the
+        previous turn's cached COMPLETED state as the new turn's result.
+        """
+        return False
 
     @property
     def extraction_retries(self) -> int:

@@ -234,6 +234,7 @@ def test_manager_passes_completion_identity_on_create_and_restart() -> None:
             skill_prompt=None,
             model=None,
             completion_id=COMPLETION_ID,
+            resume_session_id=None,
         )
 
     restarted_manager = ProviderManager()

@@ -717,7 +717,7 @@ def test_launch_yolo_still_resolves_profile_provider():
         mock_resolve.assert_called_once_with("codex_panelist", "kiro_cli")
         # The kiro_cli-specific yolo warning text must NOT appear, because
         # the profile's provider ("claude_code") was honoured.
-        assert "kiro_cli will launch in --legacy-ui mode" not in result.output
+        assert "consent dialog will be auto-answered" not in result.output
 
 
 def test_launch_allowed_tools_still_resolves_profile_provider():
@@ -818,7 +818,7 @@ def test_launch_yolo_falls_back_to_default_when_profile_lacks_provider():
         assert result.exit_code == 0
         # The kiro_cli-specific yolo warning IS expected here because the
         # profile didn't override and the fallback is kiro_cli.
-        assert "kiro_cli will launch in --legacy-ui mode" in result.output
+        assert "consent dialog will be auto-answered" in result.output
 
 
 # ── --env forwarded env vars (issue #248) ────────────────────────────
@@ -876,6 +876,27 @@ class TestParseEnvPairs:
 
     def test_value_under_cap_accepted(self):
         assert _parse_env_pairs(["SMALL=" + ("x" * 2047)]) == {"SMALL": "x" * 2047}
+
+    def test_nul_byte_value_rejected(self):
+        # Shared-validator rule now protects --env too (no drift): a NUL value
+        # is rejected at the CLI boundary as a --env error.
+        import click as _click
+
+        with pytest.raises(_click.ClickException, match="NUL byte"):
+            _parse_env_pairs(["TOKEN=bad\x00value"])
+
+    def test_non_utf8_value_rejected(self):
+        import click as _click
+
+        with pytest.raises(_click.ClickException, match="not valid UTF-8"):
+            _parse_env_pairs(["X=\ud800"])
+
+    def test_too_many_entries_rejected(self):
+        import click as _click
+
+        pairs = [f"K{i}=x" for i in range(257)]
+        with pytest.raises(_click.ClickException, match="exceeds the limit"):
+            _parse_env_pairs(pairs)
 
 
 def test_launch_forwards_env_in_json_body_not_url():
@@ -994,3 +1015,11 @@ def test_grok_cli_requires_workspace_access_confirmation():
     )
 
     assert "grok_cli" in PROVIDERS_REQUIRING_WORKSPACE_ACCESS
+
+
+def test_minimax_code_requires_workspace_access_confirmation():
+    from cli_agent_orchestrator.cli.commands.launch import (
+        PROVIDERS_REQUIRING_WORKSPACE_ACCESS,
+    )
+
+    assert "mcode" in PROVIDERS_REQUIRING_WORKSPACE_ACCESS

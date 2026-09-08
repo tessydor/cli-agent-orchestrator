@@ -8,6 +8,7 @@ from sqlalchemy import and_
 
 from cli_agent_orchestrator.clients.database import (
     AssignedWorkerCallbackModel,
+    IdempotencyKeyModel,
     InboxModel,
     SessionLocal,
     TerminalModel,
@@ -94,6 +95,17 @@ def cleanup_old_data():
             for terminal_id in protected_terminal_ids
             for suffix in (".log", ".scrollback", ".snapshot.json")
         }
+        # Clean up old idempotency-key mappings (review on PR #634, issue
+        # #616): these are never swept elsewhere, so without this they grow
+        # unbounded with terminal-creation rate.
+        with SessionLocal() as db:
+            deleted_keys = (
+                db.query(IdempotencyKeyModel)
+                .filter(IdempotencyKeyModel.created_at < cutoff_date)
+                .delete()
+            )
+            db.commit()
+            logger.info(f"Deleted {deleted_keys} old idempotency keys from database")
 
         # Clean up old terminal log files
         terminal_logs_deleted = 0

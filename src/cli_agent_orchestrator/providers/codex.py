@@ -41,7 +41,7 @@ _CODEX_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 # Regex patterns for Codex output analysis
 ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
-IDLE_PROMPT_PATTERN = r"(?:❯|›|codex>)"
+IDLE_PROMPT_PATTERN = r"(?:❯|›|»|codex>)"
 # Number of lines from the bottom of capture to check for the idle prompt.
 # With --no-alt-screen, codex output is inline (scrollback contains history),
 # so we can't anchor to \Z. Instead, check the last few lines where the prompt
@@ -67,15 +67,16 @@ ASSISTANT_PREFIX_PATTERN = r"^(?:(?:assistant|codex|agent)\s*:|[^\S\n]*•)"
 # paren) is required so legitimate model bullets like "• Called attention
 # to the bug" don't get filtered as tool calls.
 MCP_TOOL_CALL_PATTERN = r"^[^\S\n]*•\s+Called\s+[\w-]+\.[\w-]+\("
-# Match user input: "You ..." (label style) or "› text" (Codex interactive prompt).
-# The "›[^\S\n]*\S" alternative requires a non-whitespace character on the same line
-# to distinguish user input ("› what is your role?") from the empty idle prompt ("› ").
+# Match user input: "You ..." (label style), "› text" (older Codex interactive
+# prompt), or "» text" (Codex 0.149+ interactive prompt). The prompt alternative
+# requires a non-whitespace character on the same line to distinguish user input
+# from an empty idle prompt.
 # [^\S\n] matches horizontal whitespace only (spaces/tabs), preventing the pattern
 # from crossing newline boundaries into subsequent lines.
-USER_PREFIX_PATTERN = r"^(?:You\b|›[^\S\n]*\S)"
+USER_PREFIX_PATTERN = r"^(?:You\b|[›»][^\S\n]*\S)"
 # Strict idle prompt pattern for extraction: matches empty prompt lines only.
 # Distinguishes "› " (idle) from "› user message" (user input with text).
-IDLE_PROMPT_STRICT_PATTERN = r"^\s*(?:❯|›|codex>)\s*$"
+IDLE_PROMPT_STRICT_PATTERN = r"^\s*(?:❯|›|»|codex>)\s*$"
 
 PROCESSING_PATTERN = r"\b(thinking|working|running|executing|processing|analyzing)\b"
 WAITING_PROMPT_PATTERN = r"^(?:Approve|Allow)\b.*\b(?:y/n|yes/no|yes|no)\b"
@@ -301,7 +302,8 @@ STARTUP_IDLE_PLACEHOLDER_PATTERN = (
     r"Write tests for @filename|"
     r"Improve documentation in @filename|"
     r"Run /review on my current changes|"
-    r"Use /skills to list available skills"
+    r"Use /skills to list available skills|"
+    r"Ask Codex to do anything"
     r")\s*$"
 )
 
@@ -985,6 +987,36 @@ class CodexProvider(BaseProvider):
             command_parts = ["codex", "--profile", profile.codexProfile]
             selected_profile_name = profile.codexProfile
         else:
+            if profile and profile.codexProfile:
+                # The operator asked for containment and is not getting it. Naming a
+                # codexProfile is the ONLY way to keep Codex's sandbox and approval
+                # policy in effect under CAO, and allowed_tools containing "*"
+                # discards it. Silently dropping an explicit safety setting is worse
+                # than not offering one, so say so at the point it happens (#707).
+                logger.warning(
+                    "Terminal %s: profile '%s' sets codexProfile=%r, but allowed_tools "
+                    "contains '*', which forces --yolo and discards it. This worker "
+                    "runs with Codex approvals AND sandbox bypassed. Remove '*' from "
+                    "allowed_tools to keep codexProfile in effect.",
+                    self.terminal_id,
+                    self._agent_profile,
+                    profile.codexProfile,
+                )
+            else:
+                # --yolo is --dangerously-bypass-approvals-and-sandbox, so NOTHING in
+                # ~/.codex/config.toml's [sandbox_*] tables applies to this worker --
+                # including network_access. Operators have relied on that setting as a
+                # containment control (#707); it is inert here. Logged on every default
+                # codex launch because that is exactly when the expectation is set.
+                logger.info(
+                    "Terminal %s: launching codex with --yolo "
+                    "(--dangerously-bypass-approvals-and-sandbox). Codex sandbox "
+                    "settings in ~/.codex/config.toml, including "
+                    "[sandbox_workspace_write].network_access, do NOT apply. Set "
+                    "codexProfile on the agent profile to launch under a named "
+                    "[profiles.<name>] block instead.",
+                    self.terminal_id,
+                )
             command_parts = ["codex", "--yolo"]
             selected_profile_name = None
         command_parts.extend(["--no-alt-screen", "--disable", "shell_snapshot"])
@@ -1589,6 +1621,43 @@ class CodexProvider(BaseProvider):
         if not rows:
             return TerminalStatus.UNKNOWN
         return self.get_status("\n".join(rows))
+
+    def extract_current_composer(self, rendered_pane: str) -> Optional[str]:
+        """Return Codex's bottom composer without admitting transcript prompts."""
+        lines = rendered_pane.splitlines()
+        footer_index = next(
+            (
+                index
+                for index in range(
+                    len(lines) - 1, max(len(lines) - IDLE_PROMPT_TAIL_LINES - 1, -1), -1
+                )
+                if re.search(TUI_FOOTER_PATTERN, lines[index])
+            ),
+            None,
+        )
+        if footer_index is None:
+            return None
+
+        composer_index = next(
+            (
+                index
+                for index in range(footer_index - 1, -1, -1)
+                if re.match(rf"^\s*{IDLE_PROMPT_PATTERN}", lines[index])
+            ),
+            None,
+        )
+        if composer_index is None:
+            return None
+
+        composer_lines = lines[composer_index:footer_index]
+        if not composer_lines:
+            return ""
+        first_composer_line = composer_lines[0]
+        if re.match(IDLE_PROMPT_STRICT_PATTERN, first_composer_line) or re.match(
+            STARTUP_IDLE_PLACEHOLDER_PATTERN, first_composer_line
+        ):
+            return ""
+        return "\n".join(composer_lines).rstrip()
 
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract Codex's final response from terminal output.

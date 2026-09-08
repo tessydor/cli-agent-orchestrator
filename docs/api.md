@@ -60,6 +60,76 @@ See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
   client can render create and edit forms from the server's definition instead
   of duplicating the field list.
 - `POST /agents/profiles/install` installs a profile.
+- `POST /agents/profiles` creates a profile in the local store from a supplied
+  document. Named distinctly from `install`, which takes a bare profile name or
+  an https:// URL rather than the document itself. The request carries `name`
+  and `content`; the two identities of a profile, its storage key and its
+  frontmatter `name`, must agree, so a mismatch is a 400 rather than a silent
+  rename. A conflicting name returns 409. Requires `cao:write` or `cao:admin`.
+- `PUT /agents/profiles/{name}` replaces an existing local-store profile and
+  never creates one. A request naming a built-in or provider-managed profile
+  returns 404 rather than writing a local file that would shadow the original.
+  Requires `cao:write` or `cao:admin`.
+- `DELETE /agents/profiles/{name}` removes a profile from the local store.
+  Requires `cao:write` or `cao:admin`, the same guard as create and replace, so
+  one credential covers the whole create/edit/delete cycle. Scopes are a flat
+  set rather than a hierarchy, so requiring admin here would 403 a caller
+  holding exactly `cao:write`. Built-ins are not deletable, for the same reason
+  they are not replaceable.
+- Both write routes run the profile validator on the exact submitted document
+  before persisting anything, so an invalid profile never reaches disk. Errors
+  reject the request with 400 and the findings attached; warnings do not block
+  the write and are returned in the response so a client can surface them after
+  a successful save.
+- The validator rejects non-string mapping keys. A profile is written as YAML,
+  which allows any scalar as a key, but the format is described by JSON Schema,
+  where object keys are strings. Without this rule `mcpServers: {1: {...}}`
+  validates clean and persists, then fails to load, since the model requires
+  string keys. Note YAML also auto-types an unquoted date, so `2026-01-01:` is a
+  date key rather than a string; quote such keys.
+- A document is rejected up front if it cannot safely be handed to the steps that
+  follow, on any of three grounds: how large it renders, how deeply it nests, or
+  whether it contains a cycle. The reason is that YAML anchors decouple a
+  document's rendered size from its byte count, and the schema step interpolates a
+  rendering of an offending value into every error message it builds. Chained
+  anchors multiply structure, and aliasing one large scalar multiplies content, so
+  a request under the 256 KB `content` cap can render to gigabytes either way. The
+  ceilings are therefore in *rendered bytes*, the unit that cost is paid in: at
+  most 1 MB, about 3.8x the largest request that can arrive and ~2060x the largest
+  bundled profile's 485 bytes, and at most 64 levels of nesting (~21x). Exceeding
+  either is itself an error and nothing further runs, since the later steps are
+  what such a document is expensive in. A cycle is rejected rather than measured:
+  it has no finite rendering, and the providers that consume a profile cannot
+  serialize one, so accepting it would persist a document the runtime cannot
+  install. Individual schema findings are also length-capped before they reach a
+  response, which bounds the case where several fields each render a subtree.
+- Within those bounds, containers already visited are skipped, so each offending
+  mapping key is reported once, at the first path that reaches it. Note that
+  differs from the schema step, which does not memoize and so reports a shared
+  invalid value once per referencing path.
+- An `mcpServers` entry must define either `command`, for a server CAO launches,
+  or `url`, for a remote one whose `type` names its transport. The schema
+  previously required `command` unconditionally, which made the write routes
+  reject url-based servers that the runtime accepts and passes through to the
+  provider unchanged. An entry defining neither is still rejected. `url` is the
+  spelling `resolve_mcp_server_config` documents; an entry naming its endpoint
+  under any other key satisfies neither branch and is rejected.
+- Every 400 from the profile write and source routes uses one `detail` shape,
+  `{"message", "errors"}`, so a client never has to switch on the type of
+  `detail`. `errors` is empty for a failure that is not attributable to a field,
+  but the key is always present. This covers rejected names as well as schema
+  findings. 404 and 409 keep FastAPI's conventional bare-string `detail`, since
+  the status code already discriminates and there are no findings to attach.
+- `GET /agents/profiles/{name}/source` returns a profile's document exactly as
+  stored. Use this, not `GET /agents/profiles/{name}`, when the document is
+  going to be edited and written back: that route returns the *resolved*
+  profile, having applied `${VAR}` substitution from the managed environment
+  file to the raw text before parsing. Round-tripping a resolved document
+  through a write would persist substituted values into a plaintext profile.
+  Requires `cao:read`, `cao:write`, or `cao:admin`, the same guard the profile
+  reads beside it now carry. Gating matters at least as much here as on the parsed
+  route, because this one returns the stored bytes verbatim from every configured
+  store, including documents that fail to parse.
 - Template validation and preview require the selected template to include a
   `schema.json` file.
 - `/agents/providers` reports provider availability.
@@ -79,6 +149,9 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
 
 - `/sessions*` creates, lists, inspects, and deletes sessions.
 - `/sessions/{session_name}/terminals*` creates and lists session terminals.
+  The list is ordered oldest-first, and index 0 is the session's conductor —
+  `cao session status`/`list` rely on that. Sort client-side on `last_active`
+  if you need a different order.
 - `/terminals/{terminal_id}*` inspects terminals, sends input or keys, reads
   output and working-directory state, exits providers, and deletes terminals.
 - `GET /terminals/{terminal_id}/output?mode=full` returns the StatusMonitor
@@ -195,7 +268,15 @@ See [Workflows](workflows.md).
 - `/graph/{provider}*` projects and exports graph views.
 - `/outcomes` records (`POST`, write-scope) and lists (`GET`) workflow
   outcomes for the self-learning loop. Both return 404 while
-  `memory.learning_enabled` is false.
+  `memory.learning_enabled` is false, and **503 when `settings.json` exists but
+  cannot be read** — learning fails closed, so an unreadable file resolves to
+  "disabled" internally, and reporting that as 404 would tell the caller a
+  configuration story about a filesystem fault. These are the routes the
+  `report_outcome` / `list_outcomes` MCP tools call.
+- `/internal/memory/*` serves the memory tools on a node that does not own the
+  database (`CAO_MEMORY_API_URL`). Its `key` is validated leniently and then
+  normalised, matching what the tools have always done in-process — the strict
+  operator rule would reject keys that work without the gateway.
 
 See [Memory](memory.md), [Self-Learning](self-learning.md), and
 [Knowledge Graph Viewing](knowledge-graph-viewing.md).
@@ -215,8 +296,26 @@ Connect to:
 /terminals/{terminal_id}/ws
 ```
 
-The path must identify an existing terminal. This endpoint is unauthenticated
-and grants full read/write access to that terminal's PTY.
+The path must identify an existing terminal. An accepted connection grants
+full read/write access to that terminal's PTY, including command input.
+
+### Authentication
+
+Authentication is enabled when `CAO_AUTH_JWKS_URI` or `AUTH0_DOMAIN` is set.
+In that mode, the handshake requires a valid bearer token granting
+`cao:write` **or** `cao:admin`, matching `POST /terminals/{terminal_id}/input`.
+These are existing CAO scopes; `cao:read` alone does not permit interactive
+PTY access.
+
+Send the token in the `Authorization` bearer header, or in the `token` query
+parameter for clients that cannot set that header. An extracted header token
+takes precedence over the query parameter. Passing the Origin check does not
+supply a bearer token; the client must provide it. Keep token-bearing URLs out
+of logs and use TLS for remote connections.
+
+With neither authentication-enabling variable set, no token is required.
+The client-IP and Origin restrictions still apply in both modes. See the
+[authentication configuration](configuration.md#auth-auth--env-var-only).
 
 ### Client access boundary
 
@@ -225,9 +324,11 @@ By default, only loopback clients identified as `127.0.0.1`, `::1`, or
 IP addresses or hostnames to that allowlist. A literal `*` disables the
 client-IP restriction.
 
-Adding clients or using `*` gives those clients full PTY read/write access.
-Treat either change as a security-boundary change and do not expose the
-endpoint to untrusted networks. See the
+Adding clients or using `*` widens who can reach the PTY handshake; it does
+not bypass authentication when enabled. With authentication disabled,
+clients that also pass the Origin check receive full PTY read/write access.
+Treat either allowlist change as a security-boundary change and do not expose
+the endpoint to untrusted networks. See the
 [network configuration](configuration.md#network-network--env-var-only) for
 related server settings.
 
@@ -252,8 +353,18 @@ rows and 80 columns.
 
 ### Close outcomes
 
-- `4003`: the client is restricted, or terminal/backend target metadata is
-  invalid.
+Client-IP, Origin, and authentication refusals happen before the WebSocket
+upgrade. They reject the HTTP handshake with `403`, rather than delivering a
+WebSocket close frame. The handler uses these server-side refusal codes:
+
+- `4003`: the client is outside the allowed client-IP set.
+- `4403`: the browser Origin is not allowed.
+- `4401`: authentication is enabled and the token is missing, invalid, or
+  grants neither `cao:write` nor `cao:admin`.
+
+After the connection is accepted:
+
+- `4003`: terminal/backend target metadata is invalid.
 - `4004`: the terminal does not exist, or the backend cannot attach to it.
 - A normal viewer disconnect detaches that viewer and preserves the session.
 
