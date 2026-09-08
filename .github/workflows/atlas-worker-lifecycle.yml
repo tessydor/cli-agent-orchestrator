@@ -23,6 +23,11 @@ jobs:
         run: |
           export CAO_HOME_DIR="$(mktemp -d)"
           uv run --no-sync python -m pytest -p pytest_asyncio.plugin -p pytest_mock -p pytest_cov --no-cov -q \
+            test/services/test_claude_native_completion.py \
+            test/services/test_claude_question.py \
+            test/services/test_terminal_service_full.py \
+            test/mcp_server/test_terminal_inspection.py \
+            test/mcp_server/test_answer_user_prompt.py \
             test/services/test_status_monitor.py \
             test/services/test_claude_completion_launcher.py \
             test/providers/test_claude_code_completion_adapter_unit.py \

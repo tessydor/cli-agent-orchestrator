@@ -262,6 +262,11 @@ class ProviderManager:
             provider.shell_baseline = metadata["shell_command"]
             if hasattr(provider, "_initialized"):
                 provider._initialized = True
+        if (
+            metadata["provider"] == ProviderType.CLAUDE_CODE.value
+            and getattr(provider, "_native_completion", False) is True
+        ):
+            provider._initialized = True
         logger.info(f"Created provider on-demand for terminal {terminal_id}")
         return provider
 

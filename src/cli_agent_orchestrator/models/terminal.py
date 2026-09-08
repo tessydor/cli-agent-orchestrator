@@ -85,6 +85,8 @@ class Terminal(BaseModel):
     caller_id: Optional[str] = Field(
         None, description="Terminal that created this one via handoff/assign (callback target)"
     )
+    assignment_id: Optional[str] = Field(None, description="Server-recorded assignment identity")
+    completion_id: Optional[str] = Field(None, description="Server-recorded completion identity")
     allowed_tools: Optional[List[str]] = Field(None, description="Allowed CAO tools")
     engine: Optional[KiroEngine] = Field(None, description="Resolved Kiro engine")
     shell_command: Optional[str] = Field(

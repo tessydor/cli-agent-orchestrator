@@ -3612,6 +3612,36 @@ async def send_terminal_input(
         )
 
 
+@app.get("/terminals/{terminal_id}/question")
+async def get_worker_question(
+    terminal_id: TerminalId,
+    caller_id: TerminalId,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    from cli_agent_orchestrator.services.claude_question import snapshot
+
+    try:
+        return await asyncio.to_thread(snapshot, terminal_id, caller_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@app.post("/terminals/{terminal_id}/question")
+async def answer_worker_question(
+    terminal_id: TerminalId,
+    body: Dict,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    from cli_agent_orchestrator.services.claude_question import answer
+
+    try:
+        return await asyncio.to_thread(
+            answer, terminal_id, body.get("caller_id"), body.get("prompt_sha256"), body.get("index")
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
 @app.post("/terminals/{terminal_id}/key")
 async def send_terminal_key(
     terminal_id: TerminalId,
