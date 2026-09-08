@@ -14,28 +14,204 @@ from cli_agent_orchestrator.services import terminal_service as ts
 
 
 class TestMessageVisibleInBox:
-    def test_true_when_probe_present(self):
-        with patch.object(ts, "get_output", return_value="❯ Analyze the logs now"):
-            assert ts._message_visible_in_box("t1", "Analyze the logs") is True
+    @staticmethod
+    def _visible_in_current_composer(composer, message):
+        with patch.object(ts, "_capture_current_composer_region", return_value=composer):
+            return ts._message_visible_in_box("t1", message)
 
-    def test_false_when_absent(self):
-        with patch.object(ts, "get_output", return_value="❯ (empty prompt)"):
-            assert ts._message_visible_in_box("t1", "Analyze the logs") is False
+    def test_true_when_current_composer_adds_message(self):
+        assert self._visible_in_current_composer("❯ Analyze the logs now", "Analyze the logs")
+
+    def test_false_when_current_viewport_does_not_add_message(self):
+        assert not self._visible_in_current_composer("❯ (empty prompt)", "Analyze the logs")
+
+    def test_current_composer_capture_delegates_plain_viewport_to_provider(self):
+        backend = MagicMock()
+        backend.get_history.return_value = "old history\n› Analyze the logs carefully"
+        provider = MagicMock()
+        provider.extract_current_composer.return_value = "› Analyze the logs carefully"
+        with (
+            patch.object(
+                ts,
+                "get_terminal_metadata",
+                return_value={"tmux_session": "session", "tmux_window": "window"},
+            ),
+            patch.object(ts, "get_backend", return_value=backend),
+            patch.object(ts, "provider_manager") as manager,
+        ):
+            manager.get_provider.return_value = provider
+            assert ts._capture_current_composer_region("t1") == "› Analyze the logs carefully"
+        backend.get_history.assert_called_once_with(
+            "session", "window", strip_escapes=True, visible_only=True
+        )
+        provider.extract_current_composer.assert_called_once_with(
+            "old history\n› Analyze the logs carefully"
+        )
+
+    def test_send_input_does_not_retain_a_viewport_before_paste(self):
+        events = []
+        backend = MagicMock()
+        backend.send_keys.side_effect = lambda *args, **kwargs: events.append("paste")
+        with (
+            patch.object(
+                ts,
+                "get_terminal_metadata",
+                return_value={"tmux_session": "session", "tmux_window": "window"},
+            ),
+            patch.object(ts, "provider_manager") as manager,
+            patch.object(ts, "inject_memory_context", return_value="Analyze the logs"),
+            patch.object(ts.status_monitor, "notify_input_sent"),
+            patch.object(ts.status_monitor, "clear_rolling_buffer"),
+            patch.object(ts, "get_backend", return_value=backend),
+            patch.object(ts, "update_last_active"),
+        ):
+            manager.get_provider.return_value = None
+            assert ts.send_input("t1", "Analyze the logs")
+        assert events == ["paste"]
 
     def test_false_when_message_too_short(self):
-        # < 8 alnum chars → don't risk a blank submit; report not-shown.
-        with patch.object(ts, "get_output", return_value="go go go") as mock_out:
+        with patch.object(ts, "_capture_current_composer_region") as capture:
             assert ts._message_visible_in_box("t1", "go") is False
-            mock_out.assert_not_called()
+            capture.assert_not_called()
 
     def test_false_when_output_fetch_raises(self):
-        with patch.object(ts, "get_output", side_effect=Exception("boom")):
-            assert ts._message_visible_in_box("t1", "Analyze the logs") is False
+        assert not self._visible_in_current_composer(None, "Analyze the logs")
+
+    def test_current_composer_capture_rejects_provider_without_composer_contract(self):
+        backend = MagicMock()
+        backend.get_history.return_value = "› Analyze the logs"
+        provider = MagicMock()
+        provider.extract_current_composer.return_value = None
+        with (
+            patch.object(
+                ts,
+                "get_terminal_metadata",
+                return_value={"tmux_session": "session", "tmux_window": "window"},
+            ),
+            patch.object(ts, "get_backend", return_value=backend),
+            patch.object(ts, "provider_manager") as manager,
+        ):
+            manager.get_provider.return_value = provider
+            assert ts._capture_current_composer_region("t1") is None
 
     def test_match_survives_wrapping_and_whitespace(self):
-        # Rendered box wraps the text across lines / pads with spaces.
-        with patch.object(ts, "get_output", return_value="❯ Analyze the\n  logs carefully"):
-            assert ts._message_visible_in_box("t1", "Analyze the logs") is True
+        assert self._visible_in_current_composer(
+            "❯ Analyze the\n  logs carefully", "Analyze the logs"
+        )
+
+    def test_current_composer_tail_handles_wrapping_and_unicode(self):
+        message = "Analyze the logs carefully and preserve the current composer message tail"
+        tail = ts._normalized_box_text(message)[-ts._CURRENT_COMPOSER_PROBE_MAX_CHARS :]
+        with patch.object(
+            ts, "_capture_current_composer_region", return_value=f"› {tail[:24]}\n{tail[24:]}"
+        ):
+            assert ts._message_visible_in_box("t1", message)
+
+
+class TestRedeliverDroppedMessageHelper:
+    """The shared one-attempt helper: a caller without a provider instance
+    (the synchronous step path, #562) gets it resolved from the registry,
+    best-effort — a resolution failure means no probe, never a lost
+    redelivery."""
+
+    def test_resolves_provider_from_registry_for_direct_probe(self):
+        # Provider without explicit pass + direct probe True → started, no send.
+        provider = MagicMock(supports_direct_status_probe=True)
+        with (
+            patch.object(ts, "provider_manager") as mgr,
+            patch.object(ts, "_worker_is_started_direct", return_value=True) as probe,
+            patch.object(ts, "send_special_key") as key,
+            patch.object(ts, "send_input") as send,
+        ):
+            mgr.get_provider.return_value = provider
+            started = ts.redeliver_dropped_message("t1", "Analyze the logs", 1)
+        assert started is True
+        mgr.get_provider.assert_called_once_with("t1")
+        probe.assert_called_once_with("t1", provider)
+        key.assert_not_called()
+        send.assert_not_called()
+
+    def test_provider_resolution_failure_falls_through_to_box_check(self):
+        # Registry blowup must not lose the redelivery — box check still runs.
+        with (
+            patch.object(ts, "provider_manager") as mgr,
+            patch.object(ts, "_message_visible_in_box", return_value=True) as box,
+            patch.object(ts, "send_special_key") as key,
+            patch.object(ts, "send_input") as send,
+        ):
+            mgr.get_provider.side_effect = ValueError("Terminal t1 not found")
+            started = ts.redeliver_dropped_message("t1", "Analyze the logs", 1)
+        assert started is False
+        box.assert_called_once_with("t1", "Analyze the logs")
+        key.assert_called_once_with("t1", "Enter")
+        send.assert_not_called()
+
+    def test_gate_on_probe_capable_still_full_resends_when_box_empty(self):
+        # Gated step path: probe ran and said not-started, text absent → the
+        # probe ruled out a working worker, so the full re-send is safe.
+        provider = MagicMock(supports_direct_status_probe=True)
+        with (
+            patch.object(ts, "_worker_is_started_direct", return_value=False),
+            patch.object(ts, "_message_visible_in_box", return_value=False),
+            patch.object(ts, "send_special_key") as key,
+            patch.object(ts, "send_input") as send,
+        ):
+            started = ts.redeliver_dropped_message(
+                "t1", "Analyze the logs", 1, provider, full_resend_requires_probe=True
+            )
+        assert started is False
+        key.assert_not_called()
+        send.assert_called_once()
+
+    def test_gate_on_skips_full_resend_without_probe(self):
+        # Gated step path + non-probe provider + text absent: cannot tell
+        # "paste dropped" from "worker running, prompt scrolled off" — the
+        # full re-send would risk a duplicate task, so nothing is sent.
+        provider = MagicMock(supports_direct_status_probe=False)
+        with (
+            patch.object(ts, "_worker_is_started_direct") as probe,
+            patch.object(ts, "_message_visible_in_box", return_value=False),
+            patch.object(ts, "send_special_key") as key,
+            patch.object(ts, "send_input") as send,
+        ):
+            started = ts.redeliver_dropped_message(
+                "t1", "Analyze the logs", 1, provider, full_resend_requires_probe=True
+            )
+        assert started is False
+        probe.assert_not_called()
+        key.assert_not_called()
+        send.assert_not_called()
+
+    def test_gate_on_still_sends_bare_enter_without_probe(self):
+        # Gated step path + non-probe provider + text VISIBLE: a bare Enter
+        # cannot duplicate a task, so the Enter-swallowed recovery survives
+        # the gate.
+        provider = MagicMock(supports_direct_status_probe=False)
+        with (
+            patch.object(ts, "_message_visible_in_box", return_value=True),
+            patch.object(ts, "send_special_key") as key,
+            patch.object(ts, "send_input") as send,
+        ):
+            started = ts.redeliver_dropped_message(
+                "t1", "Analyze the logs", 1, provider, full_resend_requires_probe=True
+            )
+        assert started is False
+        key.assert_called_once_with("t1", "Enter")
+        send.assert_not_called()
+
+    def test_gate_off_default_keeps_deferred_init_behavior(self):
+        # Deferred-init path (default): non-probe provider + text absent →
+        # full re-send, exactly as before the helper was extracted.
+        provider = MagicMock(supports_direct_status_probe=False)
+        with (
+            patch.object(ts, "_message_visible_in_box", return_value=False),
+            patch.object(ts, "send_special_key") as key,
+            patch.object(ts, "send_input") as send,
+        ):
+            started = ts.redeliver_dropped_message("t1", "Analyze the logs", 1, provider)
+        assert started is False
+        key.assert_not_called()
+        send.assert_called_once()
 
 
 @pytest.mark.asyncio

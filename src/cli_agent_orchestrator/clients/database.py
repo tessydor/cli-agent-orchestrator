@@ -5,7 +5,7 @@ import logging
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, Dict, List, NamedTuple, Optional, cast
 
 from sqlalchemy import (
     DDL,
@@ -21,6 +21,8 @@ from sqlalchemy import (
     UniqueConstraint,
     create_engine,
     event,
+    literal_column,
+    text,
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
@@ -74,6 +76,59 @@ class TerminalModel(Base):
     # literally named "metadata" per #432's design.
     metadata_json = Column("metadata", Text, nullable=True)
     last_active = Column(DateTime, default=datetime.now)
+
+    # ORDERING CONTRACT: the two session-scoped reads -- ``list_terminals_by_session``
+    # and ``list_terminals_in_sessions`` -- order by SQLite's implicit ``rowid``,
+    # so index 0 of a session's terminals is its OLDEST SURVIVING row.
+    # (``list_siblings_by_group_prefix`` also reads this table by session and is
+    # deliberately NOT ordered: its consumer matches on group prefixes and does
+    # not take a first element. Order it too if that ever changes.) Several consumers
+    # treat that as the session's conductor and one of them kills sessions on it.
+    # rowid is not declared above, so the dependency is invisible here. Three
+    # things break it SILENTLY:
+    #   * an ``INSERT OR REPLACE``/upsert against terminals -- a replace deletes
+    #     and re-inserts, so the row gets a NEW rowid and jumps to the end of its
+    #     session. Nothing does this today and
+    #     ``test_no_upsert_against_the_terminals_table`` fails the build if it
+    #     starts; use an UPDATE.
+    #   * writing ``rowid`` explicitly (``INSERT (rowid, ...) VALUES (-5, ...)``).
+    #   * giving ``id`` INTEGER affinity, which makes rowid an alias for it and
+    #     hands the order back to a random uuid.
+    # Declaring the table WITHOUT ROWID also breaks it but fails LOUDLY
+    # (``no such column: terminals.rowid``), as does reading it through
+    # ``aliased()`` or ``union()``.
+    #
+    # New rows sort after existing ones because SQLite assigns ``max(rowid)+1``
+    # among surviving rows -- so deleting rows recycles values but cannot reorder
+    # the ones still present. The exception is a table holding a row at
+    # 2**63-1, where SQLite picks random unused rowids and within-session order
+    # scrambles; unreachable without an explicit rowid write.
+    #
+    # Deliberately NOT a ``created_at`` column: rowid already records insertion
+    # order exactly and correctly for every row in every existing database,
+    # whereas a new column has to invent the value for rows that predate it, and
+    # there is no honest source for it -- ``last_active`` is written only on
+    # input delivery (send_input/send_special_key), so it is LATEST for the
+    # busiest terminal, which is usually the conductor, and backfilling from it
+    # inverts the very order this contract exists to preserve.
+    #
+    # Deliberately NOT ``caller_id`` either, and this one was priced rather than
+    # dismissed. A conductor created through ``create_session`` records no
+    # caller while an MCP-spawned worker records its supervisor, so
+    # ``caller_id IS NOT NULL`` looks like root-terminal identity. On its own it
+    # is not total -- ``caller_id`` is an optional parameter of the agent-step
+    # create path, so a root carrying an explicit caller would be outranked by a
+    # later terminal without one. It CAN be made total by also requiring the
+    # parent to be in the same session (a correlated ``EXISTS`` on
+    # ``tmux_session``, which is immutable after insert, so a root's caller can
+    # never be in its own session). Measured, that costs ~+29% on this read
+    # (50 sessions over 5k rows: 9.0ms -> 11.6ms) and couples the conductor pick
+    # to referential integrity nothing enforces -- there is no FK on
+    # ``caller_id`` and ghost terminals are deleted in three places, so a
+    # deleted root leaves every worker's caller dangling. Rejected on that cost
+    # and coupling, for a hazard the upsert guard above already turns into a red
+    # build. ``caller_id`` is still the right thing to read for a specific
+    # terminal's spawn parent; it is not worth its price as a sort key.
 
 
 class InboxModel(Base):
@@ -340,6 +395,18 @@ class MemoryMetadataModel(Base):
 
     __table_args__ = (
         UniqueConstraint("key", "scope", "scope_id", name="uq_memory_key_scope"),
+        # Same NULL-distinctness the sentinel comment below documents for
+        # ``memory_relationships``: ``uq_memory_key_scope`` never fires for
+        # global/federated rows because SQLite treats ``NULL != NULL`` in a
+        # UNIQUE index. This partial index covers exactly those rows
+        # (issue #657). Existing DBs get it from ``_migrate_memory_scope_null_uniqueness``.
+        Index(
+            "uq_memory_key_scope_null",
+            "key",
+            "scope",
+            unique=True,
+            sqlite_where=text("scope_id IS NULL"),
+        ),
         CheckConstraint(
             "related_keys IS NULL OR length(related_keys) < 1024",
             name="ck_related_keys_length",
@@ -495,6 +562,49 @@ class FlowModel(Base):
     enabled = Column(Boolean, default=True)
 
 
+class IdempotencyKeyModel(Base):
+    """Maps a caller-supplied idempotency key to the terminal it created.
+
+    Review on PR #634, issue #616: a caller that retries the same logical
+    create-terminal request (e.g. ``cao agent handoff`` killed after the
+    server committed a terminal but before the HTTP response reached the
+    client) supplies the SAME key on retry. ``create_terminal`` looks it up
+    BEFORE doing any real work (tmux window, provider process) and returns
+    the terminal that key already produced instead of creating a second one.
+
+    ``key`` is the primary key (not just unique) specifically so a second
+    ``INSERT`` for an already-claimed key raises ``IntegrityError`` at
+    ``commit()`` time rather than silently overwriting the first mapping --
+    the row is written once, by whichever caller's transaction commits
+    first (see ``create_terminal``'s own docs for what happens to the loser
+    of that rare race).
+    """
+
+    __tablename__ = "idempotency_keys"
+
+    key = Column(String, primary_key=True)
+    terminal_id = Column(String, nullable=False)
+    # sha256 hexdigest of the REQUESTED create fields (review on PR #634).
+    # Without it a key means only "some earlier call anywhere on this server
+    # used this string", not "this is a retry of THIS request" -- so a second
+    # caller reusing a common key (`retry`, `job-1`) was handed the first
+    # caller's terminal, and `_handoff_impl` then delivered its prompt into
+    # someone else's running worker. `terminal_service._request_fingerprint`
+    # owns the computation; see its docstring for why REQUESTED and not
+    # resolved values.
+    #
+    # `nullable=False` with NO default, deliberately: this column and this
+    # TABLE ship in the same create-table DDL (neither `idempotency_keys` nor
+    # `IdempotencyKeyModel` exists on main or in ANY released tag through
+    # v2.5.0), so no pre-existing database can hold a row without one and
+    # there is nothing to migrate. A blank fingerprint is therefore not a
+    # legacy row to tolerate -- it can only come from a scratch sqlite built
+    # from an earlier revision of this branch, whose fix is deleting the file.
+    # It is compared like any other value and simply mismatches, loudly.
+    request_fingerprint = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.now)
+
+
 def _ensure_db_dir() -> None:
     """Create the DB dir owner-only (0o700).
 
@@ -540,6 +650,12 @@ def init_db() -> None:
     # #504 also migrates, so registry order is immaterial — never reorder the
     # entries above.
     _migrate_memory_relationships()
+    # Appended LAST (issue #583 Bolt 2, ``approval-store``). Disjoint from every table above —
+    # its own new table, no shared columns — so registry order is immaterial here too.
+    _migrate_workflow_plan_approval()
+    # Appended LAST (issue #657). Adds one partial index to memory_metadata;
+    # reads no other table, so registry order is immaterial here too.
+    _migrate_memory_scope_null_uniqueness()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -765,6 +881,159 @@ def _migrate_memory_relationships() -> None:
         logger.debug(f"memory_relationships migration skipped: {e}")
 
 
+def _migrate_workflow_plan_approval() -> None:
+    """Create the durable ``workflow_plan_approval`` table if missing (issue #583 Bolt 2, ``approval-store``).
+
+    FR-8's re-approval mechanism: one row per APPROVED PLAN, keyed by the ``plan_id`` that
+    ``plan_identifier.compute`` derives from a run's execution-affecting fields. A changed plan produces a
+    different ``plan_id``, finds no row, and is refused until it is approved in its own right.
+
+    ``plan_id`` IS THE PRIMARY KEY, so one-approval-per-plan is enforced by the database rather than by code
+    remembering to check. Combined with ``INSERT OR IGNORE`` in ``services/approval_store.py``, that makes an
+    approval WRITE-ONCE: a repeated grant cannot overwrite the original ``approved_at`` / ``approved_by``, and
+    there is no update path at all. That absence is deliberate and is the unit's central control — an update
+    would let an existing approval be pointed at a changed plan, so the row would read as approved while the
+    work behind it had never been reviewed.
+
+    KEYED BY PLAN, NOT BY RUN, and deliberately carrying NO foreign key to ``workflow_run``: an approval's
+    lifetime is independent of any run, so deleting a run must not be able to revoke one.
+
+    Idempotent, zero-arg, self-connecting; failure logged at debug and never propagated (B4-BR-1 / B4-RD-4),
+    same precedent as every migrator above. Because that failure is SILENT, the table's existence is VERIFIED
+    rather than assumed: see ``test/services/test_approval_store.py`` for the ``PRAGMA table_info`` assertion on
+    a fresh database. A missing table makes every approval lookup answer False, which refuses every run —
+    fail-closed, but diagnosed far from its cause.
+
+    NOT registered in ``workflow_journal``'s ``_REQUIRED_RUN_COLUMNS`` / ``_REQUIRED_STEP_COLUMNS``. That
+    verification is scoped to the columns the JOURNAL's own SQL reads, and this table is read by neither, so
+    coupling the journal's connection cache to it would be wrong. The consequence is that this table gets no
+    runtime self-healing the way ``manifest_json`` does; ``approval_store._connect`` runs this migrator on every
+    connect instead, so a transient failure is retried on the next operation.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS workflow_plan_approval ("
+                "plan_id TEXT PRIMARY KEY, "
+                "approved_at TEXT NOT NULL, "
+                "approved_by TEXT NOT NULL"
+                ")"
+            )
+    except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
+        logger.debug(f"workflow_plan_approval migration skipped: {e}")
+
+
+def _migrate_memory_scope_null_uniqueness(engine: Any = None, *, strict: bool = False) -> None:
+    """Create the partial unique index backing ``uq_memory_key_scope`` for
+    NULL ``scope_id`` rows (issue #657). Appended LAST to the ``init_db()``
+    registry.
+
+    SQLite treats ``NULL != NULL`` in a UNIQUE index, so the table-level
+    ``uq_memory_key_scope`` constraint has never fired for global/federated
+    memories (``MemoryService.resolve_scope_id`` persists a real NULL for
+    both — ``memory_metadata`` deliberately keeps the column nullable; the
+    sentinel used by ``memory_relationships`` is wrong here). This index
+    covers exactly those rows; non-NULL scopes stay on the table constraint.
+
+    Idempotent, self-connecting — mirrors the existing migrators. ``engine``
+    lets a caller bound the attempt to an existing SQLAlchemy engine (the
+    memory-repair path passes its own); the default resolves the singleton
+    ``DATABASE_FILE`` exactly like the other migrators. Fail-soft by design:
+    on a database that still holds duplicate NULL-scope rows,
+    ``CREATE UNIQUE INDEX`` raises ``IntegrityError``, so duplicates are
+    pre-scanned and the index is skipped with a warning pointing at
+    ``cao memory repair`` rather than blocking startup. The repair now
+    re-invokes this migrator once its dedupe has cleared the duplicates, so
+    the index lands in the same repair run instead of at the next startup.
+    ``strict=True`` (the explicit ``cao memory repair --apply`` path) makes
+    that re-invocation honest: DDL failure — e.g. a competing SQLite write
+    lock — propagates instead of being logged at debug, and the named index
+    is verified present before returning, so repair can no longer report
+    success while the index is absent; the startup default stays fail-soft.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    target = str(DATABASE_FILE)
+    try:
+        if engine is not None:
+            # Reuse the caller's engine connection pool so the attempt and the
+            # repairs share one database identity.
+            with engine.connect() as conn:
+                index_rows = conn.exec_driver_sql(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'index' AND name = 'uq_memory_key_scope_null'"
+                ).fetchall()
+                if index_rows:
+                    return
+                duplicates = conn.exec_driver_sql(
+                    "SELECT key, scope, COUNT(*) FROM memory_metadata "
+                    "WHERE scope_id IS NULL GROUP BY key, scope HAVING COUNT(*) > 1"
+                ).fetchall()
+                if duplicates:
+                    rendered = ", ".join(
+                        f"{scope}:{key}x{count}" for key, scope, count in duplicates
+                    )
+                    logger.warning(
+                        "Skipping uq_memory_key_scope_null creation: duplicate global/federated "
+                        f"rows in memory_metadata ({rendered}). Run `cao memory repair` to "
+                        "reconcile them; the unique index is created on the next startup."
+                    )
+                    return
+                conn.exec_driver_sql(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_key_scope_null "
+                    "ON memory_metadata (key, scope) WHERE scope_id IS NULL"
+                )
+                conn.commit()
+                if strict:
+                    created = conn.exec_driver_sql(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type = 'index' AND name = 'uq_memory_key_scope_null'"
+                    ).fetchall()
+                    if not created:
+                        raise RuntimeError(
+                            "uq_memory_key_scope_null creation reported success but the "
+                            "index is absent from sqlite_master"
+                        )
+            return
+        with sqlite3.connect(target) as conn:
+            duplicates = conn.execute(
+                "SELECT key, scope, COUNT(*) FROM memory_metadata "
+                "WHERE scope_id IS NULL GROUP BY key, scope HAVING COUNT(*) > 1"
+            ).fetchall()
+            if duplicates:
+                rendered = ", ".join(f"{scope}:{key}x{count}" for key, scope, count in duplicates)
+                logger.warning(
+                    "Skipping uq_memory_key_scope_null creation: duplicate global/federated "
+                    f"rows in memory_metadata ({rendered}). Run `cao memory repair` to "
+                    "reconcile them; the unique index is created on the next startup."
+                )
+                return
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_key_scope_null "
+                "ON memory_metadata (key, scope) WHERE scope_id IS NULL"
+            )
+            if strict:
+                created = conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'index' AND name = 'uq_memory_key_scope_null'"
+                ).fetchall()
+                if not created:
+                    raise RuntimeError(
+                        "uq_memory_key_scope_null creation reported success but the "
+                        "index is absent from sqlite_master"
+                    )
+    except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug
+        if strict:
+            raise
+        logger.debug(f"memory scope NULL uniqueness migration skipped: {e}")
+
+
 def _backfill_legacy_related_keys(conn: Any) -> None:
     """One-time, idempotent backfill of ``memory_metadata.related_keys`` into
     ``memory_relationships`` as ``type=relates_to, origin=legacy_related_keys,
@@ -957,6 +1226,28 @@ def _migrate_workflow_run() -> None:
     rows back-fill to ``tier='yaml'``, ``generation='1'``. ``generation`` is TEXT,
     not INTEGER, so it compares byte-identically against the env-var-transported
     string generation value (domain-entities B4 fix).
+
+    ``manifest-column`` (issue #583 Bolt 2, ADR-583-12) additively appends ONE
+    column, ``manifest_json``, through the same PRAGMA-gated idiom — the frozen
+    execution manifest envelope, carrying source hash, inputs, repository and
+    worktree baseline, provider, model, profile, permissions, limits, retry
+    policy, the resolved-memory record, and the ``plan_id`` derived from them.
+    ``DEFAULT NULL`` means "manifest absent", which every pre-Bolt-2 row is, so
+    such a row reads back observably identical to its pre-extension form
+    (INV-1/INV-2) and no back-fill is attempted — a manifest records how a run was
+    LAUNCHED, which is not recoverable for a run that already started.
+
+    Because this body's failure is silent (see the ``except`` below), the column's
+    existence is VERIFIED rather than assumed: ``test_workflow_run_columns`` in
+    ``test/clients/test_workflow_run_migration.py`` asserts it on a fresh database,
+    with its TEXT type and NULL default. A silent failure would otherwise surface
+    far from its cause, as every run losing its manifest — which the Bolt 2
+    approval gate reads as "never approved" and refuses. That direction is
+    fail-closed, but the diagnosis is still remote, hence the assertion.
+
+    This column is NOT indexed (ADR-583-12: re-approval compares a ``plan_id``
+    read out of the envelope and no query filters on it). Writing and reading it
+    belong to the ``manifest-freeze`` unit, not to this migrator.
     """
     import sqlite3
 
@@ -987,6 +1278,9 @@ def _migrate_workflow_run() -> None:
                     "ALTER TABLE workflow_run ADD COLUMN generation TEXT NOT NULL DEFAULT '1'"
                 )
                 logger.info("Migration: added generation column to workflow_run")
+            if "manifest_json" not in columns:
+                conn.execute("ALTER TABLE workflow_run ADD COLUMN manifest_json TEXT DEFAULT NULL")
+                logger.info("Migration: added manifest_json column to workflow_run")
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
         logger.debug(f"workflow_run migration skipped: {e}")
 
@@ -1016,6 +1310,44 @@ def _migrate_workflow_run_step() -> None:
     ``error_kind`` (structured error kind). All default to ``NULL`` so a
     pre-U1 row reads back observably identical to its pre-extension form
     (additive-only, C-1/C-4). ``workflow_run`` itself is untouched.
+
+    ``result-envelope`` (issue #583, BR-7) then additively appends ONE column,
+    ``result_json``, through the same gate — the serialised ``StepResultEnvelope``
+    that replay returns (FR-1). ``DEFAULT NULL`` means every pre-#583 row reads as
+    "envelope absent" (BR-10), which is safe rather than a gap: such a row's
+    fingerprint is legacy-scheme or NULL, so FR-6 already keeps it off the replay
+    path and the two guards agree instead of disagreeing.
+
+    Because the failure is silent, the column's existence is VERIFIED rather than
+    assumed (BR-8): see ``test/services/test_step_result.py`` for the
+    ``PRAGMA table_info`` assertion on a fresh database. A silent failure would
+    otherwise surface far away as every settle losing its envelope, which the
+    replay gate would read as crash-window rows and halt on.
+
+    MERGE NOTE (2026-08-17, #583 x #504). #583's original rationale for adding ONE
+    column rather than three read: "three statements would triple the chance of a
+    partial, silent migration", because this body is wrapped in
+    ``except Exception`` -> ``logger.debug``. **That argument is overtaken by the
+    merge** — #504 independently added three columns to the same silently-failing
+    block, so the combined body now issues FOUR guarded ``ALTER`` statements, not
+    one. The risk #583 minimised is materially larger than either change assumed
+    alone. #583's mitigation (assert the column exists on a fresh database) is
+    therefore MORE load-bearing after this merge. Flagged rather than silently
+    reconciled.
+
+    CORRECTION (2026-08-18, issue #583 Bolt 2, unit ``manifest-column``). The
+    sentence above previously ended by claiming that "#504's three columns have no
+    equivalent assertion". **That claim was false and has been removed.** All three
+    ARE asserted, in ``test/clients/test_workflow_run_migration.py``: ``terminal_id``,
+    ``reprompted`` and ``error_kind`` appear in ``test_workflow_run_step_columns``'s
+    exact ``set(cols) == {...}`` column set, and each carries a nullable check
+    (``[3] == 0``) plus a default check (``[4] == "NULL"``) in the same test. The
+    locations are named here so the denial cannot rot back: a reader who believed it
+    would add a duplicate assertion to close a gap that does not exist. What DOES
+    survive from the note above is the crowding itself — four guarded ``ALTER``
+    statements under one silent ``except`` is a real and growing risk, and adopting a
+    migration framework for it is recorded as a candidate decision (out of scope for
+    a single additive column).
     """
     import sqlite3
 
@@ -1056,6 +1388,11 @@ def _migrate_workflow_run_step() -> None:
                     "ALTER TABLE workflow_run_step ADD COLUMN error_kind TEXT DEFAULT NULL"
                 )
                 logger.info("Migration: added error_kind column to workflow_run_step")
+            if "result_json" not in columns:
+                conn.execute(
+                    "ALTER TABLE workflow_run_step ADD COLUMN result_json TEXT DEFAULT NULL"
+                )
+                logger.info("Migration: added result_json column to workflow_run_step")
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
         logger.debug(f"workflow_run_step migration skipped: {e}")
 
@@ -1383,6 +1720,8 @@ def create_terminal(
     working_directory: Optional[str] = None,
     assignment_id: Optional[str] = None,
     completion_id: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+    request_fingerprint: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata and, when supplied, its assignment atomically.
 
@@ -1428,6 +1767,20 @@ def create_terminal(
                     receiver_state=CompletionReceiverState.UNKNOWN.value,
                 )
             )
+        if idempotency_key:
+            # `or ""` keeps this insert in the SAME transaction as the terminal
+            # row (the property haofeif approved) without a nullable column: a
+            # caller that supplies a key but no fingerprint stores a blank one,
+            # which every later comparison simply mismatches. Failing loud beats
+            # a skip-on-blank branch that would silently hand back a terminal
+            # nobody verified.
+            db.add(
+                IdempotencyKeyModel(
+                    key=idempotency_key,
+                    terminal_id=terminal_id,
+                    request_fingerprint=request_fingerprint or "",
+                )
+            )
         db.commit()
         return {
             "id": terminal.id,
@@ -1449,6 +1802,73 @@ def create_terminal(
             "group": group if group else None,
             "metadata": metadata if metadata else None,
         }
+
+
+class IdempotencyRecord(NamedTuple):
+    """A key's stored mapping: which terminal, and for WHICH request."""
+
+    terminal_id: str
+    request_fingerprint: str
+
+
+def get_idempotency_record(key: str) -> Optional[IdempotencyRecord]:
+    """Return the full mapping for ``key``, or ``None`` if never used.
+
+    Review on PR #634, issue #616. A plain read, no locking: the caller
+    (``terminal_service.create_terminal``) uses this to decide whether to do
+    any real work at all, before generating a terminal id or touching tmux.
+
+    Returns the fingerprint together with the terminal id in ONE read, so the
+    caller can tell a genuine retry (same key, same request) from a key
+    COLLISION (same key, different request) rather than returning a terminal
+    that answers a question this caller never asked. This deliberately
+    REPLACES an earlier ``get_terminal_id_by_idempotency_key`` that returned
+    the id alone (review on PR #634): keeping a fingerprint-BLIND public
+    lookup beside this one would invite a future caller to reintroduce exactly
+    the bug class the fingerprint exists to close.
+    """
+    with SessionLocal() as db:
+        row = db.query(IdempotencyKeyModel).filter(IdempotencyKeyModel.key == key).first()
+        if row is None:
+            return None
+        return IdempotencyRecord(
+            terminal_id=cast(str, row.terminal_id),
+            request_fingerprint=cast(str, row.request_fingerprint),
+        )
+
+
+def delete_idempotency_key(key: str, expected_terminal_id: str) -> bool:
+    """Delete an idempotency-key mapping, but only if it still points to
+    ``expected_terminal_id``.
+
+    Review on PR #634, issue #616: ``create_terminal``'s fallthrough
+    for a mapping whose terminal no longer exists must clear this row FIRST.
+    ``delete_terminal`` does not cascade to ``idempotency_keys``, so leaving
+    a stale row in place would make the replacement terminal's own
+    idempotency insert collide on the same primary key and raise
+    ``IntegrityError``.
+
+    The ``expected_terminal_id`` guard is a compare-and-delete: if a
+    concurrent caller already replaced this mapping (it now points to
+    SOME OTHER terminal), this deletes nothing and this caller's own
+    create falls through to the normal atomic insert below, which then
+    correctly raises ``IntegrityError`` for the loser -- the same
+    already-accepted race behavior as two concurrent callers sharing a
+    brand-new key. Without this guard, an unconditional delete-by-key
+    could silently erase a concurrent winner's fresh, valid mapping
+    instead.
+    """
+    with SessionLocal() as db:
+        deleted = (
+            db.query(IdempotencyKeyModel)
+            .filter(
+                IdempotencyKeyModel.key == key,
+                IdempotencyKeyModel.terminal_id == expected_terminal_id,
+            )
+            .delete()
+        )
+        db.commit()
+        return deleted > 0
 
 
 def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
@@ -1631,9 +2051,56 @@ def list_siblings_by_group_prefix(
 
 
 def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
-    """List all terminals in a tmux session."""
+    """List a tmux session's terminals, oldest first.
+
+    **Index 0 is the session's oldest surviving terminal -- normally its
+    conductor.** That is a contract, not an accident of the query plan:
+    ``flow_service`` decides whether to kill a session by whether index 0 is
+    busy, ``cao session status``/``list`` label index 0 as the Conductor over
+    HTTP, and ``session_service`` derives a session's reported profile and
+    directory from the earliest terminal that HAS either (#497) -- a first-match
+    scan rather than a bare index, so a conductor row with both fields NULL
+    still cedes ownership to a worker. Callers should cite this docstring rather
+    than restate the rule.
+
+    Ordered by ``rowid``, which is insertion order, and normally creation order:
+    every row is written at one site (``db_create_terminal``, called from
+    ``terminal_service.create_terminal``), and a worker's row cannot precede its
+    conductor's because the MCP handoff either resolves a caller that already
+    has a row (``GET /terminals/{caller_id}``, which raises if the id is stale)
+    or, when it is running outside a CAO terminal, records no caller at all and
+    starts a NEW session in which the worker is itself the conductor. Reuse
+    after deletion does not reorder surviving rows -- see ``TerminalModel`` for
+    the mechanism and its limits.
+
+    Two known gaps, both pre-existing and neither introduced here:
+
+    * ``session_lifecycle_lock`` serialises creation against teardown, but it is
+      a ``threading.Lock`` and therefore per-PROCESS. ``cao schedule run`` calls
+      ``execute_flow`` in the CLI process, and ``flow_service`` does not take the
+      lock at all, so its kill-and-recreate is not serialised against cao-server.
+      A worker insert landing inside that window can take index 0.
+    * Index 0 is the oldest SURVIVING row, which is not the conductor once the
+      conductor's own row is gone -- ``DELETE /terminals/{id}`` has no guard, the
+      MCP tool exposes it, and ghost-terminal cleanup deletes rows while the
+      session lives on.
+
+    Both mean consumers should treat index 0 as best-effort, which is what
+    ``_enrich_session_ownership`` already does. The ordering is what makes it
+    *predictable*; it does not make it an identity.
+
+    This ORDER BY does not change what this function returned before it was
+    added -- an unordered scan of a rowid table already yielded rowid order.
+    It states the order instead of inheriting it, so an index added later
+    cannot quietly change which terminal is the conductor.
+    """
     with SessionLocal() as db:
-        terminals = db.query(TerminalModel).filter(TerminalModel.tmux_session == tmux_session).all()
+        terminals = (
+            db.query(TerminalModel)
+            .filter(TerminalModel.tmux_session == tmux_session)
+            .order_by(literal_column("terminals.rowid"))
+            .all()
+        )
         return [
             {
                 "id": t.id,
@@ -1669,6 +2136,64 @@ def update_terminal_shell_command(terminal_id: str, shell_command: str) -> bool:
             db.commit()
             return True
         return False
+
+
+def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]:
+    """List terminals for several tmux sessions in one query.
+
+    Exists so ``list_sessions`` can enrich N sessions without N queries (issue
+    #629) while still reading only the rows it will use. ``list_all_terminals``
+    would also collapse the query count, but its cost scales with the whole
+    table — including rows for sessions tmux no longer reports, which accumulate
+    because ``cleanup_service.cleanup_old_data`` only runs at server startup, so
+    a long-uptime server never sweeps them. Bounding the read by the live
+    session names keeps the cost proportional to the workload instead of to the
+    leak.
+
+    Ordered by ``rowid``, identically to ``list_terminals_by_session`` -- see
+    that function for the index-0-is-the-conductor contract and why rowid
+    expresses creation order. The two MUST order the same way: the caller picks
+    a session's "first known terminal", so the pick is order-sensitive, and an
+    ordered batched read beside an unordered per-session read is what let this
+    function silently disagree with the one it replaced.
+
+    The ORDER BY is not decoration. Without it the order is whatever the engine
+    plans: today every plan is a rowid scan (there is no index on
+    ``tmux_session``), but adding one -- the obvious reaction to a slow
+    per-session lookup -- reorders the probe. Measured, a plain ASC index on
+    ``(tmux_session, id)`` makes an unordered read return a worker ahead of the
+    session creator; ordering here is what keeps the conductor first.
+
+    Ordering by ``id`` would NOT do that: ``id`` is ``uuid4().hex[:8]``
+    (utils/terminal.generate_terminal_id), so it makes the conductor a
+    deterministic *random* terminal, and a session whose creator happens to sort
+    above one of its own workers advertises the worker's profile and directory as
+    the session's.
+
+    Returns an empty list without querying when given no session names.
+    """
+    if not tmux_sessions:
+        return []
+    with SessionLocal() as db:
+        terminals = (
+            db.query(TerminalModel)
+            .filter(TerminalModel.tmux_session.in_(tmux_sessions))
+            .order_by(literal_column("terminals.rowid"))
+            .all()
+        )
+        return [
+            {
+                "id": t.id,
+                "tmux_session": t.tmux_session,
+                "tmux_window": t.tmux_window,
+                "provider": t.provider,
+                "agent_profile": t.agent_profile,
+                "working_directory": t.working_directory,
+                "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
+                "last_active": t.last_active,
+            }
+            for t in terminals
+        ]
 
 
 def list_all_terminals() -> List[Dict[str, Any]]:
@@ -3314,3 +3839,8 @@ def get_flows_to_run() -> List[Flow]:
             )
             for f in flows
         ]
+
+
+def delete_terminals_by_ids(terminal_ids: List[str]) -> int:
+    """Delete only named rows through the shared callback-preservation guard."""
+    return sum(bool(delete_terminal(terminal_id)) for terminal_id in terminal_ids)

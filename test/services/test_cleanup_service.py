@@ -60,7 +60,12 @@ class TestCleanupOldData:
         old_terminal_query = MagicMock()
         linked_callback_query = MagicMock()
         inbox_query = MagicMock()
-        mock_db.query.side_effect = [old_terminal_query, linked_callback_query, inbox_query]
+        mock_db.query.side_effect = [
+            old_terminal_query,
+            linked_callback_query,
+            inbox_query,
+            MagicMock(),
+        ]
         old_terminal_query.filter.return_value.all.return_value = [("retained-grok",)]
         inbox_query.filter.return_value.delete.return_value = 0
         mock_log_dir.exists.return_value = False
@@ -97,6 +102,7 @@ class TestCleanupOldData:
         # Verify cleanup was called:
         # Session 1: query.all() for terminal iteration + query.delete() for terminal deletion
         # Session 2: query.delete() for inbox deletion
+        # Session 3: query.delete() for idempotency-key deletion
         assert mock_db.query.call_count >= 2
         assert mock_db.commit.call_count >= 1
 

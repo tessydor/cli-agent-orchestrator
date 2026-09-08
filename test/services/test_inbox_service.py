@@ -246,6 +246,25 @@ class TestDeliverPending:
         fakes.resolve.assert_called_once_with(1, ANY, MessageStatus.DELIVERED)
         fakes.is_callback.assert_not_called()
 
+    def test_concurrent_delivery_for_one_terminal_sends_exactly_once(self, inbox_db, monkeypatch):
+        caller, message = _create_delivery_row(False)
+        monkeypatch.setattr(inbox_mod.status_monitor, "get_status", lambda _id: TerminalStatus.IDLE)
+        send = MagicMock()
+        monkeypatch.setattr(inbox_mod.terminal_service, "send_input", send)
+        service = InboxService()
+        start = Barrier(2)
+
+        def race():
+            start.wait(timeout=5)
+            service.deliver_pending(caller)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(race) for _ in range(2)]
+            for future in futures:
+                future.result(timeout=10)
+        send.assert_called_once()
+        assert db.get_inbox_messages(caller, limit=10)[0].status == MessageStatus.DELIVERED
+
 
 class TestEagerInboxDelivery:
     @pytest.mark.parametrize(
@@ -329,7 +348,7 @@ def test_concurrent_delivery_has_one_durable_paste(inbox_db, monkeypatch, server
     monkeypatch.setattr(inbox_mod.terminal_service, "send_input", record_paste)
     service = InboxService()
     with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [executor.submit(service.deliver_pending, caller) for _ in range(2)]
+        futures = [executor.submit(InboxService().deliver_pending, caller) for _ in range(2)]
         for future in futures:
             future.result(timeout=5)
 
