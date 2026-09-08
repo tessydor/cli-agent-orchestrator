@@ -75,7 +75,7 @@ def test_ordinary_claude_terminal_remains_interactive() -> None:
     assert "claude_completion_launcher" not in " ".join(argv)
     assert "--print" not in argv
     assert "--input-format" not in argv
-    assert provider.paste_enter_count == 2
+    assert provider.paste_enter_count == 1
     assert provider.force_bracketed_paste is True
 
 
