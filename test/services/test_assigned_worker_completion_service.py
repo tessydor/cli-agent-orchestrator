@@ -1824,3 +1824,78 @@ def test_failure_notice_retries_database_enqueue_without_restarting_worker(
     monkeypatch.setattr(completion_mod, "create_inbox_message", original)
     service.reconcile_worker(worker)
     assert len([m for m in _messages(caller) if m.origin == InboxMessageOrigin.SYSTEM]) == 1
+
+
+def test_native_refusal_hook_reaches_caller_once(callback_db, ids, monkeypatch, tmp_path):
+    from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+    from cli_agent_orchestrator.services import claude_native_completion as native
+
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    completion_id = "a" * 32
+    db.create_terminal(
+        worker,
+        "cao-test",
+        "worker",
+        "claude_code",
+        caller_id=caller,
+        assignment_id="native-assignment",
+        completion_id=completion_id,
+    )
+    db.mark_assigned_worker_dispatched(worker)
+    monkeypatch.setattr(report_mod, "PROVIDER_COMPLETION_REPORT_DIR", tmp_path / "reports")
+    native.configure_native(worker, completion_id)
+    report_mod.bind_completion_dispatch("claude_code", worker, completion_id, "Task")
+    common = {
+        "session_id": report_mod.claude_session_id(worker, completion_id),
+        "prompt_id": "12345678-1234-4234-8234-123456789012",
+    }
+    native.ingest(
+        worker, completion_id, dict(common, hook_event_name="UserPromptSubmit", prompt="Task")
+    )
+    native.ingest(
+        worker,
+        completion_id,
+        dict(common, hook_event_name="Stop", last_assistant_message="I refuse this task."),
+    )
+    provider = ClaudeCodeProvider(worker, "cao-test", "worker", completion_id=completion_id)
+    monkeypatch.setattr(completion_mod.provider_manager, "get_provider", lambda _: provider)
+    service = AssignedWorkerCompletionService()
+    monkeypatch.setattr(
+        service, "_classify_receiver", lambda _: (CompletionReceiverState.ACTIVE, None)
+    )
+    monkeypatch.setattr(service, "_attempt_immediate_inbox_delivery", lambda _: None)
+    service.handle_status_event(worker, TerminalStatus.COMPLETED)
+    service.handle_status_event(worker, TerminalStatus.COMPLETED)
+    assert len(_messages(caller)) == 1
+    assert _messages(caller)[0].message.startswith("I refuse this task.")
+
+
+def test_native_question_wakes_brain_once_without_answering(callback_db, ids, monkeypatch):
+    from cli_agent_orchestrator.services import claude_question
+
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    db.create_terminal(
+        worker,
+        "cao-test",
+        "worker",
+        "claude_code",
+        caller_id=caller,
+        assignment_id="native-question",
+        completion_id="c" * 32,
+    )
+    db.mark_assigned_worker_dispatched(worker)
+    monkeypatch.setattr(
+        claude_question,
+        "_screen",
+        lambda *_: "Choose\n❯ 1. Small\n  2. Large\nEnter to select · ↑/↓ to navigate",
+    )
+    service = AssignedWorkerCompletionService()
+    monkeypatch.setattr(service, "_attempt_immediate_inbox_delivery", lambda _: None)
+    service.handle_status_event(worker, TerminalStatus.WAITING_USER_ANSWER)
+    service.handle_status_event(worker, TerminalStatus.WAITING_USER_ANSWER)
+    assert len(_messages(caller)) == 1
+    assert _messages(caller)[0].origin == InboxMessageOrigin.SYSTEM
+    assert "waiting for an answer" in _messages(caller)[0].message
+    assert db.get_assigned_worker_callback(worker).lifecycle == AssignmentLifecycle.DISPATCHED

@@ -287,12 +287,19 @@ class ClaudeCodeProvider(BaseProvider):
         # --model resolution below) -- e.g. a handoff/assign caller pinning a
         # specific model for one worker without needing a dedicated profile.
         self._model = model
-        # Only assigned workers receive this identity.  They use Claude's
-        # supported stream-json/ResultMessage path; ordinary operator-launched
-        # terminals retain the existing interactive TUI unchanged.
+        # Only assigned workers receive this identity. The persisted transport
+        # selects native hooks for new assignments and
+        # retains streaming for legacy assignments across server recovery.
         self._completion_id = completion_id
+        from cli_agent_orchestrator.services.claude_native_completion import is_native
+
+        self._native_completion = is_native(terminal_id, completion_id)
+        if self._native_completion and resume_session_id is not None:
+            raise ValueError("A new native assignment cannot resume a different conversation")
+        self._stream_completion = completion_id is not None and not self._native_completion
+
         self._completion_input_id: Optional[str] = None
-        self.supports_screen_detection = completion_id is None
+        self.supports_screen_detection = not self._stream_completion
         # Native-status dispatch tracking (_task_dispatched + flush-wait timers)
         # lives on BaseProvider and is consumed by _resolve_native_status().
         self._input_generation: int = 0
@@ -518,7 +525,7 @@ class ClaudeCodeProvider(BaseProvider):
             for tool in disallowed:
                 command_parts.extend(["--disallowedTools", tool])
 
-        if self._completion_id is not None:
+        if self._stream_completion:
             from cli_agent_orchestrator.services.provider_completion_report import (
                 claude_session_id,
             )
@@ -547,6 +554,33 @@ class ClaudeCodeProvider(BaseProvider):
                 "--",
                 *command_parts,
             ]
+
+        if self._native_completion:
+            from cli_agent_orchestrator.services.provider_completion_report import claude_session_id
+
+            hook_command = shlex.join(
+                [
+                    sys.executable,
+                    "-m",
+                    "cli_agent_orchestrator.services.claude_native_completion",
+                    "--terminal-id",
+                    self.terminal_id,
+                    "--completion-id",
+                    self._completion_id,
+                ]
+            )
+            hooks = {
+                event: [{"hooks": [{"type": "command", "command": hook_command, "timeout": 10}]}]
+                for event in ("UserPromptSubmit", "Stop", "StopFailure")
+            }
+            command_parts.extend(
+                [
+                    "--session-id",
+                    claude_session_id(self.terminal_id, self._completion_id),
+                    "--settings",
+                    json.dumps({"hooks": hooks}),
+                ]
+            )
 
         # Use shlex.join() for proper shell escaping of all arguments
         # This correctly handles multiline strings, quotes, and special characters
@@ -865,7 +899,7 @@ class ClaudeCodeProvider(BaseProvider):
         # Not exhaustive: wait_for_shell's own backend polling, _load_profile(),
         # and _build_claude_command's temp-file I/O above/below are still
         # loop-side -- tens of ms each, not the multi-second pileup #451 fixes.
-        if self._completion_id is None:
+        if not self._stream_completion:
             await asyncio.to_thread(self._ensure_skip_bypass_prompt_setting)
 
         # Build properly escaped command string
@@ -882,7 +916,7 @@ class ClaudeCodeProvider(BaseProvider):
             get_backend().send_keys, self.session_name, self.window_name, command
         )
 
-        if self._completion_id is not None:
+        if self._stream_completion:
             # Headless SDK mode skips both interactive startup dialogs.  Its
             # successful initialize control response is the positive
             # input-ready signal; waiting for TUI chrome here would time out by
@@ -965,7 +999,7 @@ class ClaudeCodeProvider(BaseProvider):
         Uses capture-pane (rendered screen) rather than the pipe-pane buffer:
         stability of the RENDERED output is the actual readiness signal.
         """
-        if self._completion_id is not None:
+        if self._stream_completion:
             return True
 
         poll = 0.5
@@ -1014,7 +1048,7 @@ class ClaudeCodeProvider(BaseProvider):
             claude_session_id,
         )
 
-        if self._completion_id is None:
+        if not self._stream_completion:
             return TerminalStatus.UNKNOWN
         expected_session_id = claude_session_id(self.terminal_id, self._completion_id)
         status = TerminalStatus.UNKNOWN
@@ -1096,13 +1130,18 @@ class ClaudeCodeProvider(BaseProvider):
 
         See: https://github.com/awslabs/cli-agent-orchestrator/issues/104
         """
+        if self._native_completion and self._initialized:
+            command = get_backend().get_pane_current_command(self.session_name, self.window_name)
+            if command in {"bash", "zsh", "sh", "fish", "dash"}:
+                return TerminalStatus.ERROR
+
         # Native status (herdr): when the backend knows agent state, trust it and
         # skip buffer reads. Tmux returns None -- falls through to buffer analysis.
         native = self._resolve_native_status(output)
         if native is not None:
             return native
 
-        if self._completion_id is not None:
+        if self._stream_completion:
             output = self._resolve_buffer(output)
             if not output:
                 return TerminalStatus.UNKNOWN
@@ -1383,6 +1422,10 @@ class ClaudeCodeProvider(BaseProvider):
         otherwise read as an idle prompt and declare the terminal ready before
         Claude's TUI has even rendered, breaking init (observed live).
         """
+        if self._native_completion and self._initialized:
+            command = get_backend().get_pane_current_command(self.session_name, self.window_name)
+            if command in {"bash", "zsh", "sh", "fish", "dash"}:
+                return TerminalStatus.ERROR
         rows = [ln.rstrip() for ln in screen_lines if ln.strip()]
         if not rows:
             return TerminalStatus.UNKNOWN
@@ -1465,7 +1508,7 @@ class ClaudeCodeProvider(BaseProvider):
 
     @property
     def paste_submit_delay(self) -> float:
-        if self._completion_id is not None:
+        if self._stream_completion:
             # SDK JSONL is line-delimited and has no Ink paste-settle phase.
             return 0.0
         # The newest Claude Code Ink TUI needs noticeably longer than the 0.3s
@@ -1479,11 +1522,11 @@ class ClaudeCodeProvider(BaseProvider):
     def force_bracketed_paste(self) -> bool:
         # The assigned stream consumes one-line JSONL, not a terminal editor.
         # Bracket markers would make the JSON record malformed.
-        return self._completion_id is None
+        return not self._stream_completion
 
     def encode_terminal_input(self, message: str, orchestration_type: str = "") -> str:
         """Encode assigned-worker input as a correlated Claude SDK user message."""
-        if self._completion_id is None:
+        if not self._stream_completion:
             return message
 
         from cli_agent_orchestrator.services.provider_completion_report import (
@@ -1550,7 +1593,7 @@ class ClaudeCodeProvider(BaseProvider):
         Uses tail-hash instead of raw length because the tmux sliding window
         is not monotonically growing.
         """
-        if self._completion_id is not None:
+        if self._stream_completion:
             self._input_generation += 1
             super().mark_input_received()
             return
@@ -1640,7 +1683,7 @@ class ClaudeCodeProvider(BaseProvider):
 
     def exit_cli(self) -> str:
         """Get the command to exit Claude Code."""
-        if self._completion_id is not None:
+        if self._stream_completion:
             return "C-d"
         return "/exit"
 

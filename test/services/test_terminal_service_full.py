@@ -81,6 +81,7 @@ class TestCreateTerminal:
         mock_tmux.create_session.assert_called_once()
         mock_provider.initialize.assert_called_once()
 
+    @pytest.mark.parametrize("provider_type", ["codex", "claude_code"])
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service._schedule_deferred_init")
@@ -108,10 +109,16 @@ class TestCreateTerminal:
         mock_status_monitor,
         mock_schedule_deferred_init,
         mock_delete_terminals_by_session,
+        provider_type,
+        tmp_path,
+        monkeypatch,
     ):
         """The real terminal layer sends the model to provider construction and
         the first task to the established deferred-init scheduler."""
-        mock_gen_id.return_value = "test1234"
+        from cli_agent_orchestrator.services import provider_completion_report as reports
+
+        monkeypatch.setattr(reports, "PROVIDER_COMPLETION_REPORT_DIR", tmp_path / "reports")
+        mock_gen_id.return_value = "abcdef01"
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "developer-abcd"
         mock_tmux.session_exists.return_value = False
@@ -129,7 +136,7 @@ class TestCreateTerminal:
             "assigned_worker_completion_service"
         ) as mock_completion_service:
             result = await create_terminal(
-                "codex",
+                provider_type,
                 "developer",
                 new_session=True,
                 caller_id="feedbeef",
@@ -144,7 +151,7 @@ class TestCreateTerminal:
         mock_provider.initialize.assert_not_awaited()
         mock_schedule_deferred_init.assert_called_once_with(
             mock_provider,
-            "test1234",
+            "abcdef01",
             "Review the current change",
             OrchestrationType.ASSIGN,
             None,
@@ -157,7 +164,19 @@ class TestCreateTerminal:
         assert mock_provider_manager.create_provider.call_args.kwargs["completion_id"] == (
             persisted["completion_id"]
         )
-        mock_completion_service.register_assignment.assert_called_once_with("test1234")
+        mock_completion_service.register_assignment.assert_called_once_with("abcdef01")
+
+        if provider_type == "claude_code":
+            from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+
+            actual_provider = ClaudeCodeProvider(
+                "abcdef01",
+                "cao-session",
+                "developer-abcd",
+                completion_id=persisted["completion_id"],
+            )
+            assert "--print" not in actual_provider._build_claude_command(None)
+            assert actual_provider.supports_screen_detection
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")

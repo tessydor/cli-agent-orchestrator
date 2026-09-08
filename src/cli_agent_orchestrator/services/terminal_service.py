@@ -1104,6 +1104,12 @@ async def create_terminal(
         if initial_message_orchestration_type == OrchestrationType.ASSIGN and caller_id is not None:
             assignment_id = uuid.uuid4().hex
             completion_id = uuid.uuid4().hex
+            if provider == ProviderType.CLAUDE_CODE.value:
+                from cli_agent_orchestrator.services.claude_native_completion import (
+                    configure_native,
+                )
+
+                configure_native(terminal_id, completion_id)
 
         if not session_name:
             session_name = generate_session_name()
@@ -2261,6 +2267,7 @@ def get_terminal(terminal_id: str) -> Dict:
 
         status = status_monitor.get_status(terminal_id).value
 
+        callback = get_assigned_worker_callback(terminal_id)
         return {
             "id": metadata["id"],
             "name": metadata["tmux_window"],
@@ -2268,6 +2275,8 @@ def get_terminal(terminal_id: str) -> Dict:
             "session_name": metadata["tmux_session"],
             "agent_profile": metadata["agent_profile"],
             "caller_id": metadata.get("caller_id"),
+            "assignment_id": callback.assignment_id if callback else None,
+            "completion_id": callback.completion_id if callback else None,
             "allowed_tools": metadata.get("allowed_tools"),
             "engine": metadata.get("engine"),
             "group": metadata.get("group"),

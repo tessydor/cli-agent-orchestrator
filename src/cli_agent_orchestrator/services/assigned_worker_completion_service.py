@@ -394,6 +394,9 @@ class AssignedWorkerCompletionService:
             self._handle_status_locked(record, status)
 
     def _handle_status_locked(self, record: AssignedWorkerCallback, status: TerminalStatus) -> None:
+        if status == TerminalStatus.WAITING_USER_ANSWER:
+            self._notify_worker_question(record)
+            return
         if status == TerminalStatus.ERROR:
             # Commit a separate SYSTEM notice before transitioning the original
             # assignment. A follow-up failure never rewrites its successful report.
@@ -431,6 +434,35 @@ class AssignedWorkerCompletionService:
         if record.lifecycle == AssignmentLifecycle.COMPLETED and record.final_result is not None:
             self._release_capture_barrier(record.worker_terminal_id)
         self._drive_delivery(record)
+
+    def _notify_worker_question(self, record: AssignedWorkerCallback) -> None:
+        """Wake the supervisor without answering or changing approval authority."""
+        metadata = get_terminal_metadata(record.worker_terminal_id)
+        if not metadata or metadata.get("provider") != "claude_code":
+            return
+        from cli_agent_orchestrator.services.claude_question import _screen, parse_screen
+
+        try:
+            screen = _screen(record.worker_terminal_id, record.caller_id)
+            try:
+                digest, _, _ = parse_screen(screen)
+            except ValueError:
+                # Owner/startup dialogs may not use a numbered question widget.
+                digest = utf8_sha256(screen)
+            create_inbox_message(
+                record.worker_terminal_id,
+                record.caller_id,
+                "CAO worker " + record.worker_terminal_id + " is waiting for an answer. "
+                "Inspect its current output. Answer only delegated routine questions with "
+                "get_worker_question/answer_worker_question; forward owner-reserved or "
+                "human-identity decisions to the owner. This notice is not approval.",
+                origin=InboxMessageOrigin.SYSTEM,
+                assignment_id=record.assignment_id,
+                idempotency_key=f"assigned-worker-question:{record.completion_id}:{digest}",
+            )
+            self._attempt_immediate_inbox_delivery(record.caller_id)
+        except (ValueError, RuntimeError):
+            logger.warning("Could not inspect waiting worker %s", record.worker_terminal_id)
 
     def _capture_dispatched_result(
         self,
