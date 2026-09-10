@@ -42,6 +42,9 @@ report cannot be promoted to a successful final result.
   snapshot. Unknown, stale, expired, ambiguous, and free-form menu answers fail
   closed. The old text-answer path is rejected for Claude.
 
+- inspect_terminal_retirement_state reads a worker's durable callback record,
+  including a computed `state_token` snapshot -- call this first and pass its
+  `assignment_id`/`state_token` unchanged into reconcile_terminal_retirement.
 - reconcile_terminal_retirement lets the recorded assigning caller record
   durable, evidence-backed acceptance of a worker whose authoritative provider
   completion report will never become available (for example an old/restarted
@@ -49,11 +52,24 @@ report cannot be promoted to a successful final result.
   fabricates a completion callback or changes the retained lifecycle/
   delivery_state/final_result: it is a distinct, additive, auditable
   who/when/why/evidence fact that `prepare_terminal_retirement` accepts as
-  sufficient, on its own, to allow retirement. Refused for a wrong caller, a
-  live terminal, one waiting on a decision, or a record that already has a
-  genuine provider report or ordinary FAILED/CANCELLED disposition. Idempotent;
-  a repeat call with different evidence is rejected rather than overwriting the
-  first durable record.
+  sufficient, on its own, to allow retirement -- and re-checks liveness again
+  at the actual retirement moment, not just at reconciliation time. Refused
+  for a wrong caller, a wrong/stale assignment snapshot, a live terminal, one
+  waiting on a decision, or a record that already has a genuine provider
+  report or ordinary FAILED/CANCELLED disposition. Idempotent; an exact
+  replay is a no-op, but a repeat call with different evidence is refused as
+  a conflict rather than overwriting the first durable record.
+
+  The underlying REST route additionally requires this server's own local
+  machine service token (`require_local_service_token`, `security/auth.py`),
+  not merely `cao:admin` scope -- a generic admin-scoped caller (a human
+  operator's session, a dashboard, an unrelated service) that reads and
+  resubmits the exact recorded `caller_id` is refused before it ever reaches
+  the caller_id check, because it does not hold this deployment's shared
+  local secret. This still does not bind to a SPECIFIC terminal -- every
+  local MCP subprocess shares that one secret -- so the caller_id check
+  remains the only defense against one legitimate terminal reconciling a
+  different terminal's assignment.
 
 CAO terminal IDs and model-native ListAgents IDs are different namespaces.
 These tools expose routing records under CAO's existing local trust/auth model;

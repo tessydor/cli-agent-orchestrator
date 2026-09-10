@@ -131,6 +131,7 @@ from cli_agent_orchestrator.security.auth import (
     get_current_scopes,
     is_auth_enabled,
     require_any_scope,
+    require_local_service_token,
 )
 from cli_agent_orchestrator.services import (
     approval_gate,
@@ -415,21 +416,42 @@ class RetirementReconciliationBody(BaseModel):
     single source of truth for that, so the exact refusal it returns is what
     every caller (API, MCP, CLI) sees, never a divergent Pydantic message.
 
-    ``caller_id`` identity note: this route is scoped ADMIN like every other
-    terminal-lifecycle mutation (``DELETE /terminals/{id}`` included), and this
-    codebase's auth stack has no notion of "this bearer token IS terminal X" --
-    only coarse read/write/admin scopes (``security/auth.py``). ``caller_id``
-    here is therefore checked for DB-consistency (does it match the immutable
-    recorded assigning caller?) but is NOT cryptographically bound to the HTTP
-    caller's identity -- exactly the same trust model already documented for
-    ``GET/POST /terminals/{id}/question`` (see docs/native-assignment-lifecycle.md).
-    The actual identity-authenticated seam for LLM-driven agents is the
-    ``reconcile_terminal_retirement`` MCP tool, whose ``caller_id`` argument
-    does not exist -- it resolves exclusively from that process's own
-    ``CAO_TERMINAL_ID`` env var, never a model-suppliable value (mirrors
-    ``answer_worker_question``). A generic REST client reaching this route
-    directly is already inside CAO's local-operator/admin trust boundary, the
-    same boundary every other ADMIN-scoped mutation relies on.
+    ``caller_id`` identity note: this codebase's auth stack has no notion of
+    "this bearer token IS terminal X" -- only coarse read/write/admin scopes
+    (``security/auth.py``) that are fungible across every holder. A prior
+    review correctly found that an ADMIN-scoped bearer belonging to a generic
+    caller (a human operator's own session, a dashboard, an unrelated
+    service) could read a stuck assignment's recorded ``caller_id`` from the
+    completion-callback endpoint and submit that exact value back here,
+    passing the DB-consistency check with no real identity behind it -- the
+    ``wrong_caller`` guard alone only catches a WRONG id, never a correctly
+    guessed/known one.
+
+    This route is therefore gated by TWO independent checks, not one:
+    ``require_any_scope(SCOPE_ADMIN)`` (coarse authorization, unchanged) AND
+    ``require_local_service_token()`` (see ``security/auth.py``), which
+    requires the presented bearer to be byte-for-byte this server's own
+    ``CAO_AUTH_LOCAL_TOKEN`` rather than merely any validly-scoped admin
+    token. That narrows reachability from "anyone holding an admin-scoped
+    credential" down to "whoever possesses this exact machine-local secret"
+    -- in this deployment, precisely the locally-spawned MCP server
+    subprocesses (the trusted seam is the ``reconcile_terminal_retirement``
+    MCP tool, whose ``caller_id`` argument does not exist -- it resolves
+    exclusively from that process's own ``CAO_TERMINAL_ID`` env var, never a
+    model-suppliable value, mirroring ``answer_worker_question``), never a
+    remote/dashboard/other-service admin credential that merely also carries
+    ``cao:admin``.
+
+    This still does NOT bind to a specific TERMINAL's identity -- every MCP
+    subprocess on the machine shares the one local token, so a
+    ``require_local_service_token()`` pass proves only "this is CAO's own
+    local MCP infrastructure," not "this is terminal X specifically." The
+    ``caller_id`` DB-consistency check (unchanged) remains the only defense
+    against one legitimate terminal's MCP process reconciling a DIFFERENT
+    terminal's assignment; per correction-836, that residual gap requires a
+    genuine per-terminal credential this codebase does not have anywhere
+    (verified against every comparable mutation, not unique to this route)
+    and is out of scope for this narrowly-scoped fix.
 
     ``assignment_id``/``expected_state_token`` bind the request to an exact
     observed snapshot (see ``compute_reconciliation_state_token``) rather than
@@ -6742,6 +6764,7 @@ async def reconcile_assigned_worker_retirement_endpoint(
     worker_terminal_id: TerminalId,
     body: RetirementReconciliationBody,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
+    _local_service_token: None = Depends(require_local_service_token()),
 ) -> Dict:
     """Record the recorded assigning caller's evidence-backed acceptance of a
     terminal whose authoritative provider completion report is permanently
@@ -6763,8 +6786,10 @@ async def reconcile_assigned_worker_retirement_endpoint(
     re-checks live terminal activity at actual teardown time) checks before
     allowing retirement of an otherwise permanently-stuck assignment. Scoped
     ADMIN like ``DELETE /terminals/{id}`` because it is a lifecycle-mutating
-    operation, not a read. See ``RetirementReconciliationBody`` for this
-    route's caller-identity trust-boundary note.
+    operation, not a read -- AND additionally requires this server's own
+    local machine service token (``require_local_service_token``), narrower
+    than ADMIN scope alone. See ``RetirementReconciliationBody`` for the full
+    caller-identity trust-boundary note.
     """
     try:
         updated = await asyncio.to_thread(
