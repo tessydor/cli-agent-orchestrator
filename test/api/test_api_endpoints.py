@@ -1038,6 +1038,30 @@ class TestDeleteSession:
         assert response.status_code == 409
         assert "cleanup deferred" in response.json()["detail"]
         assert "test-session" in response.json()["detail"]
+        assert (
+            "grok-terminal: cleanup deferred; retry delete_session"
+            in response.json()["detail"]
+        )
+        assert "Grok processes exit" not in response.json()["detail"]
+
+    def test_delete_session_deferred_cleanup_surfaces_a_second_distinct_real_reason(
+        self, client
+    ):
+        """A different real per-terminal reason produces a different detail --
+        proves genuine propagation, not one fixed 'Grok' fallback string."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.delete_session.return_value = {
+                "deleted": [],
+                "errors": [
+                    {"terminal_id": "t1", "error": "completion capture pending"},
+                ],
+            }
+
+            response = client.delete("/sessions/test-session")
+
+        assert response.status_code == 409
+        assert "t1: completion capture pending" in response.json()["detail"]
+        assert "Grok processes exit" not in response.json()["detail"]
 
     def test_delete_session_not_found(self, client):
         """DELETE /sessions/{name} returns 404 for nonexistent session."""
@@ -1755,6 +1779,21 @@ class TestLifespan:
             patch.object(
                 main_module.inbox_service, "run", new=AsyncMock(side_effect=never_returns)
             ),
+            # register_persisted_assignments()/run() both query the real,
+            # shared assigned_worker_callbacks table -- every other startup
+            # DB touch above is likewise mocked, this component is not
+            # exempt just because it predates this stub (a schema addition
+            # here must not require migrating the real on-disk DB just to
+            # keep this lifespan-wiring test passing).
+            patch.object(
+                main_module.assigned_worker_completion_service,
+                "register_persisted_assignments",
+            ),
+            patch.object(
+                main_module.assigned_worker_completion_service,
+                "run",
+                new=AsyncMock(side_effect=never_returns),
+            ),
             patch("cli_agent_orchestrator.plugins.PluginRegistry.load", mock_load),
             patch("cli_agent_orchestrator.plugins.PluginRegistry.teardown", mock_teardown),
         ):
@@ -1818,6 +1857,15 @@ class TestLifespan:
             patch(
                 "cli_agent_orchestrator.api.main.opencode_inbox_delivery_daemon",
                 fake_registry_daemon,
+            ),
+            patch.object(
+                main_module.assigned_worker_completion_service,
+                "register_persisted_assignments",
+            ),
+            patch.object(
+                main_module.assigned_worker_completion_service,
+                "run",
+                new=AsyncMock(side_effect=never_returns),
             ),
             patch(
                 "cli_agent_orchestrator.api.main.inbox_reconciliation_daemon",

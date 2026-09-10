@@ -40,6 +40,7 @@ from cli_agent_orchestrator.models.assigned_worker import (
     CompletionDeliveryState,
     CompletionReceiverState,
     TerminalRetirementReconciliationError,
+    compute_reconciliation_state_token,
     format_server_completion_message,
 )
 from cli_agent_orchestrator.models.inbox import InboxMessageOrigin
@@ -85,6 +86,7 @@ _RECONCILABLE_STUCK_STATES = frozenset(
     }
 )
 _RECONCILIATION_FIELD_MAX_BYTES = 4096
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class AssignedWorkerCompletionService:
@@ -950,6 +952,8 @@ class AssignedWorkerCompletionService:
         self,
         worker_terminal_id: str,
         caller_id: str,
+        assignment_id: str,
+        expected_state_token: str,
         reason: str,
         evidence: Mapping[str, str],
     ) -> AssignedWorkerCallback:
@@ -961,7 +965,20 @@ class AssignedWorkerCompletionService:
         ``delivery_state``, and ``final_result`` are never touched here. Its only
         effect elsewhere is that ``prepare_terminal_retirement`` will allow
         retirement of a terminal whose authoritative provider report is
-        permanently unavailable, once this evidence is durably recorded.
+        permanently unavailable, once this evidence is durably recorded -- and
+        even then only if the terminal is STILL not live at the moment of actual
+        retirement (see ``prepare_terminal_retirement``; this method's own
+        liveness check below is a snapshot, not a lock on the future).
+
+        ``assignment_id`` and ``expected_state_token`` bind this request to an
+        exact observed snapshot rather than inferring identity/state from
+        ``worker_terminal_id`` alone: a caller fetches both (and everything
+        needed to compute the token) via ``get_assigned_worker_callback``/the
+        completion-callback endpoint before calling this, so a request can
+        never accept a DIFFERENT assignment than the caller reviewed, and can
+        never accept a snapshot that has since moved on (a fresh capture
+        attempt landed, the provider errored, etc.) -- see
+        ``compute_reconciliation_state_token``.
 
         Guards, in order, each raising ``TerminalRetirementReconciliationError``
         with a distinct ``code`` on refusal:
@@ -970,23 +987,29 @@ class AssignedWorkerCompletionService:
         - ``wrong_caller``: ``caller_id`` is not the immutable recorded assigning
           caller for this assignment (mirrors the ``claude_question`` caller
           check -- callers cannot reconcile someone else's assignment).
+        - ``wrong_assignment``: ``assignment_id`` does not match the record's own
+          immutable assignment identity -- refuses a caller mistake/confusion
+          about which assignment it is accepting.
+        - ``already_reconciled``: the record already carries different durable
+          reconciliation evidence than this exact request. An EXACT replay
+          (same assignment_id/state_token/reason/evidence) is a safe idempotent
+          no-op that returns the original record unchanged; anything else is a
+          conflict, never a silent overwrite -- the immutable evidence never
+          moves once written.
         - ``not_eligible``: the record is not one of the specific stuck shapes
           this path exists for (DISPATCHED/RETRYABLE or UNRESOLVED/MANUAL_RECOVERY
           -- see ``_RECONCILABLE_STUCK_STATES``). In particular this refuses an
           assignment that already has a genuine provider report (COMPLETED), or
           one already resolved via the ordinary FAILED/CANCELLED path -- both are
           already retirable without this path.
+        - ``stale_evidence``: ``expected_state_token`` does not match the token
+          computed from the CURRENT record -- the caller's snapshot is stale.
         - ``terminal_live``: live provider status is PROCESSING or
           WAITING_USER_ANSWER -- never retire a running terminal or paper over a
           pending decision.
         - ``invalid_evidence``: ``reason``/``evidence`` fields are missing, empty,
-          or oversized.
-
-        Idempotent: a repeat call against an already-reconciled record returns
-        the existing durable record unchanged (mirrors ``capture_assigned_worker_completion``'s
-        idempotency).  Calling again with materially different evidence hits the
-        immutable-once-set DB trigger, but this method itself never invokes the
-        DB write for an already-reconciled record, so no such call reaches it.
+          malformed (``evidence.archive_sha256`` must be exactly 64 lowercase hex
+          characters), or oversized.
         """
         with self._worker_lock(worker_terminal_id):
             record = get_assigned_worker_callback(worker_terminal_id)
@@ -1001,30 +1024,24 @@ class AssignedWorkerCompletionService:
                     f"Caller {caller_id!r} is not the recorded assigning caller for "
                     f"terminal {worker_terminal_id!r}",
                 )
-            if record.caller_reconciled_at is not None:
-                return record
-
-            if (record.lifecycle, record.delivery_state) not in _RECONCILABLE_STUCK_STATES:
+            if record.assignment_id != assignment_id:
                 raise TerminalRetirementReconciliationError(
-                    "not_eligible",
-                    f"Terminal {worker_terminal_id!r} lifecycle={record.lifecycle.value} "
-                    f"delivery_state={record.delivery_state.value} is not a genuinely-stuck "
-                    "missing-provider-report state eligible for caller-evidence reconciliation",
+                    "wrong_assignment",
+                    f"Assignment {assignment_id!r} does not match the recorded "
+                    f"assignment {record.assignment_id!r} for terminal {worker_terminal_id!r}",
                 )
 
-            status = self._detect_live_status(record)
-            if status in (TerminalStatus.PROCESSING, TerminalStatus.WAITING_USER_ANSWER):
-                raise TerminalRetirementReconciliationError(
-                    "terminal_live",
-                    f"Terminal {worker_terminal_id!r} is still {status.value}; refusing to "
-                    "reconcile a live terminal or one waiting on a decision",
-                )
-
-            archive_reference = evidence.get("archive_reference", "") if evidence else ""
-            accepted_evidence = evidence.get("accepted_evidence", "") if evidence else ""
+            archive_reference = (
+                evidence.get("archive_reference", "") if evidence else ""
+            )
+            archive_sha256 = evidence.get("archive_sha256", "") if evidence else ""
+            accepted_evidence = (
+                evidence.get("accepted_evidence", "") if evidence else ""
+            )
             for label, value in (
                 ("reason", reason),
                 ("evidence.archive_reference", archive_reference),
+                ("evidence.archive_sha256", archive_sha256),
                 ("evidence.accepted_evidence", accepted_evidence),
             ):
                 if not isinstance(value, str) or not value.strip():
@@ -1036,15 +1053,74 @@ class AssignedWorkerCompletionService:
                         "invalid_evidence",
                         f"{label} exceeds {_RECONCILIATION_FIELD_MAX_BYTES} bytes",
                     )
+            normalized_sha256 = archive_sha256.strip().lower()
+            if not _SHA256_HEX_RE.fullmatch(normalized_sha256):
+                raise TerminalRetirementReconciliationError(
+                    "invalid_evidence",
+                    "evidence.archive_sha256 must be exactly 64 lowercase hex characters",
+                )
 
             evidence_json = json.dumps(
                 {
+                    "assignment_id": assignment_id,
+                    "accepted_state_token": expected_state_token,
                     "archive_reference": archive_reference.strip(),
+                    "archive_sha256": normalized_sha256,
                     "accepted_evidence": accepted_evidence.strip(),
                 },
                 sort_keys=True,
             )
-            updated = mark_caller_reconciled(record.assignment_id, reason.strip(), evidence_json)
+            normalized_reason = reason.strip()
+
+            if record.caller_reconciled_at is not None:
+                if (
+                    record.reconciliation_reason == normalized_reason
+                    and record.reconciliation_evidence == evidence_json
+                ):
+                    # Exact replay of an already-accepted request (e.g. a
+                    # retried MCP/API call) -- safe no-op, never re-written.
+                    return record
+                raise TerminalRetirementReconciliationError(
+                    "already_reconciled",
+                    f"Terminal {worker_terminal_id!r} already has different durable "
+                    "reconciliation evidence recorded; refusing to overwrite it",
+                )
+
+            if (
+                record.lifecycle,
+                record.delivery_state,
+            ) not in _RECONCILABLE_STUCK_STATES:
+                raise TerminalRetirementReconciliationError(
+                    "not_eligible",
+                    f"Terminal {worker_terminal_id!r} lifecycle={record.lifecycle.value} "
+                    f"delivery_state={record.delivery_state.value} is not a genuinely-stuck "
+                    "missing-provider-report state eligible for caller-evidence reconciliation",
+                )
+
+            current_token = compute_reconciliation_state_token(record)
+            if expected_state_token != current_token:
+                raise TerminalRetirementReconciliationError(
+                    "stale_evidence",
+                    f"Terminal {worker_terminal_id!r} state has moved on since the caller's "
+                    f"snapshot; current state token is {current_token!r}. Re-inspect the "
+                    "record and retry with the fresh token if it is still genuinely stuck",
+                )
+
+            status = self._detect_live_status(record)
+            if status in (
+                TerminalStatus.PROCESSING,
+                TerminalStatus.WAITING_USER_ANSWER,
+            ):
+                raise TerminalRetirementReconciliationError(
+                    "terminal_live",
+                    f"Terminal {worker_terminal_id!r} is still {status.value}; refusing to "
+                    "reconcile a live terminal or one waiting on a decision",
+                )
+
+            evidence_sha256 = utf8_sha256(evidence_json)
+            updated = mark_caller_reconciled(
+                record.assignment_id, normalized_reason, evidence_json, evidence_sha256
+            )
             if updated is None:
                 raise TerminalRetirementReconciliationError(
                     "not_found",
@@ -1070,8 +1146,16 @@ class AssignedWorkerCompletionService:
                 # accepted (reconcile_caller_accepted_result). That is caller
                 # acceptance, never forged provider completion: lifecycle,
                 # delivery_state and final_result are untouched and remain
-                # truthful. It is sufficient, on its own, to allow retirement.
-                return True
+                # truthful. It is necessary but NOT sufficient on its own: the
+                # reconciliation snapshot can be arbitrarily old by the time
+                # retirement is actually attempted, so live activity is
+                # re-checked right here, at teardown time, rather than trusted
+                # from whatever it was when reconciliation was recorded.
+                status = self._detect_live_status(record)
+                return status not in (
+                    TerminalStatus.PROCESSING,
+                    TerminalStatus.WAITING_USER_ANSWER,
+                )
             if record.lifecycle == AssignmentLifecycle.COMPLETED:
                 self._drive_delivery(record)
                 return True

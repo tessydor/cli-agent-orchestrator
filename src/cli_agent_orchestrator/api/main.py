@@ -96,6 +96,7 @@ from cli_agent_orchestrator.graph.sinks import get_sink
 from cli_agent_orchestrator.models.assigned_worker import (
     AssignedWorkerIntegrityError,
     TerminalRetirementReconciliationError,
+    compute_reconciliation_state_token,
 )
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import (
@@ -413,11 +414,34 @@ class RetirementReconciliationBody(BaseModel):
     (``AssignedWorkerCompletionService.reconcile_caller_accepted_result``) is the
     single source of truth for that, so the exact refusal it returns is what
     every caller (API, MCP, CLI) sees, never a divergent Pydantic message.
+
+    ``caller_id`` identity note: this route is scoped ADMIN like every other
+    terminal-lifecycle mutation (``DELETE /terminals/{id}`` included), and this
+    codebase's auth stack has no notion of "this bearer token IS terminal X" --
+    only coarse read/write/admin scopes (``security/auth.py``). ``caller_id``
+    here is therefore checked for DB-consistency (does it match the immutable
+    recorded assigning caller?) but is NOT cryptographically bound to the HTTP
+    caller's identity -- exactly the same trust model already documented for
+    ``GET/POST /terminals/{id}/question`` (see docs/native-assignment-lifecycle.md).
+    The actual identity-authenticated seam for LLM-driven agents is the
+    ``reconcile_terminal_retirement`` MCP tool, whose ``caller_id`` argument
+    does not exist -- it resolves exclusively from that process's own
+    ``CAO_TERMINAL_ID`` env var, never a model-suppliable value (mirrors
+    ``answer_worker_question``). A generic REST client reaching this route
+    directly is already inside CAO's local-operator/admin trust boundary, the
+    same boundary every other ADMIN-scoped mutation relies on.
+
+    ``assignment_id``/``expected_state_token`` bind the request to an exact
+    observed snapshot (see ``compute_reconciliation_state_token``) rather than
+    trusting ``worker_terminal_id`` alone to identify what is being accepted.
     """
 
     caller_id: TerminalId
+    assignment_id: str
+    expected_state_token: str
     reason: str
     archive_reference: str
+    archive_sha256: str
     accepted_evidence: str
 
 
@@ -3180,12 +3204,24 @@ async def delete_session(
             isinstance(deleted, (list, tuple)) and session_name not in deleted
         )
         if deferred:
+            # Surface the real per-terminal/per-step reasons already collected
+            # in ``errors`` (e.g. "completion capture pending",
+            # "cleanup deferred; retry delete_session") instead of a fixed
+            # Grok-specific guess -- the deferral is not provider-specific and
+            # discarding these in favor of static text hid exactly the
+            # information an operator needs to decide what to do next.
+            if errors:
+                reasons = "; ".join(
+                    f"{e.get('terminal_id') or e.get('session') or '?'}: "
+                    f"{e.get('error', 'unknown reason')}"
+                    for e in errors
+                    if isinstance(e, dict)
+                )
+            else:
+                reasons = f"session '{session_name}' was not fully torn down"
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    f"cleanup deferred for session '{session_name}'; "
-                    "retry delete after residual Grok processes exit"
-                ),
+                detail=f"cleanup deferred for session '{session_name}': {reasons}",
             )
         return {"success": True, **result}
     except HTTPException:
@@ -6680,13 +6716,22 @@ async def get_assigned_worker_completion_callback_endpoint(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Assigned-worker callback for '{worker_terminal_id}' not found",
         )
-    return cast(Dict, jsonable_encoder(record.model_dump()))
+    payload = record.model_dump()
+    # Additive, computed (never stored): the optimistic-concurrency snapshot a
+    # caller echoes back on retirement-reconciliation so an accept request is
+    # bound to the exact state observed here, not to whatever it is by the
+    # time the request lands (see compute_reconciliation_state_token).
+    payload["state_token"] = compute_reconciliation_state_token(record)
+    return cast(Dict, jsonable_encoder(payload))
 
 
 _RECONCILIATION_ERROR_STATUS = {
     "not_found": status.HTTP_404_NOT_FOUND,
     "wrong_caller": status.HTTP_403_FORBIDDEN,
+    "wrong_assignment": status.HTTP_409_CONFLICT,
+    "already_reconciled": status.HTTP_409_CONFLICT,
     "not_eligible": status.HTTP_409_CONFLICT,
+    "stale_evidence": status.HTTP_409_CONFLICT,
     "terminal_live": status.HTTP_409_CONFLICT,
     "invalid_evidence": status.HTTP_400_BAD_REQUEST,
 }
@@ -6705,28 +6750,41 @@ async def reconcile_assigned_worker_retirement_endpoint(
     This is NOT a completion callback and never becomes one: ``lifecycle``,
     ``delivery_state``, and ``final_result`` on the callback record are
     untouched. It is a distinct, durable, auditable fact -- who (the immutable
-    recorded caller, never an unrelated caller), when, why (``reason``), and on
-    what evidence (``archive_reference``, ``accepted_evidence``) -- that
+    recorded caller, never an unrelated caller), which assignment
+    (``assignment_id``, checked against the record's own immutable identity),
+    on what observed snapshot (``expected_state_token``, from ``GET
+    .../completion-callback``'s ``state_token`` -- refused as stale if the
+    record has moved on since), when, why (``reason``), and on what
+    caller-attested evidence (``archive_reference``, ``archive_sha256``,
+    ``accepted_evidence`` -- CAO never independently verifies off-box artifact
+    or commit contents; it only durably records the attestation) -- that
     ``prepare_terminal_retirement`` (the same guard the ordinary
-    ``delete_terminal`` path already goes through) checks before allowing
-    retirement of an otherwise permanently-stuck assignment. Scoped ADMIN like
-    ``DELETE /terminals/{id}`` because it is a lifecycle-mutating operation, not
-    a read.
+    ``delete_terminal`` path already goes through, and which independently
+    re-checks live terminal activity at actual teardown time) checks before
+    allowing retirement of an otherwise permanently-stuck assignment. Scoped
+    ADMIN like ``DELETE /terminals/{id}`` because it is a lifecycle-mutating
+    operation, not a read. See ``RetirementReconciliationBody`` for this
+    route's caller-identity trust-boundary note.
     """
     try:
         updated = await asyncio.to_thread(
             assigned_worker_completion_service.reconcile_caller_accepted_result,
             worker_terminal_id,
             body.caller_id,
+            body.assignment_id,
+            body.expected_state_token,
             body.reason,
             {
                 "archive_reference": body.archive_reference,
+                "archive_sha256": body.archive_sha256,
                 "accepted_evidence": body.accepted_evidence,
             },
         )
     except TerminalRetirementReconciliationError as exc:
         raise HTTPException(
-            status_code=_RECONCILIATION_ERROR_STATUS.get(exc.code, status.HTTP_409_CONFLICT),
+            status_code=_RECONCILIATION_ERROR_STATUS.get(
+                exc.code, status.HTTP_409_CONFLICT
+            ),
             detail=f"{exc.code}: {exc}",
         ) from exc
     return cast(Dict, jsonable_encoder(updated.model_dump()))

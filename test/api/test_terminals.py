@@ -606,6 +606,10 @@ class TestAssignedWorkerCompletionCallbackEndpoint:
     """Manual recovery view for retained completion reports."""
 
     def test_returns_report_after_terminal_retirement(self, client):
+        from cli_agent_orchestrator.models.assigned_worker import (
+            compute_reconciliation_state_token,
+        )
+
         record = MagicMock()
         record.model_dump.return_value = {
             "assignment_id": "assignment-one",
@@ -617,7 +621,18 @@ class TestAssignedWorkerCompletionCallbackEndpoint:
             "receiver_state": "deleted",
             "final_result": "retained final report",
             "final_result_sha256": "abc123",
+            "last_error": None,
         }
+        # compute_reconciliation_state_token reads these attributes directly
+        # off the record (not through model_dump); a manual mock needs both
+        # kept consistent with each other, same as a real model instance.
+        record.assignment_id = "assignment-one"
+        record.worker_terminal_id = "abcd1234"
+        record.caller_id = "feedbeef"
+        record.lifecycle.value = "completed"
+        record.delivery_state.value = "terminal_error"
+        record.final_result = "retained final report"
+        record.last_error = None
         with patch(
             "cli_agent_orchestrator.api.main.get_assigned_worker_callback",
             return_value=record,
@@ -625,7 +640,10 @@ class TestAssignedWorkerCompletionCallbackEndpoint:
             response = client.get("/assigned-workers/abcd1234/completion-callback")
 
         assert response.status_code == 200
-        assert response.json()["final_result"] == "retained final report"
+        payload = response.json()
+        assert payload["final_result"] == "retained final report"
+        # The optimistic-concurrency token a reconciliation call must echo back.
+        assert payload["state_token"] == compute_reconciliation_state_token(record)
         get_callback.assert_called_once_with("abcd1234")
 
     def test_missing_assignment_returns_404(self, client):
@@ -691,8 +709,11 @@ class TestRetirementReconciliationEndpoint:
 
     _BODY = {
         "caller_id": "feedbeef",
+        "assignment_id": "assignment-one",
+        "expected_state_token": "a" * 64,
         "reason": "Independently verified via merged PR",
         "archive_reference": "archive-sha-abc123",
+        "archive_sha256": "b" * 64,
         "accepted_evidence": "PR44 merge 5c673ce11e8226ed23d2566f7f780d7d9471354c",
     }
 
@@ -718,9 +739,12 @@ class TestRetirementReconciliationEndpoint:
         mock_svc.reconcile_caller_accepted_result.assert_called_once_with(
             "abcd1234",
             "feedbeef",
+            "assignment-one",
+            "a" * 64,
             "Independently verified via merged PR",
             {
                 "archive_reference": "archive-sha-abc123",
+                "archive_sha256": "b" * 64,
                 "accepted_evidence": "PR44 merge 5c673ce11e8226ed23d2566f7f780d7d9471354c",
             },
         )
@@ -730,12 +754,17 @@ class TestRetirementReconciliationEndpoint:
         [
             ("not_found", 404),
             ("wrong_caller", 403),
+            ("wrong_assignment", 409),
+            ("already_reconciled", 409),
             ("not_eligible", 409),
+            ("stale_evidence", 409),
             ("terminal_live", 409),
             ("invalid_evidence", 400),
         ],
     )
-    def test_guard_failures_map_to_exact_status_and_reason(self, client, code, expected_status):
+    def test_guard_failures_map_to_exact_status_and_reason(
+        self, client, code, expected_status
+    ):
         from cli_agent_orchestrator.models.assigned_worker import (
             TerminalRetirementReconciliationError,
         )
@@ -758,9 +787,76 @@ class TestRetirementReconciliationEndpoint:
         body = dict(self._BODY)
         del body["reason"]
 
-        response = client.post("/assigned-workers/abcd1234/retirement-reconciliation", json=body)
+        response = client.post(
+            "/assigned-workers/abcd1234/retirement-reconciliation", json=body
+        )
 
         assert response.status_code == 422
+
+    def test_missing_assignment_id_is_422(self, client):
+        """Assignment binding is required, not merely worker_terminal_id."""
+        body = dict(self._BODY)
+        del body["assignment_id"]
+
+        response = client.post(
+            "/assigned-workers/abcd1234/retirement-reconciliation", json=body
+        )
+
+        assert response.status_code == 422
+
+    def test_missing_expected_state_token_is_422(self, client):
+        body = dict(self._BODY)
+        del body["expected_state_token"]
+
+        response = client.post(
+            "/assigned-workers/abcd1234/retirement-reconciliation", json=body
+        )
+
+        assert response.status_code == 422
+
+    def test_admin_scoped_client_cannot_impersonate_another_caller(self, client):
+        """The REST route independently refuses a caller_id it does not recognize
+        as this assignment's recorded caller -- an ADMIN-scoped client cannot
+        simply assert an arbitrary identity and be believed. The stronger,
+        identity-authenticated seam for LLM agents is the MCP tool: see
+        test_terminal_cleanup.py::TestReconcileTerminalRetirement, which proves
+        that tool has no caller-identity argument at all -- it is impossible
+        for a model to make it claim to be any caller_id other than this
+        process's own CAO_TERMINAL_ID.
+        """
+        from cli_agent_orchestrator.models.assigned_worker import (
+            TerminalRetirementReconciliationError,
+        )
+
+        impersonating_body = dict(self._BODY)
+        impersonating_body["caller_id"] = "1eadbeef"  # not the recorded caller
+        with patch(
+            "cli_agent_orchestrator.api.main.assigned_worker_completion_service"
+        ) as mock_svc:
+            mock_svc.reconcile_caller_accepted_result.side_effect = (
+                TerminalRetirementReconciliationError(
+                    "wrong_caller", "refused: wrong_caller"
+                )
+            )
+
+            response = client.post(
+                "/assigned-workers/abcd1234/retirement-reconciliation",
+                json=impersonating_body,
+            )
+
+        assert response.status_code == 403
+        mock_svc.reconcile_caller_accepted_result.assert_called_once_with(
+            "abcd1234",
+            "1eadbeef",
+            "assignment-one",
+            "a" * 64,
+            "Independently verified via merged PR",
+            {
+                "archive_reference": "archive-sha-abc123",
+                "archive_sha256": "b" * 64,
+                "accepted_evidence": "PR44 merge 5c673ce11e8226ed23d2566f7f780d7d9471354c",
+            },
+        )
 
 
 class TestCreateInboxMessageEndpoint:

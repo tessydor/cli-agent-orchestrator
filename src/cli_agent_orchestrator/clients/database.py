@@ -207,6 +207,10 @@ class AssignedWorkerCallbackModel(Base):
     caller_reconciled_at = Column(DateTime, nullable=True)
     reconciliation_reason = Column(Text, nullable=True)
     reconciliation_evidence = Column(Text, nullable=True)
+    # SHA-256 of ``reconciliation_evidence`` (the canonical evidence JSON),
+    # mirroring the ``final_result``/``final_result_sha256`` integrity pattern.
+    # Re-verified on every read; catches a below-the-ORM tamper of either field.
+    reconciliation_evidence_sha256 = Column(String, nullable=True)
 
     __table_args__ = (
         Index("uq_assigned_worker_callback_completion_id", "completion_id", unique=True),
@@ -258,13 +262,15 @@ END
 
 _IMMUTABLE_CALLBACK_RECONCILIATION_TRIGGER = """
 CREATE TRIGGER IF NOT EXISTS trg_assigned_worker_reconciliation_immutable
-BEFORE UPDATE OF caller_reconciled_at, reconciliation_reason, reconciliation_evidence
+BEFORE UPDATE OF caller_reconciled_at, reconciliation_reason, reconciliation_evidence,
+  reconciliation_evidence_sha256
 ON assigned_worker_callbacks
 WHEN OLD.caller_reconciled_at IS NOT NULL
  AND (
       NEW.caller_reconciled_at IS NOT OLD.caller_reconciled_at
    OR NEW.reconciliation_reason IS NOT OLD.reconciliation_reason
    OR NEW.reconciliation_evidence IS NOT OLD.reconciliation_evidence
+   OR NEW.reconciliation_evidence_sha256 IS NOT OLD.reconciliation_evidence_sha256
  )
 BEGIN
   SELECT RAISE(ABORT, 'caller-accepted retirement reconciliation evidence is immutable once recorded');
@@ -286,6 +292,7 @@ WHEN EXISTS (
   SELECT 1 FROM assigned_worker_callbacks callback
   WHERE callback.worker_terminal_id = OLD.id
     AND callback.lifecycle IN ('assigned', 'dispatched', 'unresolved')
+    AND callback.caller_reconciled_at IS NULL
 )
 BEGIN
   SELECT RAISE(ABORT, 'unclassified assigned-worker terminal must be retained');
@@ -1682,6 +1689,11 @@ def _migrate_assigned_worker_integrity_schema() -> None:
                 conn.execute(
                     "ALTER TABLE assigned_worker_callbacks ADD COLUMN reconciliation_evidence TEXT"
                 )
+            if "reconciliation_evidence_sha256" not in columns:
+                conn.execute(
+                    "ALTER TABLE assigned_worker_callbacks "
+                    "ADD COLUMN reconciliation_evidence_sha256 TEXT"
+                )
 
             rows = conn.execute(
                 "SELECT assignment_id, completion_id, worker_terminal_id, caller_id, "
@@ -2389,10 +2401,18 @@ def delete_terminal(
         if worker_callback is not None:
             _validate_assigned_worker_callback_row(db, worker_callback)
             lifecycle = AssignmentLifecycle(worker_callback.lifecycle)
-            if lifecycle in (
-                AssignmentLifecycle.ASSIGNED,
-                AssignmentLifecycle.DISPATCHED,
-                AssignmentLifecycle.UNRESOLVED,
+            if (
+                lifecycle
+                in (
+                    AssignmentLifecycle.ASSIGNED,
+                    AssignmentLifecycle.DISPATCHED,
+                    AssignmentLifecycle.UNRESOLVED,
+                )
+                # A caller-reconciled record is durably, auditably classified
+                # even though it deliberately never leaves this lifecycle (see
+                # mark_caller_reconciled) -- it is exactly as safe to delete
+                # here as one that transitioned to FAILED/CANCELLED.
+                and worker_callback.caller_reconciled_at is None
             ):
                 if not missing_backend:
                     db.rollback()
@@ -2863,6 +2883,7 @@ def _validate_assigned_worker_callback_row(db: Any, row: AssignedWorkerCallbackM
         row.caller_reconciled_at,
         row.reconciliation_reason,
         row.reconciliation_evidence,
+        row.reconciliation_evidence_sha256,
     )
     if any(value is None for value in reconciliation_fields) != all(
         value is None for value in reconciliation_fields
@@ -2870,6 +2891,14 @@ def _validate_assigned_worker_callback_row(db: Any, row: AssignedWorkerCallbackM
         raise _callback_integrity_error(
             row, "caller-reconciliation fields are only partially present"
         )
+    if row.reconciliation_evidence is not None:
+        expected_evidence_hash = hashlib.sha256(
+            row.reconciliation_evidence.encode("utf-8")
+        ).hexdigest()
+        if row.reconciliation_evidence_sha256 != expected_evidence_hash:
+            raise _callback_integrity_error(
+                row, "reconciliation_evidence SHA-256 mismatch"
+            )
 
     attempt_count = row.attempt_count or 0
     if attempt_count < 0:
@@ -3205,6 +3234,7 @@ def _assigned_worker_callback_from_row(
         caller_reconciled_at=row.caller_reconciled_at,
         reconciliation_reason=row.reconciliation_reason,
         reconciliation_evidence=row.reconciliation_evidence,
+        reconciliation_evidence_sha256=row.reconciliation_evidence_sha256,
     )
 
 
@@ -3694,22 +3724,24 @@ def mark_caller_reconciled(
     assignment_id: str,
     reason: str,
     evidence_json: str,
+    evidence_sha256: str,
 ) -> Optional[AssignedWorkerCallback]:
     """Durably record the recorded assigning caller's independently-verified acceptance.
 
     This NEVER touches ``lifecycle``, ``delivery_state``, or any ``final_result*``
     column -- caller acceptance is recorded as separate, additive evidence, never
-    forged provider completion. Callers (see
-    ``AssignedWorkerCompletionService.reconcile_caller_accepted_result``) are
-    expected to have already validated eligibility (who/state/liveness) before
-    calling this; this function's own responsibility is the durable write and
-    duplicate-safety.
+    forged provider completion. ``evidence_sha256`` must be the SHA-256 of
+    ``evidence_json``; read validation re-verifies this on every load (mirrors
+    ``final_result``/``final_result_sha256``).
 
-    Idempotent: once ``caller_reconciled_at`` is set, this returns the existing
-    row unchanged rather than re-writing it. Attempting to change already-recorded
-    evidence is a data problem the immutability trigger below independently
-    guards; the idempotent early-return here just keeps a genuine duplicate
-    request (mission requires duplicate-safety) from touching the row at all.
+    Callers (see ``AssignedWorkerCompletionService.reconcile_caller_accepted_result``)
+    are expected to have already validated eligibility, identity/assignment
+    binding, state-token freshness, and exact-replay-vs-conflicting-duplicate
+    semantics before calling this; this function's own responsibility is only
+    the durable write and a defense-in-depth idempotent no-op if the row is
+    somehow already reconciled by the time this executes (the caller-visible
+    conflict-on-mismatch decision is made one layer up, with the full old vs.
+    new evidence available for comparison).
     """
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
@@ -3726,6 +3758,7 @@ def mark_caller_reconciled(
         row.caller_reconciled_at = datetime.now()
         row.reconciliation_reason = reason
         row.reconciliation_evidence = evidence_json
+        row.reconciliation_evidence_sha256 = evidence_sha256
         _commit_validated_callback_mutation(db, row)
         return _assigned_worker_callback_from_row(row)
 

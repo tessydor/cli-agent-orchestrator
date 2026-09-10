@@ -88,6 +88,7 @@ class AssignedWorkerCallback(BaseModel):
     caller_reconciled_at: Optional[datetime] = None
     reconciliation_reason: Optional[str] = None
     reconciliation_evidence: Optional[str] = None
+    reconciliation_evidence_sha256: Optional[str] = None
 
 
 class AssignedWorkerIntegrityError(ValueError):
@@ -105,12 +106,45 @@ class TerminalRetirementReconciliationError(ValueError):
     it without parsing prose out of the message.
     """
 
-    #: not_found | wrong_caller | not_eligible | terminal_live | invalid_evidence
+    #: not_found | wrong_caller | wrong_assignment | already_reconciled |
+    #: not_eligible | stale_evidence | terminal_live | invalid_evidence
     code: str
 
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+def compute_reconciliation_state_token(record: "AssignedWorkerCallback") -> str:
+    """Return a deterministic optimistic-concurrency token for one callback record.
+
+    Covers exactly the fields a caller-evidence reconciliation is accepting a
+    snapshot of: worker/assignment/caller identity, lifecycle, delivery_state,
+    whether a provider report has actually landed (never its content -- content
+    is immutable once captured and irrelevant to "is this still stuck"), and the
+    last recorded error (a change there without a lifecycle/delivery_state
+    change -- e.g. a fresh failed capture attempt -- still means the caller
+    observed a stale snapshot). A caller fetches this via
+    ``inspect_terminal_retirement_state``/the completion-callback endpoint,
+    echoes it back on ``reconcile_caller_accepted_result``, and a mismatch
+    (the record moved on in between) is refused as ``stale_evidence`` rather
+    than silently accepted.
+    """
+    payload = json.dumps(
+        {
+            "worker_terminal_id": record.worker_terminal_id,
+            "assignment_id": record.assignment_id,
+            "caller_id": record.caller_id,
+            "lifecycle": record.lifecycle.value,
+            "delivery_state": record.delivery_state.value,
+            "final_result_is_none": record.final_result is None,
+            "last_error": record.last_error or "",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 _EXPLICIT_SENDER_SUFFIX_RE = re.compile(

@@ -215,7 +215,9 @@ def test_legacy_callback_migration_backfills_digest_and_installs_route_guard(tmp
     assert digest == expected_digest
 
 
-def test_pre_reconciliation_schema_migration_adds_columns_and_guard(tmp_path, monkeypatch):
+def test_pre_reconciliation_schema_migration_adds_columns_and_guard(
+    tmp_path, monkeypatch
+):
     """A DB from before this change gets the new columns and immutability guard."""
     database_file = tmp_path / "pre-reconciliation-callback.sqlite"
     with sqlite3.connect(database_file) as conn:
@@ -260,8 +262,16 @@ def test_pre_reconciliation_schema_migration_adds_columns_and_guard(tmp_path, mo
     db._migrate_assigned_worker_integrity_schema()  # idempotent
 
     with sqlite3.connect(database_file) as conn:
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(assigned_worker_callbacks)")}
-    assert {"caller_reconciled_at", "reconciliation_reason", "reconciliation_evidence"} <= columns
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(assigned_worker_callbacks)")
+        }
+    assert {
+        "caller_reconciled_at",
+        "reconciliation_reason",
+        "reconciliation_evidence",
+        "reconciliation_evidence_sha256",
+    } <= columns
 
     engine = create_engine(
         f"sqlite:///{database_file}", connect_args={"check_same_thread": False}
@@ -274,8 +284,12 @@ def test_pre_reconciliation_schema_migration_adds_columns_and_guard(tmp_path, mo
         assert stuck is not None
         assert stuck.caller_reconciled_at is None
 
+        evidence_json = '{"pr": "44"}'
         reconciled = db.mark_caller_reconciled(
-            "stuck-legacy-assignment", "verified via merged PR", '{"pr": "44"}'
+            "stuck-legacy-assignment",
+            "verified via merged PR",
+            evidence_json,
+            hashlib.sha256(evidence_json.encode("utf-8")).hexdigest(),
         )
         assert reconciled is not None
         assert reconciled.caller_reconciled_at is not None
@@ -285,7 +299,9 @@ def test_pre_reconciliation_schema_migration_adds_columns_and_guard(tmp_path, mo
         assert reconciled.final_result is None
 
         with db.SessionLocal() as session:
-            with pytest.raises(DatabaseError, match="reconciliation evidence is immutable"):
+            with pytest.raises(
+                DatabaseError, match="reconciliation evidence is immutable"
+            ):
                 session.execute(
                     db.AssignedWorkerCallbackModel.__table__.update()
                     .where(
@@ -306,9 +322,19 @@ def test_pre_reconciliation_schema_migration_adds_columns_and_guard(tmp_path, mo
 def test_mark_caller_reconciled_is_idempotent_on_repeat_call(callback_db):
     _dispatched_stuck_assignment()
 
-    first = db.mark_caller_reconciled("assignment-stuck", "reason one", '{"a": 1}')
+    first = db.mark_caller_reconciled(
+        "assignment-stuck",
+        "reason one",
+        '{"a": 1}',
+        hashlib.sha256(b'{"a": 1}').hexdigest(),
+    )
     assert first is not None
-    again = db.mark_caller_reconciled("assignment-stuck", "reason two", '{"a": 2}')
+    again = db.mark_caller_reconciled(
+        "assignment-stuck",
+        "reason two",
+        '{"a": 2}',
+        hashlib.sha256(b'{"a": 2}').hexdigest(),
+    )
 
     assert again is not None
     assert again.caller_reconciled_at == first.caller_reconciled_at
@@ -317,7 +343,10 @@ def test_mark_caller_reconciled_is_idempotent_on_repeat_call(callback_db):
 
 
 def test_mark_caller_reconciled_unknown_assignment_returns_none(callback_db):
-    assert db.mark_caller_reconciled("no-such-assignment", "reason", "{}") is None
+    assert (
+        db.mark_caller_reconciled("no-such-assignment", "reason", "{}", "0" * 64)
+        is None
+    )
 
 
 def test_reconciliation_fields_are_all_or_nothing_on_read(callback_db):
@@ -335,6 +364,90 @@ def test_reconciliation_fields_are_all_or_nothing_on_read(callback_db):
 
     with pytest.raises(AssignedWorkerIntegrityError, match="only partially present"):
         db.get_assigned_worker_callback("22222222")
+
+
+def test_reconciliation_evidence_tamper_is_blocked_in_sql_and_detected_again_on_read(
+    callback_db,
+):
+    """Post-write tampering of the reconciliation evidence/digest is caught on read."""
+    _dispatched_stuck_assignment()
+    evidence_json = '{"archive_reference": "a"}'
+    db.mark_caller_reconciled(
+        "assignment-stuck",
+        "verified",
+        evidence_json,
+        hashlib.sha256(evidence_json.encode("utf-8")).hexdigest(),
+    )
+
+    with db.SessionLocal() as session:
+        with pytest.raises(DatabaseError, match="reconciliation evidence is immutable"):
+            session.execute(
+                db.AssignedWorkerCallbackModel.__table__.update()
+                .where(
+                    db.AssignedWorkerCallbackModel.assignment_id == "assignment-stuck"
+                )
+                .values(reconciliation_evidence='{"archive_reference": "tampered"}')
+            )
+            session.commit()
+        session.rollback()
+
+        # Simulate storage corruption beneath the DB guard, same as the
+        # existing final_result tamper test.
+        session.connection().exec_driver_sql(
+            "DROP TRIGGER trg_assigned_worker_reconciliation_immutable"
+        )
+        session.connection().exec_driver_sql(
+            "UPDATE assigned_worker_callbacks "
+            'SET reconciliation_evidence = \'{"archive_reference": "tampered"}\' '
+            "WHERE assignment_id = 'assignment-stuck'"
+        )
+        session.commit()
+
+    with pytest.raises(
+        AssignedWorkerIntegrityError, match="reconciliation_evidence SHA-256"
+    ):
+        db.get_assigned_worker_callback("22222222")
+
+
+def test_caller_reconciled_dispatched_worker_can_be_deleted(callback_db):
+    """A still-DISPATCHED worker becomes deletable once caller-reconciled.
+
+    The "unclassified assigned-worker terminal must be retained" guard exists
+    to keep an unproven DISPATCHED/UNRESOLVED terminal from being deleted out
+    from under a later reconciliation pass -- but it must recognize
+    ``caller_reconciled_at`` as an alternate, equally durable classification,
+    or a caller-reconciled worker (which deliberately never leaves lifecycle
+    DISPATCHED) could never actually be deleted.
+    """
+    _dispatched_stuck_assignment()
+    evidence_json = '{"archive_reference": "a"}'
+    db.mark_caller_reconciled(
+        "assignment-stuck",
+        "verified",
+        evidence_json,
+        hashlib.sha256(evidence_json.encode("utf-8")).hexdigest(),
+    )
+
+    assert db.delete_terminal("22222222") is True
+
+    retained = db.get_assigned_worker_callback("22222222")
+    assert retained is not None
+    assert retained.lifecycle == AssignmentLifecycle.DISPATCHED
+    assert retained.caller_reconciled_at is not None
+
+
+def test_unreconciled_dispatched_worker_still_refuses_deletion(callback_db):
+    """The pre-existing guard is unchanged for a worker with no reconciliation."""
+    _dispatched_stuck_assignment()
+
+    with pytest.raises(DatabaseError, match="unclassified assigned-worker terminal"):
+        with db.SessionLocal() as session:
+            session.execute(
+                db.TerminalModel.__table__.delete().where(
+                    db.TerminalModel.id == "22222222"
+                )
+            )
+            session.commit()
 
 
 def test_capture_validates_digest_and_immutable_result_reference(callback_db):
