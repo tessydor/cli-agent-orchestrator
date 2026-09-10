@@ -1060,40 +1060,45 @@ def _reconcile_terminal_retirement_impl(
     archive_sha256: str,
     accepted_evidence: str,
 ) -> Dict[str, Any]:
-    """Implementation of reconcile_terminal_retirement logic."""
+    """Implementation of reconcile_terminal_retirement logic.
+
+    correction-842: this calls straight into the service, in-process, never
+    over HTTP -- see mcp_server/reconciliation_direct.py for why. There is no
+    generic REST mutation this could otherwise reach: a caller-identity check
+    reachable only over HTTP cannot hold when the auth layer is disabled,
+    which is this deployment's actual configuration.
+    """
     own_terminal_id = _own_terminal_id_or_error("reconcile terminal retirement")
     if isinstance(own_terminal_id, dict):
         return own_terminal_id
+
+    from cli_agent_orchestrator.mcp_server.reconciliation_direct import (
+        reconcile_caller_accepted_result_locally,
+    )
+    from cli_agent_orchestrator.models.assigned_worker import (
+        TerminalRetirementReconciliationError,
+    )
+
     try:
-        result = mcp_utils.post_body_json(
-            f"/assigned-workers/{worker_terminal_id}/retirement-reconciliation",
+        result = reconcile_caller_accepted_result_locally(
+            worker_terminal_id,
+            own_terminal_id,
+            assignment_id,
+            expected_state_token,
+            reason,
             {
-                "caller_id": own_terminal_id,
-                "assignment_id": assignment_id,
-                "expected_state_token": expected_state_token,
-                "reason": reason,
                 "archive_reference": archive_reference,
                 "archive_sha256": archive_sha256,
                 "accepted_evidence": accepted_evidence,
             },
-            timeout=_mcp_timeout(),
         )
         return {"success": True, "callback": result}
-    except requests.HTTPError as e:
-        detail = (
-            _extract_error_detail(e.response, str(e))
-            if e.response is not None
-            else str(e)
-        )
-        return {
-            "success": False,
-            "error": f"Failed to reconcile terminal retirement: {detail}",
-        }
+    except TerminalRetirementReconciliationError as exc:
+        # Exact guard failure, same shape every caller of this tool used to
+        # get from the (now removed) HTTP endpoint's mapped status/detail.
+        return {"success": False, "error": f"{exc.code}: {exc}"}
     except Exception as e:
-        return {
-            "success": False,
-            "error": f"Failed to reconcile terminal retirement: {str(e)}",
-        }
+        return {"success": False, "error": f"Failed to reconcile terminal retirement: {str(e)}"}
 
 
 @mcp.tool()
@@ -1160,6 +1165,11 @@ def reconcile_terminal_retirement(
     A later call with different assignment/token/reason/evidence against an
     already-reconciled terminal is refused as a conflict, never silently
     accepted. Call delete_terminal as usual once this succeeds.
+
+    This tool is the ONLY way to perform this action -- there is no HTTP
+    route for it. That is deliberate: a caller-identity check reachable over
+    a generic REST mutation cannot hold in every auth configuration, so the
+    action only runs from within this trusted MCP process.
     """
     return _reconcile_terminal_retirement_impl(
         worker_terminal_id,

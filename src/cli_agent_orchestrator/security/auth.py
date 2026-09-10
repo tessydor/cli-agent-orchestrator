@@ -443,65 +443,15 @@ def require_any_scope(*required: str) -> Callable[..., Any]:
     return _dep
 
 
-def require_local_service_token() -> Callable[..., Any]:
-    """FastAPI dependency requiring the presented bearer to BE this server's
-    own ``CAO_AUTH_LOCAL_TOKEN``, not merely a validly-scoped token.
-
-    ``require_any_scope`` alone cannot distinguish "the local MCP server for
-    THIS deployment" from any other caller who happens to hold a token scoped
-    ``cao:admin`` -- every bearer that clears scope checks is fungible (see
-    ``get_current_scopes``/``extract_scopes_from_token``): a human operator's
-    own session, a dashboard, or an unrelated service's admin credential all
-    pass identically. For a mutation where that distinction actually matters
-    (see ``RetirementReconciliationBody`` in ``api/main.py``), this narrows
-    the reachable population from "anyone holding an admin-scoped token" down
-    to "whoever possesses this exact machine-local secret" -- in this
-    deployment, precisely the locally-spawned MCP server subprocesses that
-    ``get_local_bearer`` hands the identical value to attach on their own
-    outbound calls (``mcp_server/utils.py``, ``utils/orchestration.py``), and
-    never a remote/dashboard/other-service admin credential that merely also
-    carries ``cao:admin``.
-
-    This is explicitly NOT a per-terminal identity proof: every MCP
-    subprocess on this machine shares the one local token, so it cannot tell
-    terminal X's process from terminal Y's. Callers still need a separate
-    caller_id/assignment/state-token check (as ``reconcile_caller_accepted_result``
-    already has) for that. This dependency only rules OUT the broader
-    "any admin-scoped credential, anywhere" population -- exactly the gap a
-    review found: an admin-scoped caller that is not this deployment's own
-    local MCP infrastructure could read a recorded caller_id and submit it
-    back; that caller now fails here before ever reaching the caller_id
-    check, because it does not hold this specific secret.
-
-    Default-off: when auth is disabled, this is a no-op -- byte-for-byte
-    unchanged, matching every other dependency in this module. When auth is
-    enabled but the operator never provisioned ``CAO_AUTH_LOCAL_TOKEN`` on
-    this server process, every call fails closed with an actionable 401
-    rather than silently falling back to "reachable by any admin scope."
-    """
-
-    async def _dep(authorization: Optional[str] = Header(default=None)) -> None:
-        if not is_auth_enabled():
-            return
-        configured = os.getenv("CAO_AUTH_LOCAL_TOKEN", "").strip()
-        if not configured:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=(
-                    "server has no CAO_AUTH_LOCAL_TOKEN configured; this operation "
-                    "requires the local machine service token"
-                ),
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        presented = _extract_bearer(authorization)
-        if not presented or presented != configured:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=(
-                    "this operation requires the local machine service token, not "
-                    "a generic admin-scoped credential"
-                ),
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-
-    return _dep
+# NOTE (correction-842): an earlier revision of this module defined
+# ``require_local_service_token()`` here -- a dependency requiring the
+# presented bearer to exactly equal ``CAO_AUTH_LOCAL_TOKEN`` -- as a narrower
+# alternative to ``require_any_scope(SCOPE_ADMIN)`` for the
+# retirement-reconciliation mutation. It was removed: it (like every
+# dependency in this module) is a no-op when ``is_auth_enabled()`` is False,
+# and the actual target deployment runs with auth disabled. A
+# security-sensitive mutation that must never be reachable by a generic HTTP
+# client, in EVERY configuration including auth-disabled, cannot be solved by
+# any check gated on the auth toggle -- see
+# ``mcp_server/reconciliation_direct.py`` for the fix that removed the
+# generic REST mutation entirely instead.

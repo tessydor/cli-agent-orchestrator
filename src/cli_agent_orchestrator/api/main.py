@@ -95,7 +95,6 @@ from cli_agent_orchestrator.graph.providers import GraphProvider, get_provider
 from cli_agent_orchestrator.graph.sinks import get_sink
 from cli_agent_orchestrator.models.assigned_worker import (
     AssignedWorkerIntegrityError,
-    TerminalRetirementReconciliationError,
     compute_reconciliation_state_token,
 )
 from cli_agent_orchestrator.models.flow import Flow
@@ -131,7 +130,6 @@ from cli_agent_orchestrator.security.auth import (
     get_current_scopes,
     is_auth_enabled,
     require_any_scope,
-    require_local_service_token,
 )
 from cli_agent_orchestrator.services import (
     approval_gate,
@@ -403,68 +401,6 @@ def _validate_model_id(value: str) -> None:
         raise ValueError(f"model exceeds the {MODEL_ID_MAX_LEN}-char cap")
     if not re.fullmatch(MODEL_ID_RE, value):
         raise ValueError(f"model {value!r} is invalid (must match {MODEL_ID_RE!r})")
-
-
-class RetirementReconciliationBody(BaseModel):
-    """Request body for ``POST /assigned-workers/{id}/retirement-reconciliation``.
-
-    Every field is required (no defaults): an omitted ``reason`` or evidence
-    field is rejected with 422 rather than silently treated as empty, matching
-    ``UpdateGroupBody``/``UpdateMetadataBody`` above. Field-level non-empty/size
-    validation is intentionally NOT duplicated here — the service layer
-    (``AssignedWorkerCompletionService.reconcile_caller_accepted_result``) is the
-    single source of truth for that, so the exact refusal it returns is what
-    every caller (API, MCP, CLI) sees, never a divergent Pydantic message.
-
-    ``caller_id`` identity note: this codebase's auth stack has no notion of
-    "this bearer token IS terminal X" -- only coarse read/write/admin scopes
-    (``security/auth.py``) that are fungible across every holder. A prior
-    review correctly found that an ADMIN-scoped bearer belonging to a generic
-    caller (a human operator's own session, a dashboard, an unrelated
-    service) could read a stuck assignment's recorded ``caller_id`` from the
-    completion-callback endpoint and submit that exact value back here,
-    passing the DB-consistency check with no real identity behind it -- the
-    ``wrong_caller`` guard alone only catches a WRONG id, never a correctly
-    guessed/known one.
-
-    This route is therefore gated by TWO independent checks, not one:
-    ``require_any_scope(SCOPE_ADMIN)`` (coarse authorization, unchanged) AND
-    ``require_local_service_token()`` (see ``security/auth.py``), which
-    requires the presented bearer to be byte-for-byte this server's own
-    ``CAO_AUTH_LOCAL_TOKEN`` rather than merely any validly-scoped admin
-    token. That narrows reachability from "anyone holding an admin-scoped
-    credential" down to "whoever possesses this exact machine-local secret"
-    -- in this deployment, precisely the locally-spawned MCP server
-    subprocesses (the trusted seam is the ``reconcile_terminal_retirement``
-    MCP tool, whose ``caller_id`` argument does not exist -- it resolves
-    exclusively from that process's own ``CAO_TERMINAL_ID`` env var, never a
-    model-suppliable value, mirroring ``answer_worker_question``), never a
-    remote/dashboard/other-service admin credential that merely also carries
-    ``cao:admin``.
-
-    This still does NOT bind to a specific TERMINAL's identity -- every MCP
-    subprocess on the machine shares the one local token, so a
-    ``require_local_service_token()`` pass proves only "this is CAO's own
-    local MCP infrastructure," not "this is terminal X specifically." The
-    ``caller_id`` DB-consistency check (unchanged) remains the only defense
-    against one legitimate terminal's MCP process reconciling a DIFFERENT
-    terminal's assignment; per correction-836, that residual gap requires a
-    genuine per-terminal credential this codebase does not have anywhere
-    (verified against every comparable mutation, not unique to this route)
-    and is out of scope for this narrowly-scoped fix.
-
-    ``assignment_id``/``expected_state_token`` bind the request to an exact
-    observed snapshot (see ``compute_reconciliation_state_token``) rather than
-    trusting ``worker_terminal_id`` alone to identify what is being accepted.
-    """
-
-    caller_id: TerminalId
-    assignment_id: str
-    expected_state_token: str
-    reason: str
-    archive_reference: str
-    archive_sha256: str
-    accepted_evidence: str
 
 
 class UpdateGroupBody(BaseModel):
@@ -6745,74 +6681,6 @@ async def get_assigned_worker_completion_callback_endpoint(
     # time the request lands (see compute_reconciliation_state_token).
     payload["state_token"] = compute_reconciliation_state_token(record)
     return cast(Dict, jsonable_encoder(payload))
-
-
-_RECONCILIATION_ERROR_STATUS = {
-    "not_found": status.HTTP_404_NOT_FOUND,
-    "wrong_caller": status.HTTP_403_FORBIDDEN,
-    "wrong_assignment": status.HTTP_409_CONFLICT,
-    "already_reconciled": status.HTTP_409_CONFLICT,
-    "not_eligible": status.HTTP_409_CONFLICT,
-    "stale_evidence": status.HTTP_409_CONFLICT,
-    "terminal_live": status.HTTP_409_CONFLICT,
-    "invalid_evidence": status.HTTP_400_BAD_REQUEST,
-}
-
-
-@app.post("/assigned-workers/{worker_terminal_id}/retirement-reconciliation")
-async def reconcile_assigned_worker_retirement_endpoint(
-    worker_terminal_id: TerminalId,
-    body: RetirementReconciliationBody,
-    _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
-    _local_service_token: None = Depends(require_local_service_token()),
-) -> Dict:
-    """Record the recorded assigning caller's evidence-backed acceptance of a
-    terminal whose authoritative provider completion report is permanently
-    unavailable, so it can be retired without ever forging that report.
-
-    This is NOT a completion callback and never becomes one: ``lifecycle``,
-    ``delivery_state``, and ``final_result`` on the callback record are
-    untouched. It is a distinct, durable, auditable fact -- who (the immutable
-    recorded caller, never an unrelated caller), which assignment
-    (``assignment_id``, checked against the record's own immutable identity),
-    on what observed snapshot (``expected_state_token``, from ``GET
-    .../completion-callback``'s ``state_token`` -- refused as stale if the
-    record has moved on since), when, why (``reason``), and on what
-    caller-attested evidence (``archive_reference``, ``archive_sha256``,
-    ``accepted_evidence`` -- CAO never independently verifies off-box artifact
-    or commit contents; it only durably records the attestation) -- that
-    ``prepare_terminal_retirement`` (the same guard the ordinary
-    ``delete_terminal`` path already goes through, and which independently
-    re-checks live terminal activity at actual teardown time) checks before
-    allowing retirement of an otherwise permanently-stuck assignment. Scoped
-    ADMIN like ``DELETE /terminals/{id}`` because it is a lifecycle-mutating
-    operation, not a read -- AND additionally requires this server's own
-    local machine service token (``require_local_service_token``), narrower
-    than ADMIN scope alone. See ``RetirementReconciliationBody`` for the full
-    caller-identity trust-boundary note.
-    """
-    try:
-        updated = await asyncio.to_thread(
-            assigned_worker_completion_service.reconcile_caller_accepted_result,
-            worker_terminal_id,
-            body.caller_id,
-            body.assignment_id,
-            body.expected_state_token,
-            body.reason,
-            {
-                "archive_reference": body.archive_reference,
-                "archive_sha256": body.archive_sha256,
-                "accepted_evidence": body.accepted_evidence,
-            },
-        )
-    except TerminalRetirementReconciliationError as exc:
-        raise HTTPException(
-            status_code=_RECONCILIATION_ERROR_STATUS.get(
-                exc.code, status.HTTP_409_CONFLICT
-            ),
-            detail=f"{exc.code}: {exc}",
-        ) from exc
-    return cast(Dict, jsonable_encoder(updated.model_dump()))
 
 
 @app.post("/terminals/{receiver_id}/inbox/messages")

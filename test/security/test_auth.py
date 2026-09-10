@@ -346,60 +346,6 @@ async def test_require_any_scope_admin_required_for_delete(monkeypatch):
     assert await dep([auth.SCOPE_ADMIN]) == [auth.SCOPE_ADMIN]
 
 
-# --- require_local_service_token: distinguishes the local MCP seam from any
-# other admin-scoped bearer (correction-836, item 5) ------------------------
-
-
-@pytest.mark.asyncio
-async def test_require_local_service_token_noop_when_auth_disabled():
-    # Default-off: no header, no configured token, nothing raised.
-    dep = auth.require_local_service_token()
-    assert await dep(None) is None
-
-
-@pytest.mark.asyncio
-async def test_require_local_service_token_fails_closed_when_unconfigured(monkeypatch):
-    """Auth on but the operator never provisioned CAO_AUTH_LOCAL_TOKEN server-side."""
-    monkeypatch.setenv("CAO_AUTH_JWKS_URI", "https://idp.example/jwks")
-    monkeypatch.delenv("CAO_AUTH_LOCAL_TOKEN", raising=False)
-    dep = auth.require_local_service_token()
-    with pytest.raises(HTTPException) as ei:
-        await dep("Bearer anything")
-    assert ei.value.status_code == 401
-
-
-@pytest.mark.asyncio
-async def test_require_local_service_token_rejects_generic_admin_bearer(monkeypatch):
-    """The exact impersonation scenario: a DIFFERENT valid admin-scoped bearer
-    (a human operator's own session, a dashboard, an unrelated service) is
-    refused even though it is a real, non-empty, distinct token."""
-    monkeypatch.setenv("CAO_AUTH_JWKS_URI", "https://idp.example/jwks")
-    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", "the-real-local-secret")
-    dep = auth.require_local_service_token()
-    with pytest.raises(HTTPException) as ei:
-        await dep("Bearer some-other-admin-scoped-token")
-    assert ei.value.status_code == 401
-
-
-@pytest.mark.asyncio
-async def test_require_local_service_token_rejects_missing_header(monkeypatch):
-    monkeypatch.setenv("CAO_AUTH_JWKS_URI", "https://idp.example/jwks")
-    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", "the-real-local-secret")
-    dep = auth.require_local_service_token()
-    with pytest.raises(HTTPException) as ei:
-        await dep(None)
-    assert ei.value.status_code == 401
-
-
-@pytest.mark.asyncio
-async def test_require_local_service_token_passes_the_real_local_seam(monkeypatch):
-    """The trusted MCP-local seam: the exact configured secret is admitted."""
-    monkeypatch.setenv("CAO_AUTH_JWKS_URI", "https://idp.example/jwks")
-    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", "the-real-local-secret")
-    dep = auth.require_local_service_token()
-    assert await dep("Bearer the-real-local-secret") is None
-
-
 # --- authorization-server discovery + local-token + bearer parsing --------
 
 

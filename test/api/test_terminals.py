@@ -708,33 +708,21 @@ class TestAssignedWorkerCompletionCallbackEndpoint:
         engine.dispose()
 
 
-class _FakeJwksSigningKey:
-    def __init__(self, key):
-        self.key = key
-
-
 class _FakeJwksClient:
     def __init__(self, public_key):
         self._public_key = public_key
 
     def get_signing_key_from_jwt(self, token):
-        return _FakeJwksSigningKey(self._public_key)
+        class _Key:
+            key = self._public_key
+
+        return _Key()
 
 
 def _mint_admin_jwt(rsa_key, *, subject: str = "generic-admin-caller") -> str:
-    """A real, validly-signed, admin-scoped JWT.
-
-    ``CAO_AUTH_LOCAL_TOKEN`` is itself "a machine token from the same IdP"
-    (security/auth.py::get_local_bearer) -- i.e. also a real signed
-    admin-scoped JWT, just one specific one the operator provisioned and
-    every local MCP subprocess shares. ``subject`` only exists so two calls
-    mint two DIFFERENT token strings (distinguishing "the configured local
-    secret" from "some other, equally valid, admin-scoped JWT" -- the exact
-    generic-admin-caller scenario: a human operator's own session, a
-    dashboard, or an unrelated service that legitimately holds ``cao:admin``
-    through the IdP but is not this deployment's own local MCP
-    infrastructure).
-    """
+    """A real, validly-signed, admin-scoped JWT -- a generic admin caller
+    (human operator session, dashboard, unrelated service), not this
+    deployment's own local MCP infrastructure."""
     now = datetime.now(timezone.utc)
     claims = {
         "aud": "cao-api",
@@ -747,8 +735,16 @@ def _mint_admin_jwt(rsa_key, *, subject: str = "generic-admin-caller") -> str:
     return jwt.encode(claims, rsa_key, algorithm="RS256", headers={"kid": "test"})
 
 
-class TestRetirementReconciliationEndpoint:
-    """POST /assigned-workers/{id}/retirement-reconciliation."""
+class TestRetirementReconciliationRouteRemoved:
+    """correction-842: the generic REST mutation is gone entirely.
+
+    A caller-identity check reachable only over HTTP cannot hold in every
+    auth configuration (the actual target deployment runs with auth
+    disabled, where require_any_scope/require_local_service_token-style
+    checks are no-ops) -- so no HTTP route exists for this action in ANY
+    configuration. Reconciliation now only happens in-process, from within
+    the trusted MCP server (see test/mcp_server/test_reconciliation_direct.py).
+    """
 
     _BODY = {
         "caller_id": "feedbeef",
@@ -760,158 +756,25 @@ class TestRetirementReconciliationEndpoint:
         "accepted_evidence": "PR44 merge 5c673ce11e8226ed23d2566f7f780d7d9471354c",
     }
 
-    def test_success_returns_updated_record(self, client):
-        record = MagicMock()
-        record.model_dump.return_value = {
-            "assignment_id": "assignment-one",
-            "worker_terminal_id": "abcd1234",
-            "caller_id": "feedbeef",
-            "caller_reconciled_at": "2026-09-10T06:00:00",
-        }
+    def test_route_is_gone_with_auth_disabled(self, client):
+        """Regression 1 (correction-842): auth disabled, exact recorded
+        caller_id, generic REST request -- still cannot reconcile."""
         with patch(
             "cli_agent_orchestrator.api.main.assigned_worker_completion_service"
         ) as mock_svc:
-            mock_svc.reconcile_caller_accepted_result.return_value = record
-
             response = client.post(
                 "/assigned-workers/abcd1234/retirement-reconciliation", json=self._BODY
             )
 
-        assert response.status_code == 200
-        assert response.json()["caller_reconciled_at"] == "2026-09-10T06:00:00"
-        mock_svc.reconcile_caller_accepted_result.assert_called_once_with(
-            "abcd1234",
-            "feedbeef",
-            "assignment-one",
-            "a" * 64,
-            "Independently verified via merged PR",
-            {
-                "archive_reference": "archive-sha-abc123",
-                "archive_sha256": "b" * 64,
-                "accepted_evidence": "PR44 merge 5c673ce11e8226ed23d2566f7f780d7d9471354c",
-            },
-        )
+        assert response.status_code in (404, 405)
+        mock_svc.reconcile_caller_accepted_result.assert_not_called()
 
-    @pytest.mark.parametrize(
-        "code,expected_status",
-        [
-            ("not_found", 404),
-            ("wrong_caller", 403),
-            ("wrong_assignment", 409),
-            ("already_reconciled", 409),
-            ("not_eligible", 409),
-            ("stale_evidence", 409),
-            ("terminal_live", 409),
-            ("invalid_evidence", 400),
-        ],
-    )
-    def test_guard_failures_map_to_exact_status_and_reason(
-        self, client, code, expected_status
+    def test_route_is_gone_with_auth_enabled_and_generic_admin_bearer(
+        self, client, monkeypatch
     ):
-        from cli_agent_orchestrator.models.assigned_worker import (
-            TerminalRetirementReconciliationError,
-        )
-
-        with patch(
-            "cli_agent_orchestrator.api.main.assigned_worker_completion_service"
-        ) as mock_svc:
-            mock_svc.reconcile_caller_accepted_result.side_effect = (
-                TerminalRetirementReconciliationError(code, f"refused: {code}")
-            )
-
-            response = client.post(
-                "/assigned-workers/abcd1234/retirement-reconciliation", json=self._BODY
-            )
-
-        assert response.status_code == expected_status
-        assert response.json()["detail"] == f"{code}: refused: {code}"
-
-    def test_missing_field_is_422(self, client):
-        body = dict(self._BODY)
-        del body["reason"]
-
-        response = client.post(
-            "/assigned-workers/abcd1234/retirement-reconciliation", json=body
-        )
-
-        assert response.status_code == 422
-
-    def test_missing_assignment_id_is_422(self, client):
-        """Assignment binding is required, not merely worker_terminal_id."""
-        body = dict(self._BODY)
-        del body["assignment_id"]
-
-        response = client.post(
-            "/assigned-workers/abcd1234/retirement-reconciliation", json=body
-        )
-
-        assert response.status_code == 422
-
-    def test_missing_expected_state_token_is_422(self, client):
-        body = dict(self._BODY)
-        del body["expected_state_token"]
-
-        response = client.post(
-            "/assigned-workers/abcd1234/retirement-reconciliation", json=body
-        )
-
-        assert response.status_code == 422
-
-    def test_wrong_caller_id_value_is_refused_by_db_consistency_check(self, client):
-        """NOT an impersonation test: this only proves the service's DB-consistency
-        check rejects a caller_id value that doesn't match the recorded one. It
-        says nothing about whether a generic caller could submit the CORRECT
-        recorded caller_id -- see TestRetirementReconciliationAuthBoundary for
-        the actual impersonation regression (correction-836 item 5), which this
-        test was previously, misleadingly, named as covering.
-        """
-        from cli_agent_orchestrator.models.assigned_worker import (
-            TerminalRetirementReconciliationError,
-        )
-
-        wrong_caller_body = dict(self._BODY)
-        wrong_caller_body["caller_id"] = "1eadbeef"  # not the recorded caller
-        with patch(
-            "cli_agent_orchestrator.api.main.assigned_worker_completion_service"
-        ) as mock_svc:
-            mock_svc.reconcile_caller_accepted_result.side_effect = (
-                TerminalRetirementReconciliationError(
-                    "wrong_caller", "refused: wrong_caller"
-                )
-            )
-
-            response = client.post(
-                "/assigned-workers/abcd1234/retirement-reconciliation",
-                json=wrong_caller_body,
-            )
-
-        assert response.status_code == 403
-        mock_svc.reconcile_caller_accepted_result.assert_called_once_with(
-            "abcd1234",
-            "1eadbeef",
-            "assignment-one",
-            "a" * 64,
-            "Independently verified via merged PR",
-            {
-                "archive_reference": "archive-sha-abc123",
-                "archive_sha256": "b" * 64,
-                "accepted_evidence": "PR44 merge 5c673ce11e8226ed23d2566f7f780d7d9471354c",
-            },
-        )
-
-
-class TestRetirementReconciliationAuthBoundary:
-    """Correction-836 item 5: the real impersonation regression.
-
-    A generic ADMIN-scoped HTTP request carrying the EXACT recorded
-    caller_id must still be refused; only a request bearing this server's
-    own local machine service token (the trusted MCP-local seam) may pass.
-    """
-
-    _BODY = TestRetirementReconciliationEndpoint._BODY
-
-    @pytest.fixture(autouse=True)
-    def _clear_auth_env(self, monkeypatch):
+        """Regression 2 (correction-842): auth enabled, generic ADMIN bearer,
+        exact recorded caller_id -- still cannot reconcile. No route exists
+        for require_any_scope to even gate."""
         for var in (
             "AUTH0_DOMAIN",
             "CAO_AUTH_JWKS_URI",
@@ -922,109 +785,49 @@ class TestRetirementReconciliationAuthBoundary:
         ):
             monkeypatch.delenv(var, raising=False)
         auth_module.get_jwks_cache().clear()
-
-    @pytest.fixture
-    def rsa_key(self):
-        return rsa.generate_private_key(public_exponent=65537, key_size=2048)
-
-    def _enable_auth(self, monkeypatch, rsa_key) -> str:
-        """Enable auth and return the exact CAO_AUTH_LOCAL_TOKEN JWT configured
-        server-side -- the one string that should clear require_local_service_token.
-        """
+        rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         monkeypatch.setenv("AUTH0_DOMAIN", "example.auth0.com")
         monkeypatch.setenv("CAO_AUTH_AUDIENCE", "cao-api")
-        local_token = _mint_admin_jwt(rsa_key, subject="local-mcp-infrastructure")
-        monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", local_token)
+        admin_token = _mint_admin_jwt(rsa_key)
         fake = _FakeJwksClient(rsa_key.public_key())
         monkeypatch.setattr(auth_module.get_jwks_cache(), "get_client", lambda uri: fake)
-        return local_token
-
-    def test_generic_admin_bearer_with_exact_correct_caller_id_still_refused(
-        self, client, monkeypatch, rsa_key
-    ):
-        """The exact scenario the review found: an admin-scoped caller reads
-        the recorded caller_id (e.g. via GET .../completion-callback, which
-        is READ-scoped, even more open than this ADMIN route) and submits
-        that exact value here. It must never reach the service layer."""
-        self._enable_auth(monkeypatch, rsa_key)
-        admin_token = _mint_admin_jwt(rsa_key)
 
         with patch(
             "cli_agent_orchestrator.api.main.assigned_worker_completion_service"
         ) as mock_svc:
-            response = client.post(
-                "/assigned-workers/abcd1234/retirement-reconciliation",
-                json=self._BODY,  # carries the EXACT recorded caller_id
-                headers={"Authorization": f"Bearer {admin_token}"},
-            )
-
-        assert response.status_code == 401
-        mock_svc.reconcile_caller_accepted_result.assert_not_called()
-
-    def test_missing_bearer_entirely_is_refused(self, client, monkeypatch, rsa_key):
-        self._enable_auth(monkeypatch, rsa_key)
-        with patch(
-            "cli_agent_orchestrator.api.main.assigned_worker_completion_service"
-        ) as mock_svc:
-            response = client.post(
-                "/assigned-workers/abcd1234/retirement-reconciliation", json=self._BODY
-            )
-        assert response.status_code == 401
-        mock_svc.reconcile_caller_accepted_result.assert_not_called()
-
-    def test_trusted_mcp_local_seam_bearer_passes_the_auth_boundary(
-        self, client, monkeypatch, rsa_key
-    ):
-        """The trusted MCP-local seam: exactly what reconcile_terminal_retirement
-        sends (CAO_AUTH_LOCAL_TOKEN, via mcp_utils._auth_headers/get_local_bearer)
-        clears this gate and reaches the service layer -- proving the fix does
-        not also lock out the legitimate path."""
-        local_token = self._enable_auth(monkeypatch, rsa_key)
-        record = MagicMock()
-        record.model_dump.return_value = {"caller_reconciled_at": "2026-09-10T06:00:00"}
-
-        with patch(
-            "cli_agent_orchestrator.api.main.assigned_worker_completion_service"
-        ) as mock_svc:
-            mock_svc.reconcile_caller_accepted_result.return_value = record
             response = client.post(
                 "/assigned-workers/abcd1234/retirement-reconciliation",
                 json=self._BODY,
-                headers={"Authorization": f"Bearer {local_token}"},
+                headers={"Authorization": f"Bearer {admin_token}"},
             )
 
-        assert response.status_code == 200
-        mock_svc.reconcile_caller_accepted_result.assert_called_once()
+        assert response.status_code in (404, 405)
+        mock_svc.reconcile_caller_accepted_result.assert_not_called()
 
-    def test_local_seam_bearer_still_refuses_wrong_terminal_caller_id(
-        self, client, monkeypatch, rsa_key
-    ):
-        """Wrong-terminal MCP context still refuses: holding the shared local
-        secret is necessary but not sufficient -- the caller_id DB-consistency
-        check (unchanged) still catches a DIFFERENT terminal's own
-        CAO_TERMINAL_ID being submitted for this assignment."""
-        from cli_agent_orchestrator.models.assigned_worker import (
-            TerminalRetirementReconciliationError,
-        )
-
-        local_token = self._enable_auth(monkeypatch, rsa_key)
-        wrong_terminal_body = dict(self._BODY)
-        wrong_terminal_body["caller_id"] = "9999beef"  # a different terminal's own id
-
+    def test_get_completion_callback_still_exists_unchanged(self, client):
+        """Only the mutation was removed -- the read-only endpoint that backs
+        inspect_terminal_retirement_state is untouched. A 404 here carries
+        OUR own detail message (the route was reached, the row wasn't found),
+        distinguishing it from FastAPI's generic "no matching route" 404."""
         with patch(
-            "cli_agent_orchestrator.api.main.assigned_worker_completion_service"
-        ) as mock_svc:
-            mock_svc.reconcile_caller_accepted_result.side_effect = (
-                TerminalRetirementReconciliationError("wrong_caller", "refused: wrong_caller")
-            )
-            response = client.post(
-                "/assigned-workers/abcd1234/retirement-reconciliation",
-                json=wrong_terminal_body,
-                headers={"Authorization": f"Bearer {local_token}"},
-            )
+            "cli_agent_orchestrator.api.main.get_assigned_worker_callback",
+            return_value=None,
+        ):
+            response = client.get("/assigned-workers/abcd1234/completion-callback")
 
-        assert response.status_code == 403
-        mock_svc.reconcile_caller_accepted_result.assert_called_once()
+        assert response.status_code == 404
+        assert "not found" in response.json()["detail"]
+
+    def test_mutation_route_no_longer_registered_in_the_app(self):
+        """Structural guard: the route table itself has no POST route for this
+        path at all -- not merely one that happens to refuse every caller."""
+        matches = [
+            r
+            for r in app.routes
+            if getattr(r, "path", None) == "/assigned-workers/{worker_terminal_id}/retirement-reconciliation"
+            and "POST" in (getattr(r, "methods", None) or set())
+        ]
+        assert matches == []
 
 
 class TestCreateInboxMessageEndpoint:

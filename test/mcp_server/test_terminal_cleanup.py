@@ -230,7 +230,14 @@ class TestDeleteTerminal:
 
 
 class TestReconcileTerminalRetirement:
-    """Tests for the reconcile_terminal_retirement MCP tool."""
+    """Tests for the reconcile_terminal_retirement MCP tool.
+
+    correction-842: this now calls straight into the service, in-process --
+    see test/mcp_server/test_reconciliation_direct.py for the real,
+    DB-backed end-to-end coverage. These tests pin the MCP-tool wrapper's own
+    contract: identity resolution, error-shape translation, and the
+    structural impersonation proof.
+    """
 
     _ARGS = (
         "worker1",
@@ -252,35 +259,33 @@ class TestReconcileTerminalRetirement:
         """Identity comes solely from this process's own env, never an argument."""
         with patch.dict(os.environ, {"CAO_TERMINAL_ID": "caller-abc"}):
             with patch(
-                "cli_agent_orchestrator.mcp_server.server.mcp_utils.post_body_json"
-            ) as mock_post:
-                mock_post.return_value = {"caller_reconciled_at": "2026-09-10T06:00:00"}
+                "cli_agent_orchestrator.mcp_server.reconciliation_direct."
+                "reconcile_caller_accepted_result_locally"
+            ) as mock_local:
+                mock_local.return_value = {"caller_reconciled_at": "2026-09-10T06:00:00"}
                 result = reconcile_terminal_retirement(*self._ARGS)
 
         assert result == {
             "success": True,
             "callback": {"caller_reconciled_at": "2026-09-10T06:00:00"},
         }
-        mock_post.assert_called_once()
-        path, body = mock_post.call_args[0]
-        assert path == "/assigned-workers/worker1/retirement-reconciliation"
-        assert body == {
-            "caller_id": "caller-abc",
-            "assignment_id": "assignment-1",
-            "expected_state_token": "a" * 64,
-            "reason": "reason",
-            "archive_reference": "archive-ref",
-            "archive_sha256": "b" * 64,
-            "accepted_evidence": "accepted-ev",
-        }
+        mock_local.assert_called_once_with(
+            "worker1",
+            "caller-abc",
+            "assignment-1",
+            "a" * 64,
+            "reason",
+            {
+                "archive_reference": "archive-ref",
+                "archive_sha256": "b" * 64,
+                "accepted_evidence": "accepted-ev",
+            },
+        )
 
     def test_tool_signature_has_no_caller_identity_argument(self):
         """Structural proof against impersonation: no argument through which a
         model (benign or compromised) could ever make this tool claim to be
-        any caller_id other than this process's own CAO_TERMINAL_ID. This is
-        the actual identity-authenticated boundary for LLM-driven agents --
-        the underlying REST route's own caller_id-in-body is checked only for
-        DB-consistency, documented in RetirementReconciliationBody.
+        any caller_id other than this process's own CAO_TERMINAL_ID.
         """
         import inspect
 
@@ -288,28 +293,43 @@ class TestReconcileTerminalRetirement:
         assert "caller_id" not in params
         assert not any("caller" in name for name in params)
 
-    def test_two_distinct_real_http_error_details_are_both_surfaced(self):
-        """Two different real refusals produce two different messages, not one
-        generic fallback -- proves genuine detail propagation, not merely the
-        absence of the old fixed text."""
-        for detail_text in (
-            "wrong_caller: refused",
-            "stale_evidence: state token mismatch",
-        ):
-            detail_response = MagicMock()
-            detail_response.json.return_value = {"detail": detail_text}
-            http_err = requests.HTTPError("409")
-            http_err.response = detail_response
+    def test_never_makes_an_http_call(self):
+        """Structural proof this is genuinely in-process: no requests.post/get
+        and no mcp_utils HTTP helper is ever invoked for this action."""
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "caller-abc"}):
+            with patch(
+                "cli_agent_orchestrator.mcp_server.reconciliation_direct."
+                "reconcile_caller_accepted_result_locally"
+            ) as mock_local:
+                mock_local.return_value = {}
+                with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+                    reconcile_terminal_retirement(*self._ARGS)
 
+        mock_requests.post.assert_not_called()
+        mock_requests.get.assert_not_called()
+
+    def test_two_distinct_real_guard_failures_are_both_surfaced(self):
+        """Two different real refusals produce two different messages, not one
+        generic fallback."""
+        from cli_agent_orchestrator.models.assigned_worker import (
+            TerminalRetirementReconciliationError,
+        )
+
+        for code, message in (
+            ("wrong_caller", "refused: wrong_caller"),
+            ("stale_evidence", "state token mismatch"),
+        ):
             with patch.dict(os.environ, {"CAO_TERMINAL_ID": "caller-abc"}):
                 with patch(
-                    "cli_agent_orchestrator.mcp_server.server.mcp_utils.post_body_json",
-                    side_effect=http_err,
+                    "cli_agent_orchestrator.mcp_server.reconciliation_direct."
+                    "reconcile_caller_accepted_result_locally",
+                    side_effect=TerminalRetirementReconciliationError(code, message),
                 ):
                     result = reconcile_terminal_retirement(*self._ARGS)
 
             assert result["success"] is False
-            assert detail_text in result["error"]
+            assert code in result["error"]
+            assert message in result["error"]
 
 
 class TestInspectTerminalRetirementState:

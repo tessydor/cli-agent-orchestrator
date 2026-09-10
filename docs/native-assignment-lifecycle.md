@@ -60,16 +60,24 @@ report cannot be promoted to a successful final result.
   replay is a no-op, but a repeat call with different evidence is refused as
   a conflict rather than overwriting the first durable record.
 
-  The underlying REST route additionally requires this server's own local
-  machine service token (`require_local_service_token`, `security/auth.py`),
-  not merely `cao:admin` scope -- a generic admin-scoped caller (a human
-  operator's session, a dashboard, an unrelated service) that reads and
-  resubmits the exact recorded `caller_id` is refused before it ever reaches
-  the caller_id check, because it does not hold this deployment's shared
-  local secret. This still does not bind to a SPECIFIC terminal -- every
-  local MCP subprocess shares that one secret -- so the caller_id check
-  remains the only defense against one legitimate terminal reconciling a
-  different terminal's assignment.
+  There is no HTTP route for this action, on purpose (correction-842): a
+  caller-identity check reachable only over a generic REST mutation cannot
+  hold in every auth configuration -- this deployment runs with the auth
+  layer disabled, where any scope/token check is a no-op, so a public route
+  would have stayed a fully unauthenticated, spoofable mutation regardless of
+  what it additionally required. `reconcile_terminal_retirement` instead
+  calls straight into `AssignedWorkerCompletionService.reconcile_caller_accepted_result`
+  from *within this MCP server process* (see
+  `mcp_server/reconciliation_direct.py`), deriving caller identity
+  exclusively from this process's own `CAO_TERMINAL_ID` -- there is no
+  `caller_id` argument a model or a generic HTTP client could ever set. This
+  still does not bind to a SPECIFIC terminal -- a compromised MCP process
+  could still claim to be a different terminal's caller_id in code -- so the
+  `wrong_caller` DB-consistency check (unchanged) remains the defense against
+  one legitimate terminal reconciling a different terminal's assignment.
+  **Compatibility**: there is no longer any way to perform this specific
+  mutation via raw HTTP/curl; it is reachable only through this MCP tool (or
+  equivalent in-process Python code importing the same service function).
 
 CAO terminal IDs and model-native ListAgents IDs are different namespaces.
 These tools expose routing records under CAO's existing local trust/auth model;
