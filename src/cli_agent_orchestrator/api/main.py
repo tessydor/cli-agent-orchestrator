@@ -93,7 +93,10 @@ from cli_agent_orchestrator.graph.providers import GraphProvider, get_provider
 # Import the sinks package for its import-time @register_sink side effects
 # ("okf", "obsidian", "graphml"); get_sink resolves by name from the registry.
 from cli_agent_orchestrator.graph.sinks import get_sink
-from cli_agent_orchestrator.models.assigned_worker import AssignedWorkerIntegrityError
+from cli_agent_orchestrator.models.assigned_worker import (
+    AssignedWorkerIntegrityError,
+    compute_reconciliation_state_token,
+)
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import (
     InboxMessageOrigin,
@@ -3159,12 +3162,24 @@ async def delete_session(
             isinstance(deleted, (list, tuple)) and session_name not in deleted
         )
         if deferred:
+            # Surface the real per-terminal/per-step reasons already collected
+            # in ``errors`` (e.g. "completion capture pending",
+            # "cleanup deferred; retry delete_session") instead of a fixed
+            # Grok-specific guess -- the deferral is not provider-specific and
+            # discarding these in favor of static text hid exactly the
+            # information an operator needs to decide what to do next.
+            if errors:
+                reasons = "; ".join(
+                    f"{e.get('terminal_id') or e.get('session') or '?'}: "
+                    f"{e.get('error', 'unknown reason')}"
+                    for e in errors
+                    if isinstance(e, dict)
+                )
+            else:
+                reasons = f"session '{session_name}' was not fully torn down"
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    f"cleanup deferred for session '{session_name}'; "
-                    "retry delete after residual Grok processes exit"
-                ),
+                detail=f"cleanup deferred for session '{session_name}': {reasons}",
             )
         return {"success": True, **result}
     except HTTPException:
@@ -6659,7 +6674,13 @@ async def get_assigned_worker_completion_callback_endpoint(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Assigned-worker callback for '{worker_terminal_id}' not found",
         )
-    return cast(Dict, jsonable_encoder(record.model_dump()))
+    payload = record.model_dump()
+    # Additive, computed (never stored): the optimistic-concurrency snapshot a
+    # caller echoes back on retirement-reconciliation so an accept request is
+    # bound to the exact state observed here, not to whatever it is by the
+    # time the request lands (see compute_reconciliation_state_token).
+    payload["state_token"] = compute_reconciliation_state_token(record)
+    return cast(Dict, jsonable_encoder(payload))
 
 
 @app.post("/terminals/{receiver_id}/inbox/messages")

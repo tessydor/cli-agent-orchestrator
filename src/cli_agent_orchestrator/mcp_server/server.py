@@ -1011,6 +1011,177 @@ def _own_terminal_id_or_error(action: str) -> Union[str, Dict[str, Any]]:
     return own_terminal_id
 
 
+def _inspect_terminal_retirement_state_impl(worker_terminal_id: str) -> Dict[str, Any]:
+    """Implementation of inspect_terminal_retirement_state logic."""
+    try:
+        record = mcp_utils.get_json(
+            f"/assigned-workers/{worker_terminal_id}/completion-callback",
+            timeout=_mcp_timeout(),
+        )
+        return {"success": True, "callback": record}
+    except requests.HTTPError as e:
+        detail = (
+            _extract_error_detail(e.response, str(e))
+            if e.response is not None
+            else str(e)
+        )
+        return {
+            "success": False,
+            "error": f"Failed to inspect terminal retirement state: {detail}",
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Failed to inspect terminal retirement state: {str(e)}",
+        }
+
+
+@mcp.tool()
+def inspect_terminal_retirement_state(
+    worker_terminal_id: str = Field(
+        description="The assigned worker's terminal ID to inspect before reconciling retirement"
+    ),
+) -> Dict[str, Any]:
+    """Read an assigned worker's durable callback record, including its current
+    ``assignment_id`` and ``state_token`` -- call this BEFORE
+    reconcile_terminal_retirement and pass those two values through unchanged.
+    ``state_token`` is a snapshot binding: if the record moves on before your
+    reconcile call lands, that call is refused as stale and you must re-inspect.
+    """
+    return _inspect_terminal_retirement_state_impl(worker_terminal_id)
+
+
+def _reconcile_terminal_retirement_impl(
+    worker_terminal_id: str,
+    assignment_id: str,
+    expected_state_token: str,
+    reason: str,
+    archive_reference: str,
+    archive_sha256: str,
+    accepted_evidence: str,
+) -> Dict[str, Any]:
+    """Implementation of reconcile_terminal_retirement logic.
+
+    correction-842: this calls straight into the service, in-process, never
+    over HTTP -- see mcp_server/reconciliation_direct.py for why. There is no
+    generic REST mutation this could otherwise reach: a caller-identity check
+    reachable only over HTTP cannot hold when the auth layer is disabled,
+    which is this deployment's actual configuration.
+    """
+    own_terminal_id = _own_terminal_id_or_error("reconcile terminal retirement")
+    if isinstance(own_terminal_id, dict):
+        return own_terminal_id
+
+    from cli_agent_orchestrator.mcp_server.reconciliation_direct import (
+        reconcile_caller_accepted_result_locally,
+    )
+    from cli_agent_orchestrator.models.assigned_worker import (
+        TerminalRetirementReconciliationError,
+    )
+
+    try:
+        result = reconcile_caller_accepted_result_locally(
+            worker_terminal_id,
+            own_terminal_id,
+            assignment_id,
+            expected_state_token,
+            reason,
+            {
+                "archive_reference": archive_reference,
+                "archive_sha256": archive_sha256,
+                "accepted_evidence": accepted_evidence,
+            },
+        )
+        return {"success": True, "callback": result}
+    except TerminalRetirementReconciliationError as exc:
+        # Exact guard failure, same shape every caller of this tool used to
+        # get from the (now removed) HTTP endpoint's mapped status/detail.
+        return {"success": False, "error": f"{exc.code}: {exc}"}
+    except Exception as e:
+        return {"success": False, "error": f"Failed to reconcile terminal retirement: {str(e)}"}
+
+
+@mcp.tool()
+def reconcile_terminal_retirement(
+    worker_terminal_id: str = Field(
+        description=(
+            "The assigned worker's terminal ID whose authoritative provider "
+            "completion report is permanently unavailable"
+        )
+    ),
+    assignment_id: str = Field(
+        description=(
+            "The exact assignment_id from inspect_terminal_retirement_state -- "
+            "binds this request to the assignment you actually reviewed"
+        )
+    ),
+    expected_state_token: str = Field(
+        description=(
+            "The exact state_token from inspect_terminal_retirement_state -- "
+            "refused as stale if the record has moved on since you fetched it"
+        )
+    ),
+    reason: str = Field(
+        description="Why this stuck assignment is being reconciled for retirement"
+    ),
+    archive_reference: str = Field(
+        description=(
+            "Immutable identifier/hash of the retained private artifact/report "
+            "archive that documents what this worker produced"
+        )
+    ),
+    archive_sha256: str = Field(
+        description="SHA-256 (64 lowercase hex chars) of that archive's content"
+    ),
+    accepted_evidence: str = Field(
+        description=(
+            "Caller-attested acceptance evidence, e.g. the merged PR/commit SHA "
+            "showing this worker's result was accepted -- CAO does not "
+            "independently verify this off-box; it durably records your attestation"
+        )
+    ),
+) -> Dict[str, Any]:
+    """Unblock delete_terminal for an assigned worker whose authoritative provider
+    completion report will never become available (e.g. an old/restarted native
+    session), when delete_terminal keeps returning 409.
+
+    Call inspect_terminal_retirement_state first and pass its ``assignment_id``/
+    ``state_token`` through unchanged -- this binds your acceptance to the exact
+    assignment and stuck snapshot you actually reviewed, not merely to this
+    terminal's current id.
+
+    You must be this terminal's recorded assigning caller -- calling this on
+    someone else's assignment is refused. This does NOT fabricate a completion
+    callback: it records durable evidence that YOU independently verified and
+    accepted the result out of band (its associated PR was merged, or you
+    reviewed its retained transcript/report archive yourself). The underlying
+    callback record's completion state is left exactly as truthfully observed. A
+    live terminal, or one waiting on a decision, is refused -- inspect it with
+    inspect_worker first if unsure; delete_terminal itself re-checks liveness
+    again at actual teardown time, so this alone does not guarantee retirement
+    if the terminal becomes active again in between.
+
+    Idempotent: an exact replay of an already-succeeded call is a safe no-op.
+    A later call with different assignment/token/reason/evidence against an
+    already-reconciled terminal is refused as a conflict, never silently
+    accepted. Call delete_terminal as usual once this succeeds.
+
+    This tool is the ONLY way to perform this action -- there is no HTTP
+    route for it. That is deliberate: a caller-identity check reachable over
+    a generic REST mutation cannot hold in every auth configuration, so the
+    action only runs from within this trusted MCP process.
+    """
+    return _reconcile_terminal_retirement_impl(
+        worker_terminal_id,
+        assignment_id,
+        expected_state_token,
+        reason,
+        archive_reference,
+        archive_sha256,
+        accepted_evidence,
+    )
+
+
 @mcp.tool()
 def get_worker_question(terminal_id: str) -> Dict[str, Any]:
     """Inspect a live direct-worker Claude menu before answering a routine question."""

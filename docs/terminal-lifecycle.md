@@ -74,6 +74,12 @@ Constraints:
 - **Handoff** terminals are deleted automatically on success. No action needed.
 - **Assign** terminals are not auto-deleted. Call `delete_terminal(terminal_id)`
   when you no longer need the terminal, or wait for the 10-terminal nudge.
+- If `delete_terminal` keeps returning 409 for an assigned worker whose
+  provider completion report is permanently unavailable (see
+  [native-assignment-lifecycle.md](native-assignment-lifecycle.md)), and you
+  (the recorded assigning caller) have independently verified and accepted its
+  result out of band, call `reconcile_terminal_retirement` first, then retry
+  `delete_terminal`.
 
 ## Terminal count nudge
 

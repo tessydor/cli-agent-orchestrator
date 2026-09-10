@@ -42,6 +42,43 @@ report cannot be promoted to a successful final result.
   snapshot. Unknown, stale, expired, ambiguous, and free-form menu answers fail
   closed. The old text-answer path is rejected for Claude.
 
+- inspect_terminal_retirement_state reads a worker's durable callback record,
+  including a computed `state_token` snapshot -- call this first and pass its
+  `assignment_id`/`state_token` unchanged into reconcile_terminal_retirement.
+- reconcile_terminal_retirement lets the recorded assigning caller record
+  durable, evidence-backed acceptance of a worker whose authoritative provider
+  completion report will never become available (for example an old/restarted
+  native session), so delete_terminal stops returning 409 for it. It never
+  fabricates a completion callback or changes the retained lifecycle/
+  delivery_state/final_result: it is a distinct, additive, auditable
+  who/when/why/evidence fact that `prepare_terminal_retirement` accepts as
+  sufficient, on its own, to allow retirement -- and re-checks liveness again
+  at the actual retirement moment, not just at reconciliation time. Refused
+  for a wrong caller, a wrong/stale assignment snapshot, a live terminal, one
+  waiting on a decision, or a record that already has a genuine provider
+  report or ordinary FAILED/CANCELLED disposition. Idempotent; an exact
+  replay is a no-op, but a repeat call with different evidence is refused as
+  a conflict rather than overwriting the first durable record.
+
+  There is no HTTP route for this action, on purpose (correction-842): a
+  caller-identity check reachable only over a generic REST mutation cannot
+  hold in every auth configuration -- this deployment runs with the auth
+  layer disabled, where any scope/token check is a no-op, so a public route
+  would have stayed a fully unauthenticated, spoofable mutation regardless of
+  what it additionally required. `reconcile_terminal_retirement` instead
+  calls straight into `AssignedWorkerCompletionService.reconcile_caller_accepted_result`
+  from *within this MCP server process* (see
+  `mcp_server/reconciliation_direct.py`), deriving caller identity
+  exclusively from this process's own `CAO_TERMINAL_ID` -- there is no
+  `caller_id` argument a model or a generic HTTP client could ever set. This
+  still does not bind to a SPECIFIC terminal -- a compromised MCP process
+  could still claim to be a different terminal's caller_id in code -- so the
+  `wrong_caller` DB-consistency check (unchanged) remains the defense against
+  one legitimate terminal reconciling a different terminal's assignment.
+  **Compatibility**: there is no longer any way to perform this specific
+  mutation via raw HTTP/curl; it is reachable only through this MCP tool (or
+  equivalent in-process Python code importing the same service function).
+
 CAO terminal IDs and model-native ListAgents IDs are different namespaces.
 These tools expose routing records under CAO's existing local trust/auth model;
 they are not cryptographic owner authorization and do not add tenant isolation.
