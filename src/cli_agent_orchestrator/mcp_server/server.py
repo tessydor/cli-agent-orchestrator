@@ -1011,6 +1011,80 @@ def _own_terminal_id_or_error(action: str) -> Union[str, Dict[str, Any]]:
     return own_terminal_id
 
 
+def _reconcile_terminal_retirement_impl(
+    worker_terminal_id: str,
+    reason: str,
+    archive_reference: str,
+    accepted_evidence: str,
+) -> Dict[str, Any]:
+    """Implementation of reconcile_terminal_retirement logic."""
+    own_terminal_id = _own_terminal_id_or_error("reconcile terminal retirement")
+    if isinstance(own_terminal_id, dict):
+        return own_terminal_id
+    try:
+        result = mcp_utils.post_body_json(
+            f"/assigned-workers/{worker_terminal_id}/retirement-reconciliation",
+            {
+                "caller_id": own_terminal_id,
+                "reason": reason,
+                "archive_reference": archive_reference,
+                "accepted_evidence": accepted_evidence,
+            },
+            timeout=_mcp_timeout(),
+        )
+        return {"success": True, "callback": result}
+    except requests.HTTPError as e:
+        detail = _extract_error_detail(e.response, str(e)) if e.response is not None else str(e)
+        return {"success": False, "error": f"Failed to reconcile terminal retirement: {detail}"}
+    except Exception as e:
+        return {"success": False, "error": f"Failed to reconcile terminal retirement: {str(e)}"}
+
+
+@mcp.tool()
+def reconcile_terminal_retirement(
+    worker_terminal_id: str = Field(
+        description=(
+            "The assigned worker's terminal ID whose authoritative provider "
+            "completion report is permanently unavailable"
+        )
+    ),
+    reason: str = Field(
+        description="Why this stuck assignment is being reconciled for retirement"
+    ),
+    archive_reference: str = Field(
+        description=(
+            "Immutable identifier/hash of the retained private artifact/report "
+            "archive that documents what this worker produced"
+        )
+    ),
+    accepted_evidence: str = Field(
+        description=(
+            "Independent acceptance evidence, e.g. the merged PR/commit SHA "
+            "showing this worker's result was actually accepted"
+        )
+    ),
+) -> Dict[str, Any]:
+    """Unblock delete_terminal for an assigned worker whose authoritative provider
+    completion report will never become available (e.g. an old/restarted native
+    session), when delete_terminal keeps returning 409.
+
+    You must be this terminal's recorded assigning caller -- calling this on
+    someone else's assignment is refused. This does NOT fabricate a completion
+    callback: it records durable evidence that YOU independently verified and
+    accepted the result out of band (its associated PR was merged, or you
+    reviewed its retained transcript/report archive yourself). The underlying
+    callback record's completion state is left exactly as truthfully observed. A
+    live terminal, or one waiting on a decision, is refused -- inspect it with
+    inspect_worker first if unsure.
+
+    Idempotent: calling this again with the same evidence after it already
+    succeeded is a safe no-op. Call delete_terminal as usual once this succeeds.
+    """
+    return _reconcile_terminal_retirement_impl(
+        worker_terminal_id, reason, archive_reference, accepted_evidence
+    )
+
+
 @mcp.tool()
 def get_worker_question(terminal_id: str) -> Dict[str, Any]:
     """Inspect a live direct-worker Claude menu before answering a routine question."""

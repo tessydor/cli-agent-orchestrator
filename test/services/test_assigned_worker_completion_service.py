@@ -18,6 +18,7 @@ from cli_agent_orchestrator.models.assigned_worker import (
     AssignmentLifecycle,
     CompletionDeliveryState,
     CompletionReceiverState,
+    TerminalRetirementReconciliationError,
 )
 from cli_agent_orchestrator.models.inbox import InboxMessageOrigin, MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.provider_completion import (
@@ -146,6 +147,42 @@ def _authoritative_assignment(
     )
     monkeypatch.setitem(completion_mod.provider_manager._providers, worker_id, provider)
     return record
+
+
+def _stuck_missing_report_worker(worker_id, caller_id, monkeypatch, tmp_path, sequence=1):
+    """Reproduce the exact incident shape: DISPATCHED + RETRYABLE, final_result=None.
+
+    Mirrors ``test_missing_authoritative_completion_is_retryable_not_a_prompt_callback``:
+    the provider never produces a completion report for this terminal (e.g. an old/
+    restarted native session), so ``ProviderCompletionUnavailableError`` is raised on
+    every capture attempt and the callback is durably stuck retryable forever.
+    """
+    completion_id = f"{sequence:032x}"
+    db.create_terminal(
+        worker_id,
+        "cao-test",
+        f"window-{worker_id}",
+        "mock_cli",
+        caller_id=caller_id,
+        assignment_id=f"stuck-missing-report-{sequence:04d}",
+        completion_id=completion_id,
+    )
+    monkeypatch.setattr(report_mod, "PROVIDER_COMPLETION_REPORT_DIR", tmp_path / "reports")
+    report_mod.bind_completion_dispatch("mock_cli", worker_id, completion_id, "prompt text")
+    db.mark_assigned_worker_dispatched(worker_id)
+    monkeypatch.setitem(
+        completion_mod.provider_manager._providers,
+        worker_id,
+        MockCliProvider(worker_id, "cao-test", f"window-{worker_id}"),
+    )
+    service = AssignedWorkerCompletionService()
+    service.handle_status_event(worker_id, TerminalStatus.COMPLETED)
+    record = db.get_assigned_worker_callback(worker_id)
+    assert record is not None
+    assert record.lifecycle == AssignmentLifecycle.DISPATCHED
+    assert record.delivery_state == CompletionDeliveryState.RETRYABLE
+    assert record.final_result is None
+    return service, record
 
 
 def _configure_real_terminal_retirement(monkeypatch, tmp_path, *, cleanup_succeeds: bool):
@@ -1577,6 +1614,228 @@ def test_retirement_recovers_retained_report_before_idle_cancellation(
     assert retained.final_result == response
     assert retained.final_result_sha256 == hashlib.sha256(response.encode("utf-8")).hexdigest()
     assert len(_messages(caller)) == 1
+
+
+def test_permanently_stuck_missing_report_blocks_retirement_without_reconciliation(
+    callback_db, ids, monkeypatch, tmp_path
+):
+    """Without caller-evidence reconciliation, the incident state stays refused."""
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    service, _record = _stuck_missing_report_worker(worker, caller, monkeypatch, tmp_path)
+    monkeypatch.setattr(service, "_detect_live_status", lambda _record: TerminalStatus.UNKNOWN)
+
+    assert service.prepare_terminal_retirement(worker) is False
+
+    still_stuck = db.get_assigned_worker_callback(worker)
+    assert still_stuck.lifecycle == AssignmentLifecycle.DISPATCHED
+    assert still_stuck.delivery_state == CompletionDeliveryState.RETRYABLE
+    assert still_stuck.caller_reconciled_at is None
+
+
+def test_reconcile_caller_accepted_result_unblocks_retirement_without_forging_completion(
+    callback_db, ids, monkeypatch, tmp_path
+):
+    """Caller-evidence reconciliation is additive audit, never forged completion."""
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    service, record = _stuck_missing_report_worker(worker, caller, monkeypatch, tmp_path)
+
+    reconciled = service.reconcile_caller_accepted_result(
+        worker,
+        caller,
+        "Independently verified: associated PR was reviewed and merged",
+        {
+            "archive_reference": "archive-sha-deadbeef",
+            "accepted_evidence": "PR44 merge 5c673ce11e8226ed23d2566f7f780d7d9471354c",
+        },
+    )
+
+    # Never forged: the truthful missing-provider-report state is untouched.
+    assert reconciled.lifecycle == AssignmentLifecycle.DISPATCHED
+    assert reconciled.delivery_state == CompletionDeliveryState.RETRYABLE
+    assert reconciled.final_result is None
+    assert reconciled.assignment_id == record.assignment_id
+    # The additive audit fact is durable and complete.
+    assert reconciled.caller_reconciled_at is not None
+    assert reconciled.reconciliation_reason == (
+        "Independently verified: associated PR was reviewed and merged"
+    )
+    assert "5c673ce11e8226ed23d2566f7f780d7d9471354c" in (reconciled.reconciliation_evidence or "")
+
+    # Retirement is now unblocked purely by that additive evidence.
+    monkeypatch.setattr(service, "_detect_live_status", lambda _record: TerminalStatus.UNKNOWN)
+    assert service.prepare_terminal_retirement(worker) is True
+
+    # Post-retirement, the callback row (retained forever) still shows the
+    # truthful provider state alongside the caller-acceptance evidence.
+    after = db.get_assigned_worker_callback(worker)
+    assert after.lifecycle == AssignmentLifecycle.DISPATCHED
+    assert after.final_result is None
+    assert after.caller_reconciled_at is not None
+
+
+def test_reconcile_caller_accepted_result_rejects_wrong_caller(
+    callback_db, ids, monkeypatch, tmp_path
+):
+    caller, impostor, worker = ids(), ids(), ids()
+    _terminal(caller)
+    _terminal(impostor)
+    service, _record = _stuck_missing_report_worker(worker, caller, monkeypatch, tmp_path)
+
+    with pytest.raises(TerminalRetirementReconciliationError) as exc_info:
+        service.reconcile_caller_accepted_result(
+            worker,
+            impostor,
+            "not my assignment to reconcile",
+            {"archive_reference": "x", "accepted_evidence": "y"},
+        )
+    assert exc_info.value.code == "wrong_caller"
+
+    untouched = db.get_assigned_worker_callback(worker)
+    assert untouched.caller_reconciled_at is None
+
+
+def test_reconcile_caller_accepted_result_rejects_unknown_worker(callback_db, ids):
+    caller = ids()
+    _terminal(caller)
+
+    with pytest.raises(TerminalRetirementReconciliationError) as exc_info:
+        AssignedWorkerCompletionService().reconcile_caller_accepted_result(
+            "deadbeef",
+            caller,
+            "reason",
+            {"archive_reference": "x", "accepted_evidence": "y"},
+        )
+    assert exc_info.value.code == "not_found"
+
+
+def test_reconcile_caller_accepted_result_rejects_live_terminal(
+    callback_db, ids, monkeypatch, tmp_path
+):
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    service, _record = _stuck_missing_report_worker(worker, caller, monkeypatch, tmp_path)
+    monkeypatch.setattr(service, "_detect_live_status", lambda _record: TerminalStatus.PROCESSING)
+
+    with pytest.raises(TerminalRetirementReconciliationError) as exc_info:
+        service.reconcile_caller_accepted_result(
+            worker,
+            caller,
+            "reason",
+            {"archive_reference": "x", "accepted_evidence": "y"},
+        )
+    assert exc_info.value.code == "terminal_live"
+
+
+def test_reconcile_caller_accepted_result_rejects_genuine_completion(
+    callback_db, ids, monkeypatch, tmp_path
+):
+    """A record with a genuine provider report is already retirable; refuse it here."""
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    _authoritative_assignment(worker, caller, monkeypatch, tmp_path)
+    service = AssignedWorkerCompletionService()
+    service.handle_status_event(worker, TerminalStatus.COMPLETED)
+    assert (
+        db.get_assigned_worker_callback(worker).lifecycle == AssignmentLifecycle.COMPLETED  # type: ignore[union-attr]
+    )
+
+    with pytest.raises(TerminalRetirementReconciliationError) as exc_info:
+        service.reconcile_caller_accepted_result(
+            worker,
+            caller,
+            "reason",
+            {"archive_reference": "x", "accepted_evidence": "y"},
+        )
+    assert exc_info.value.code == "not_eligible"
+
+
+def test_reconcile_caller_accepted_result_rejects_invalid_evidence(
+    callback_db, ids, monkeypatch, tmp_path
+):
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    service, _record = _stuck_missing_report_worker(worker, caller, monkeypatch, tmp_path)
+
+    for reason, evidence in (
+        ("", {"archive_reference": "x", "accepted_evidence": "y"}),
+        ("reason", {"archive_reference": "", "accepted_evidence": "y"}),
+        ("reason", {"archive_reference": "x", "accepted_evidence": "   "}),
+    ):
+        with pytest.raises(TerminalRetirementReconciliationError) as exc_info:
+            service.reconcile_caller_accepted_result(worker, caller, reason, evidence)
+        assert exc_info.value.code == "invalid_evidence"
+
+    assert db.get_assigned_worker_callback(worker).caller_reconciled_at is None  # type: ignore[union-attr]
+
+
+def test_reconcile_caller_accepted_result_allows_unresolved_manual_recovery(
+    callback_db, ids, monkeypatch, tmp_path
+):
+    """The other genuinely-stuck missing-report shape (manual recovery) is also eligible."""
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    _authoritative_assignment(
+        worker,
+        caller,
+        monkeypatch,
+        tmp_path,
+        task="the dispatched task",
+        reported_input="a different provider turn",
+    )
+    service = AssignedWorkerCompletionService()
+    service.handle_status_event(worker, TerminalStatus.COMPLETED)
+    stuck = db.get_assigned_worker_callback(worker)
+    assert stuck.lifecycle == AssignmentLifecycle.UNRESOLVED
+    assert stuck.delivery_state == CompletionDeliveryState.MANUAL_RECOVERY
+
+    reconciled = service.reconcile_caller_accepted_result(
+        worker,
+        caller,
+        "Reviewed retained transcript manually; work was accepted",
+        {"archive_reference": "archive-1", "accepted_evidence": "merge-sha-1"},
+    )
+    assert reconciled.caller_reconciled_at is not None
+    assert reconciled.lifecycle == AssignmentLifecycle.UNRESOLVED
+
+    monkeypatch.setattr(service, "_detect_live_status", lambda _record: TerminalStatus.IDLE)
+    assert service.prepare_terminal_retirement(worker) is True
+
+
+def test_reconcile_caller_accepted_result_duplicate_is_idempotent_and_keeps_first_evidence(
+    callback_db, ids, monkeypatch, tmp_path
+):
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    service, _record = _stuck_missing_report_worker(worker, caller, monkeypatch, tmp_path)
+
+    first = service.reconcile_caller_accepted_result(
+        worker,
+        caller,
+        "first reason",
+        {"archive_reference": "archive-first", "accepted_evidence": "evidence-first"},
+    )
+
+    # A genuine duplicate call (e.g. a retried MCP/API request) is a safe no-op...
+    again = service.reconcile_caller_accepted_result(
+        worker,
+        caller,
+        "first reason",
+        {"archive_reference": "archive-first", "accepted_evidence": "evidence-first"},
+    )
+    assert again.caller_reconciled_at == first.caller_reconciled_at
+
+    # ...and a second call carrying DIFFERENT evidence never overwrites the
+    # first durable record (it short-circuits before ever attempting the write).
+    different = service.reconcile_caller_accepted_result(
+        worker,
+        caller,
+        "a completely different later reason",
+        {"archive_reference": "archive-second", "accepted_evidence": "evidence-second"},
+    )
+    assert different.reconciliation_reason == first.reconciliation_reason
+    assert different.reconciliation_evidence == first.reconciliation_evidence
 
 
 def test_report_integrity_and_manual_recovery_outlive_both_terminals(callback_db, ids, monkeypatch):

@@ -8,6 +8,7 @@ import requests
 from cli_agent_orchestrator.mcp_server.server import (
     _get_terminal_context_from_env,
     delete_terminal,
+    reconcile_terminal_retirement,
 )
 from cli_agent_orchestrator.utils.orchestration import _current_terminal_id, _get_cleanup_nudge
 
@@ -206,6 +207,57 @@ class TestDeleteTerminal:
 
         _, kwargs = mock_delete.call_args
         assert kwargs["headers"] == {"Authorization": "Bearer tok"}
+
+
+class TestReconcileTerminalRetirement:
+    """Tests for the reconcile_terminal_retirement MCP tool."""
+
+    def test_no_terminal_id_env_fails_closed(self):
+        with patch.dict(os.environ, {}, clear=True):
+            result = reconcile_terminal_retirement("worker1", "reason", "arch", "evid")
+        assert result["success"] is False
+        assert "CAO_TERMINAL_ID" in result["error"]
+
+    def test_caller_id_resolved_from_own_env_never_a_client_argument(self):
+        """Identity comes solely from this process's own env, never an argument."""
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "caller-abc"}):
+            with patch(
+                "cli_agent_orchestrator.mcp_server.server.mcp_utils.post_body_json"
+            ) as mock_post:
+                mock_post.return_value = {"caller_reconciled_at": "2026-09-10T06:00:00"}
+                result = reconcile_terminal_retirement(
+                    "worker1", "my reason", "archive-ref", "accepted-ev"
+                )
+
+        assert result == {
+            "success": True,
+            "callback": {"caller_reconciled_at": "2026-09-10T06:00:00"},
+        }
+        mock_post.assert_called_once()
+        path, body = mock_post.call_args[0]
+        assert path == "/assigned-workers/worker1/retirement-reconciliation"
+        assert body == {
+            "caller_id": "caller-abc",
+            "reason": "my reason",
+            "archive_reference": "archive-ref",
+            "accepted_evidence": "accepted-ev",
+        }
+
+    def test_http_error_surfaces_real_detail(self):
+        detail_response = MagicMock()
+        detail_response.json.return_value = {"detail": "wrong_caller: refused"}
+        http_err = requests.HTTPError("403")
+        http_err.response = detail_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "caller-abc"}):
+            with patch(
+                "cli_agent_orchestrator.mcp_server.server.mcp_utils.post_body_json",
+                side_effect=http_err,
+            ):
+                result = reconcile_terminal_retirement("worker1", "reason", "arch", "evid")
+
+        assert result["success"] is False
+        assert "wrong_caller: refused" in result["error"]
 
 
 class TestMemoryToolsSurfaceContextFailures:

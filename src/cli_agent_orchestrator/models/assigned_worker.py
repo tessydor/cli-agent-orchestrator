@@ -79,10 +79,38 @@ class AssignedWorkerCallback(BaseModel):
     acknowledged_at: Optional[datetime] = None
     terminal_error_at: Optional[datetime] = None
     last_error: Optional[str] = None
+    # Caller-acceptance reconciliation (distinct from provider completion above).
+    # Set only by ``mark_caller_reconciled`` when the recorded assigning caller
+    # supplies durable evidence that the work was independently accepted despite
+    # a missing/permanently-unavailable authoritative provider report. Never
+    # implies ``final_result``/``lifecycle`` changed -- those remain the
+    # truthful provider-observed record.
+    caller_reconciled_at: Optional[datetime] = None
+    reconciliation_reason: Optional[str] = None
+    reconciliation_evidence: Optional[str] = None
 
 
 class AssignedWorkerIntegrityError(ValueError):
     """Raised when durable callback state fails integrity validation."""
+
+
+class TerminalRetirementReconciliationError(ValueError):
+    """Raised when a caller-evidence retirement reconciliation request is refused.
+
+    This is never raised for a genuine provider completion — it exists only for
+    the caller-acceptance-without-provider-report path (see
+    ``AssignedWorkerCompletionService.reconcile_caller_accepted_result``).
+    ``code`` is a small closed, stable, machine-readable reason so the API/MCP/CLI
+    layers can map each refusal to the right HTTP status and callers can branch on
+    it without parsing prose out of the message.
+    """
+
+    #: not_found | wrong_caller | not_eligible | terminal_live | invalid_evidence
+    code: str
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 _EXPLICIT_SENDER_SUFFIX_RE = re.compile(

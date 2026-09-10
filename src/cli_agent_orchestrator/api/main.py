@@ -93,7 +93,10 @@ from cli_agent_orchestrator.graph.providers import GraphProvider, get_provider
 # Import the sinks package for its import-time @register_sink side effects
 # ("okf", "obsidian", "graphml"); get_sink resolves by name from the registry.
 from cli_agent_orchestrator.graph.sinks import get_sink
-from cli_agent_orchestrator.models.assigned_worker import AssignedWorkerIntegrityError
+from cli_agent_orchestrator.models.assigned_worker import (
+    AssignedWorkerIntegrityError,
+    TerminalRetirementReconciliationError,
+)
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import (
     InboxMessageOrigin,
@@ -398,6 +401,24 @@ def _validate_model_id(value: str) -> None:
         raise ValueError(f"model exceeds the {MODEL_ID_MAX_LEN}-char cap")
     if not re.fullmatch(MODEL_ID_RE, value):
         raise ValueError(f"model {value!r} is invalid (must match {MODEL_ID_RE!r})")
+
+
+class RetirementReconciliationBody(BaseModel):
+    """Request body for ``POST /assigned-workers/{id}/retirement-reconciliation``.
+
+    Every field is required (no defaults): an omitted ``reason`` or evidence
+    field is rejected with 422 rather than silently treated as empty, matching
+    ``UpdateGroupBody``/``UpdateMetadataBody`` above. Field-level non-empty/size
+    validation is intentionally NOT duplicated here — the service layer
+    (``AssignedWorkerCompletionService.reconcile_caller_accepted_result``) is the
+    single source of truth for that, so the exact refusal it returns is what
+    every caller (API, MCP, CLI) sees, never a divergent Pydantic message.
+    """
+
+    caller_id: TerminalId
+    reason: str
+    archive_reference: str
+    accepted_evidence: str
 
 
 class UpdateGroupBody(BaseModel):
@@ -6660,6 +6681,55 @@ async def get_assigned_worker_completion_callback_endpoint(
             detail=f"Assigned-worker callback for '{worker_terminal_id}' not found",
         )
     return cast(Dict, jsonable_encoder(record.model_dump()))
+
+
+_RECONCILIATION_ERROR_STATUS = {
+    "not_found": status.HTTP_404_NOT_FOUND,
+    "wrong_caller": status.HTTP_403_FORBIDDEN,
+    "not_eligible": status.HTTP_409_CONFLICT,
+    "terminal_live": status.HTTP_409_CONFLICT,
+    "invalid_evidence": status.HTTP_400_BAD_REQUEST,
+}
+
+
+@app.post("/assigned-workers/{worker_terminal_id}/retirement-reconciliation")
+async def reconcile_assigned_worker_retirement_endpoint(
+    worker_terminal_id: TerminalId,
+    body: RetirementReconciliationBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
+) -> Dict:
+    """Record the recorded assigning caller's evidence-backed acceptance of a
+    terminal whose authoritative provider completion report is permanently
+    unavailable, so it can be retired without ever forging that report.
+
+    This is NOT a completion callback and never becomes one: ``lifecycle``,
+    ``delivery_state``, and ``final_result`` on the callback record are
+    untouched. It is a distinct, durable, auditable fact -- who (the immutable
+    recorded caller, never an unrelated caller), when, why (``reason``), and on
+    what evidence (``archive_reference``, ``accepted_evidence``) -- that
+    ``prepare_terminal_retirement`` (the same guard the ordinary
+    ``delete_terminal`` path already goes through) checks before allowing
+    retirement of an otherwise permanently-stuck assignment. Scoped ADMIN like
+    ``DELETE /terminals/{id}`` because it is a lifecycle-mutating operation, not
+    a read.
+    """
+    try:
+        updated = await asyncio.to_thread(
+            assigned_worker_completion_service.reconcile_caller_accepted_result,
+            worker_terminal_id,
+            body.caller_id,
+            body.reason,
+            {
+                "archive_reference": body.archive_reference,
+                "accepted_evidence": body.accepted_evidence,
+            },
+        )
+    except TerminalRetirementReconciliationError as exc:
+        raise HTTPException(
+            status_code=_RECONCILIATION_ERROR_STATUS.get(exc.code, status.HTTP_409_CONFLICT),
+            detail=f"{exc.code}: {exc}",
+        ) from exc
+    return cast(Dict, jsonable_encoder(updated.model_dump()))
 
 
 @app.post("/terminals/{receiver_id}/inbox/messages")

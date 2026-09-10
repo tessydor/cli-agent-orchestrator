@@ -42,6 +42,19 @@ report cannot be promoted to a successful final result.
   snapshot. Unknown, stale, expired, ambiguous, and free-form menu answers fail
   closed. The old text-answer path is rejected for Claude.
 
+- reconcile_terminal_retirement lets the recorded assigning caller record
+  durable, evidence-backed acceptance of a worker whose authoritative provider
+  completion report will never become available (for example an old/restarted
+  native session), so delete_terminal stops returning 409 for it. It never
+  fabricates a completion callback or changes the retained lifecycle/
+  delivery_state/final_result: it is a distinct, additive, auditable
+  who/when/why/evidence fact that `prepare_terminal_retirement` accepts as
+  sufficient, on its own, to allow retirement. Refused for a wrong caller, a
+  live terminal, one waiting on a decision, or a record that already has a
+  genuine provider report or ordinary FAILED/CANCELLED disposition. Idempotent;
+  a repeat call with different evidence is rejected rather than overwriting the
+  first durable record.
+
 CAO terminal IDs and model-native ListAgents IDs are different namespaces.
 These tools expose routing records under CAO's existing local trust/auth model;
 they are not cryptographic owner authorization and do not add tenant isolation.

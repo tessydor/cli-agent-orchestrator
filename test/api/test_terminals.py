@@ -686,6 +686,83 @@ class TestAssignedWorkerCompletionCallbackEndpoint:
         engine.dispose()
 
 
+class TestRetirementReconciliationEndpoint:
+    """POST /assigned-workers/{id}/retirement-reconciliation."""
+
+    _BODY = {
+        "caller_id": "feedbeef",
+        "reason": "Independently verified via merged PR",
+        "archive_reference": "archive-sha-abc123",
+        "accepted_evidence": "PR44 merge 5c673ce11e8226ed23d2566f7f780d7d9471354c",
+    }
+
+    def test_success_returns_updated_record(self, client):
+        record = MagicMock()
+        record.model_dump.return_value = {
+            "assignment_id": "assignment-one",
+            "worker_terminal_id": "abcd1234",
+            "caller_id": "feedbeef",
+            "caller_reconciled_at": "2026-09-10T06:00:00",
+        }
+        with patch(
+            "cli_agent_orchestrator.api.main.assigned_worker_completion_service"
+        ) as mock_svc:
+            mock_svc.reconcile_caller_accepted_result.return_value = record
+
+            response = client.post(
+                "/assigned-workers/abcd1234/retirement-reconciliation", json=self._BODY
+            )
+
+        assert response.status_code == 200
+        assert response.json()["caller_reconciled_at"] == "2026-09-10T06:00:00"
+        mock_svc.reconcile_caller_accepted_result.assert_called_once_with(
+            "abcd1234",
+            "feedbeef",
+            "Independently verified via merged PR",
+            {
+                "archive_reference": "archive-sha-abc123",
+                "accepted_evidence": "PR44 merge 5c673ce11e8226ed23d2566f7f780d7d9471354c",
+            },
+        )
+
+    @pytest.mark.parametrize(
+        "code,expected_status",
+        [
+            ("not_found", 404),
+            ("wrong_caller", 403),
+            ("not_eligible", 409),
+            ("terminal_live", 409),
+            ("invalid_evidence", 400),
+        ],
+    )
+    def test_guard_failures_map_to_exact_status_and_reason(self, client, code, expected_status):
+        from cli_agent_orchestrator.models.assigned_worker import (
+            TerminalRetirementReconciliationError,
+        )
+
+        with patch(
+            "cli_agent_orchestrator.api.main.assigned_worker_completion_service"
+        ) as mock_svc:
+            mock_svc.reconcile_caller_accepted_result.side_effect = (
+                TerminalRetirementReconciliationError(code, f"refused: {code}")
+            )
+
+            response = client.post(
+                "/assigned-workers/abcd1234/retirement-reconciliation", json=self._BODY
+            )
+
+        assert response.status_code == expected_status
+        assert response.json()["detail"] == f"{code}: refused: {code}"
+
+    def test_missing_field_is_422(self, client):
+        body = dict(self._BODY)
+        del body["reason"]
+
+        response = client.post("/assigned-workers/abcd1234/retirement-reconciliation", json=body)
+
+        assert response.status_code == 422
+
+
 class TestCreateInboxMessageEndpoint:
     """Test POST /terminals/{receiver_id}/inbox/messages endpoint."""
 

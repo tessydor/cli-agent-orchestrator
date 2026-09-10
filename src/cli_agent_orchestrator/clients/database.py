@@ -199,6 +199,14 @@ class AssignedWorkerCallbackModel(Base):
     acknowledged_at = Column(DateTime, nullable=True)
     terminal_error_at = Column(DateTime, nullable=True)
     last_error = Column(Text, nullable=True)
+    # Caller-acceptance retirement reconciliation (distinct from the provider
+    # completion columns above). Additive/nullable so a rolled-back server still
+    # reads/writes every pre-existing column unchanged. See
+    # ``trg_assigned_worker_reconciliation_immutable`` and
+    # ``mark_caller_reconciled``.
+    caller_reconciled_at = Column(DateTime, nullable=True)
+    reconciliation_reason = Column(Text, nullable=True)
+    reconciliation_evidence = Column(Text, nullable=True)
 
     __table_args__ = (
         Index("uq_assigned_worker_callback_completion_id", "completion_id", unique=True),
@@ -245,6 +253,21 @@ WHEN OLD.inbox_message_id IS NOT NULL
  AND NEW.inbox_message_id IS NOT OLD.inbox_message_id
 BEGIN
   SELECT RAISE(ABORT, 'assigned-worker callback inbox link is immutable once set');
+END
+"""
+
+_IMMUTABLE_CALLBACK_RECONCILIATION_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS trg_assigned_worker_reconciliation_immutable
+BEFORE UPDATE OF caller_reconciled_at, reconciliation_reason, reconciliation_evidence
+ON assigned_worker_callbacks
+WHEN OLD.caller_reconciled_at IS NOT NULL
+ AND (
+      NEW.caller_reconciled_at IS NOT OLD.caller_reconciled_at
+   OR NEW.reconciliation_reason IS NOT OLD.reconciliation_reason
+   OR NEW.reconciliation_evidence IS NOT OLD.reconciliation_evidence
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'caller-accepted retirement reconciliation evidence is immutable once recorded');
 END
 """
 
@@ -338,6 +361,7 @@ for _callback_trigger in (
     _IMMUTABLE_CALLBACK_ROUTE_TRIGGER,
     _IMMUTABLE_CALLBACK_RESULT_TRIGGER,
     _IMMUTABLE_CALLBACK_LINK_TRIGGER,
+    _IMMUTABLE_CALLBACK_RECONCILIATION_TRIGGER,
     _RETAIN_CALLBACK_TRIGGER,
     _RETAIN_UNCLASSIFIED_WORKER_TERMINAL_TRIGGER,
     _REQUIRE_RECEIVER_DELETE_AUDIT_TRIGGER,
@@ -1646,6 +1670,18 @@ def _migrate_assigned_worker_integrity_schema() -> None:
                 return
             if "routing_digest" not in columns:
                 conn.execute("ALTER TABLE assigned_worker_callbacks ADD COLUMN routing_digest TEXT")
+            if "caller_reconciled_at" not in columns:
+                conn.execute(
+                    "ALTER TABLE assigned_worker_callbacks ADD COLUMN caller_reconciled_at DATETIME"
+                )
+            if "reconciliation_reason" not in columns:
+                conn.execute(
+                    "ALTER TABLE assigned_worker_callbacks ADD COLUMN reconciliation_reason TEXT"
+                )
+            if "reconciliation_evidence" not in columns:
+                conn.execute(
+                    "ALTER TABLE assigned_worker_callbacks ADD COLUMN reconciliation_evidence TEXT"
+                )
 
             rows = conn.execute(
                 "SELECT assignment_id, completion_id, worker_terminal_id, caller_id, "
@@ -1670,6 +1706,7 @@ def _migrate_assigned_worker_integrity_schema() -> None:
                 _IMMUTABLE_CALLBACK_ROUTE_TRIGGER,
                 _IMMUTABLE_CALLBACK_RESULT_TRIGGER,
                 _IMMUTABLE_CALLBACK_LINK_TRIGGER,
+                _IMMUTABLE_CALLBACK_RECONCILIATION_TRIGGER,
                 _RETAIN_CALLBACK_TRIGGER,
                 _RETAIN_UNCLASSIFIED_WORKER_TERMINAL_TRIGGER,
                 _REQUIRE_RECEIVER_DELETE_AUDIT_TRIGGER,
@@ -1686,6 +1723,7 @@ def _migrate_assigned_worker_integrity_schema() -> None:
                 "trg_assigned_worker_route_immutable",
                 "trg_assigned_worker_result_immutable",
                 "trg_assigned_worker_link_immutable",
+                "trg_assigned_worker_reconciliation_immutable",
                 "trg_assigned_worker_callback_retain",
                 "trg_assigned_worker_terminal_recovery_retain",
                 "trg_assigned_worker_receiver_delete_audit",
@@ -2821,6 +2859,18 @@ def _validate_assigned_worker_callback_row(db: Any, row: AssignedWorkerCallbackM
         if row.result_reference != expected_reference:
             raise _callback_integrity_error(row, "result_reference does not match assignment")
 
+    reconciliation_fields = (
+        row.caller_reconciled_at,
+        row.reconciliation_reason,
+        row.reconciliation_evidence,
+    )
+    if any(value is None for value in reconciliation_fields) != all(
+        value is None for value in reconciliation_fields
+    ):
+        raise _callback_integrity_error(
+            row, "caller-reconciliation fields are only partially present"
+        )
+
     attempt_count = row.attempt_count or 0
     if attempt_count < 0:
         raise _callback_integrity_error(row, "attempt_count is negative")
@@ -3152,6 +3202,9 @@ def _assigned_worker_callback_from_row(
         acknowledged_at=row.acknowledged_at,
         terminal_error_at=row.terminal_error_at,
         last_error=row.last_error,
+        caller_reconciled_at=row.caller_reconciled_at,
+        reconciliation_reason=row.reconciliation_reason,
+        reconciliation_evidence=row.reconciliation_evidence,
     )
 
 
@@ -3633,6 +3686,46 @@ def mark_assignment_manual_recovery(
         row.delivery_state = CompletionDeliveryState.MANUAL_RECOVERY.value
         row.terminal_error_at = datetime.now()
         row.last_error = error
+        _commit_validated_callback_mutation(db, row)
+        return _assigned_worker_callback_from_row(row)
+
+
+def mark_caller_reconciled(
+    assignment_id: str,
+    reason: str,
+    evidence_json: str,
+) -> Optional[AssignedWorkerCallback]:
+    """Durably record the recorded assigning caller's independently-verified acceptance.
+
+    This NEVER touches ``lifecycle``, ``delivery_state``, or any ``final_result*``
+    column -- caller acceptance is recorded as separate, additive evidence, never
+    forged provider completion. Callers (see
+    ``AssignedWorkerCompletionService.reconcile_caller_accepted_result``) are
+    expected to have already validated eligibility (who/state/liveness) before
+    calling this; this function's own responsibility is the durable write and
+    duplicate-safety.
+
+    Idempotent: once ``caller_reconciled_at`` is set, this returns the existing
+    row unchanged rather than re-writing it. Attempting to change already-recorded
+    evidence is a data problem the immutability trigger below independently
+    guards; the idempotent early-return here just keeps a genuine duplicate
+    request (mission requires duplicate-safety) from touching the row at all.
+    """
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        row = (
+            db.query(AssignedWorkerCallbackModel)
+            .filter(AssignedWorkerCallbackModel.assignment_id == assignment_id)
+            .first()
+        )
+        if row is None:
+            return None
+        _validate_assigned_worker_callback_row(db, row)
+        if row.caller_reconciled_at is not None:
+            return _assigned_worker_callback_from_row(row)
+        row.caller_reconciled_at = datetime.now()
+        row.reconciliation_reason = reason
+        row.reconciliation_evidence = evidence_json
         _commit_validated_callback_mutation(db, row)
         return _assigned_worker_callback_from_row(row)
 
