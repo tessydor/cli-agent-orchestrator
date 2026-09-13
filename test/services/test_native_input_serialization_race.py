@@ -38,7 +38,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from cli_agent_orchestrator.models.inbox import OrchestrationType
+from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import terminal_service
+from cli_agent_orchestrator.services.status_monitor import status_monitor
 
 
 class TestNativeInputNeverOverlapsForSameTerminal:
@@ -245,35 +247,43 @@ class TestDispatchIdentityImmutableUnderConcurrentFollowUp:
     """Item B: a concurrent follow-up must never become part of the original
     assignment's registered dispatch identity.
 
-    Races a real ASSIGN dispatch (which calls bind_completion_dispatch with
-    the exact post-injection bytes before its paste) against a concurrent
-    SEND_MESSAGE follow-up for the SAME terminal_id, released simultaneously
-    via a Barrier. Proves: (1) bind_completion_dispatch is called exactly
-    once, with the assignment's own exact bytes -- never the follow-up's, and
-    never a concatenation of both; (2) the two tmux writes still never
-    overlap; (3) each write carries exactly one of the two distinct original
-    payloads, unmodified.
+    Uses the REAL StatusMonitor singleton (not mocked) so the native-
+    acceptance fence (correction-984, see TestNativeAcceptanceFence below)
+    actually engages: the ASSIGN dispatch is sent first and its acceptance is
+    explicitly, deliberately confirmed (simulating StatusMonitor's real
+    detection loop observing the PROCESSING transition) before the follow-up
+    is ever attempted. This is deliberate, not a symmetric race -- unlike a
+    Barrier-released simultaneous start (which the mutex alone cannot put in
+    a guaranteed order, and previously required sorted() to tolerate either
+    winning), this models the actual incident shape: an assignment dispatches
+    first, and a follow-up arrives afterward. Proves: (1) bind_completion_
+    dispatch is called exactly once, with the assignment's own exact bytes --
+    never the follow-up's, and never a concatenation of both; (2) the two
+    tmux writes never overlap; (3) they land in EXACT order (assignment,
+    then follow-up) with exact, unmodified, Unicode/multiline-preserving
+    payloads and exactly one submit each -- never merely "both happened,
+    in some order" (sorted()'s weaker guarantee, replaced here per
+    correction-984).
     """
 
     @patch("cli_agent_orchestrator.services.provider_completion_report.bind_completion_dispatch")
     @patch("cli_agent_orchestrator.services.terminal_service.inject_memory_context")
     @patch("cli_agent_orchestrator.services.terminal_service.get_assigned_worker_callback")
-    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_concurrent_assign_and_follow_up_never_merge_dispatch_identity(
+    def test_assign_then_follow_up_land_in_exact_order_with_identity_bound_only_to_assign(
         self,
         mock_get_metadata,
         mock_tmux,
         mock_pm,
         mock_update,
-        mock_status_monitor,
         mock_get_callback,
         mock_inject,
         mock_bind,
     ):
+        terminal_id = "real-status-terminal-order"
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
             "tmux_window": "developer-abcd",
@@ -290,59 +300,162 @@ class TestDispatchIdentityImmutableUnderConcurrentFollowUp:
         provider = mock_pm.get_provider.return_value
         provider.paste_enter_count = 2
         provider.paste_submit_delay = 0.0
-        mock_status_monitor.get_status.return_value = None
+        # A MagicMock provider's assume_processing_on_dispatch is never `is
+        # True`, matching every real provider except the opt-in few -- the
+        # native-acceptance fence is meant to engage here.
 
-        occupancy = 0
-        max_seen = 0
-        occupancy_guard = threading.Lock()
-        writes = []
+        writes: list[str] = []
 
         def send_keys_side_effect(session, window, message, **kwargs):
-            nonlocal occupancy, max_seen
-            with occupancy_guard:
-                occupancy += 1
-                max_seen = max(max_seen, occupancy)
-                writes.append(message)
-            time.sleep(0.02)
-            with occupancy_guard:
-                occupancy -= 1
+            writes.append(message)
 
         mock_tmux.send_keys.side_effect = send_keys_side_effect
 
-        assign_text = "assigned task: do the real work"
-        follow_up_text = "follow-up: unrelated later message"
-        barrier = threading.Barrier(2)
+        # Unicode + multiline, to prove the fence and the identity binding
+        # both preserve exact bytes rather than merely "some text".
+        assign_text = "assigned task: über-review — line one\nline two"
+        follow_up_text = "message874 follow-up: 日本語 — line one\nline two"
 
-        def call_assign():
-            barrier.wait(timeout=5)
+        try:
             terminal_service.send_input(
-                "race-terminal-assign",
-                assign_text,
-                orchestration_type=OrchestrationType.ASSIGN,
+                terminal_id, assign_text, orchestration_type=OrchestrationType.ASSIGN
             )
+            assert writes == [assign_text], "assignment must paste before anything else"
 
-        def call_follow_up():
-            barrier.wait(timeout=5)
+            # Simulate StatusMonitor's real detection loop observing the
+            # dispatch's acceptance (a genuine PROCESSING transition) --
+            # deliberately, only now, releasing the fence armed by the
+            # ASSIGN call's own notify_input_sent.
+            status_monitor._apply_detection(terminal_id, TerminalStatus.PROCESSING)
+
             terminal_service.send_input(
-                "race-terminal-assign",
-                follow_up_text,
-                orchestration_type=OrchestrationType.SEND_MESSAGE,
+                terminal_id, follow_up_text, orchestration_type=OrchestrationType.SEND_MESSAGE
             )
+        finally:
+            status_monitor.clear_terminal(terminal_id)
 
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            f1 = pool.submit(call_assign)
-            f2 = pool.submit(call_follow_up)
-            f1.result(timeout=5)
-            f2.result(timeout=5)
+        assert writes == [
+            assign_text,
+            follow_up_text,
+        ], f"expected exact order [assign, follow-up], got {writes!r}"
+        assert mock_tmux.send_keys.call_count == 2, "exactly one submit per input"
+        mock_bind.assert_called_once_with("codex", terminal_id, "0" * 32, assign_text)
 
-        assert max_seen == 1, (
-            f"tmux writes overlapped ({max_seen} concurrent) -- the assignment's "
-            "paste and the follow-up's paste could merge into one native turn"
-        )
-        assert sorted(writes) == sorted(
-            [assign_text, follow_up_text]
-        ), f"payloads were altered/merged: got {writes!r}"
-        mock_bind.assert_called_once_with("codex", "race-terminal-assign", "0" * 32, assign_text)
+
+class TestNativeAcceptanceFence:
+    """Item A: a per-terminal mutex alone (correction-971) is not enough --
+    a SUBSEQUENT send_input() call must also wait for a PRIOR dispatch's
+    native acceptance (correction-984) before it may paste, and must fail
+    closed rather than wait forever or silently proceed.
+
+    Uses the REAL StatusMonitor singleton so the fence armed by
+    notify_input_sent() and released by _apply_detection() actually engages;
+    only the tmux backend, terminal metadata, and provider manager are
+    mocked.
+    """
+
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_follow_up_blocks_until_a_controllably_delayed_acceptance_is_observed(
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_pm,
+        mock_update,
+    ):
+        terminal_id = "fence-terminal-delayed-acceptance"
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        provider = mock_pm.get_provider.return_value
+        provider.paste_enter_count = 1
+        provider.paste_submit_delay = 0.0
+
+        writes: list[str] = []
+
+        def send_keys_side_effect(session, window, message, **kwargs):
+            writes.append(message)
+
+        mock_tmux.send_keys.side_effect = send_keys_side_effect
+
+        first_text = "initial assignment dispatch"
+        second_text = "message874 follow-up"
+
+        try:
+            terminal_service.send_input(terminal_id, first_text)
+            assert writes == [first_text]
+
+            # Acceptance is deliberately NOT yet observed: the fence armed by
+            # the call above is still pending. Start the follow-up on its own
+            # thread -- it must block inside wait_for_native_acceptance
+            # rather than paste immediately.
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(terminal_service.send_input, terminal_id, second_text)
+
+                # Not the correctness mechanism (that is the fence itself) --
+                # a bounded scheduling nudge so the assertion below is
+                # actually exercising "still blocked", not "hasn't started
+                # yet". A blocked thread.Event.wait() releases the GIL almost
+                # immediately, so this is far more time than needed in
+                # practice; the real proof is what follows the release.
+                time.sleep(0.2)
+                assert writes == [first_text], (
+                    "follow-up pasted before the controlled acceptance event fired -- "
+                    "the native-acceptance fence did not hold"
+                )
+
+                # NOW deliberately deliver the controlled acceptance event.
+                status_monitor._apply_detection(terminal_id, TerminalStatus.PROCESSING)
+                future.result(timeout=5)
+
+            assert writes == [
+                first_text,
+                second_text,
+            ], f"expected exact order [first, follow-up] once accepted, got {writes!r}"
+        finally:
+            status_monitor.clear_terminal(terminal_id)
+
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_follow_up_fails_closed_when_acceptance_never_arrives(
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_pm,
+        mock_update,
+        monkeypatch,
+    ):
+        terminal_id = "fence-terminal-never-accepted"
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        provider = mock_pm.get_provider.return_value
+        provider.paste_enter_count = 1
+        provider.paste_submit_delay = 0.0
+        mock_tmux.send_keys.side_effect = lambda *a, **k: None
+        # Bounded, and short -- this test's whole point is proving the
+        # timeout path itself, not how long it takes.
+        monkeypatch.setattr(terminal_service, "NATIVE_ACCEPTANCE_TIMEOUT_S", 0.2)
+
+        try:
+            terminal_service.send_input(terminal_id, "initial assignment dispatch")
+            assert mock_tmux.send_keys.call_count == 1
+
+            # Acceptance is never delivered for this terminal_id in this test.
+            with pytest.raises(terminal_service.NativeAcceptanceTimeoutError):
+                terminal_service.send_input(terminal_id, "message874 follow-up")
+
+            assert (
+                mock_tmux.send_keys.call_count == 1
+            ), "the follow-up must never physically paste when acceptance times out"
+        finally:
+            status_monitor.clear_terminal(terminal_id)
 
 
 class TestTerminalInputLockPrimitive:

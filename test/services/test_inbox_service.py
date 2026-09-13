@@ -374,17 +374,21 @@ def test_concurrent_delivery_has_one_durable_paste(inbox_db, monkeypatch, server
 
 
 def test_deferred_follow_up_never_overlaps_a_concurrent_assign_dispatch(monkeypatch):
-    """Correction-971's real-world shape, end to end across both modules.
+    """Correction-971/984's real-world shape, end to end across both modules.
 
-    A completed assigned worker's capture barrier has just cleared, and
-    InboxService.deliver_pending is about to deliver a queued follow-up to it
-    -- racing, for the SAME terminal_id, against a genuinely concurrent
-    ASSIGN-orchestration send_input() call made directly (standing in for
+    An ASSIGN-orchestration send_input() call made directly (standing in for
     agent_step.py's initial-dispatch entry point, the one InboxService's own
-    private lock never shared anything with pre-fix). Both threads run the
-    REAL InboxService.deliver_pending / terminal_service.send_input code
-    (only DB/tmux/provider edges are mocked), so this proves the shared lock
-    actually closes the gap across the two modules -- not merely within one.
+    private lock never shared anything with pre-971-fix) dispatches first;
+    its native acceptance is then deliberately, explicitly confirmed (the
+    real StatusMonitor detection loop's role, simulated here); only THEN does
+    InboxService.deliver_pending attempt the completed worker's queued
+    follow-up. Deliberate ordering, not a symmetric race -- correction-984
+    found that a symmetric release proves only non-overlap, not the correct
+    order a real incident (assignment first, follow-up after) requires. Both
+    calls run the REAL InboxService.deliver_pending / terminal_service.
+    send_input code (only DB/tmux/provider edges are mocked), so this proves
+    the shared lock AND the native-acceptance fence both actually apply
+    across the two modules -- not merely within one.
     """
     terminal_id = "shared-completed-worker"
     message = _make_message(id=42, receiver_id=terminal_id, message="queued follow-up")
@@ -476,32 +480,38 @@ def test_deferred_follow_up_never_overlaps_a_concurrent_assign_dispatch(monkeypa
             occupancy -= 1
         return None
 
-    with patch("cli_agent_orchestrator.backends.registry._backend") as mock_backend:
-        mock_backend.send_keys.side_effect = send_keys_side_effect
-        assign_text = "assigned task bytes"
-        barrier = Barrier(2)
+    try:
+        with patch("cli_agent_orchestrator.backends.registry._backend") as mock_backend:
+            mock_backend.send_keys.side_effect = send_keys_side_effect
+            assign_text = "assigned task bytes"
 
-        def call_follow_up():
-            barrier.wait(timeout=5)
-            InboxService().deliver_pending(terminal_id)
-
-        def call_assign():
-            barrier.wait(timeout=5)
+            # Deliberate order (correction-984): the assignment dispatches
+            # first and completes...
             real_terminal_service.send_input(
                 terminal_id, assign_text, orchestration_type=OrchestrationType.ASSIGN
             )
+            assert writes == [assign_text]
 
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            f1 = executor.submit(call_follow_up)
-            f2 = executor.submit(call_assign)
-            f1.result(timeout=5)
-            f2.result(timeout=5)
+            # ...its native acceptance is then explicitly, deliberately
+            # confirmed -- simulating StatusMonitor's real detection loop --
+            # releasing the fence armed by that dispatch's own
+            # notify_input_sent (called internally by send_input above)...
+            inbox_mod.status_monitor._apply_detection(terminal_id, TerminalStatus.PROCESSING)
+
+            # ...only THEN does the completed worker's queued follow-up
+            # attempt delivery.
+            InboxService().deliver_pending(terminal_id)
+    finally:
+        inbox_mod.status_monitor.clear_terminal(terminal_id)
 
     assert max_seen == 1, (
         f"follow-up and ASSIGN dispatch tmux writes overlapped ({max_seen} concurrent) "
         "-- correction-971's cross-module race reproduced"
     )
-    assert sorted(writes) == sorted(["queued follow-up", assign_text])
+    assert writes == [
+        assign_text,
+        "queued follow-up",
+    ], f"expected exact order [assign, follow-up], got {writes!r}"
     mock_bind.assert_called_once_with("codex", terminal_id, "1" * 32, assign_text)
 
 

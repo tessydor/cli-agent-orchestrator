@@ -155,6 +155,42 @@ class TerminalRecordCorruptError(Exception):
     """
 
 
+class NativeAcceptanceTimeoutError(Exception):
+    """A prior send_input() dispatch to this terminal has not been confirmed
+    accepted by its native process within the bounded wait.
+
+    Correction-984: terminal_input_lock (correction-971) serializes the
+    PHYSICAL tmux write between concurrent send_input() callers for the same
+    terminal_id, but says nothing about whether the terminal's own process
+    has actually registered a PRIOR dispatch by the time a SUBSEQUENT
+    caller's turn to hold that lock arrives -- for a provider that does not
+    ``assume_processing_on_dispatch`` (see providers/base.py), that
+    confirmation depends on StatusMonitor's real output-based detection
+    observing a transition away from IDLE (see
+    StatusMonitor.wait_for_native_acceptance / notify_input_sent), which can
+    genuinely take a bounded amount of wall-clock time after the physical
+    paste+Enter returns. Raised instead of proceeding: a too-early second
+    paste risks landing inside a composer the prior dispatch has not yet
+    cleared, silently merging two turns into one. Callers that can safely
+    retry later (e.g. InboxService, which re-checks status on the next
+    IDLE/COMPLETED event) should treat this the same as a transient,
+    not-ready-yet condition -- never as a permanent failure, and never by
+    retrying immediately in a tight loop.
+    """
+
+
+# Bounded wait (seconds) for a PRIOR dispatch's native acceptance before a
+# SUBSEQUENT send_input() call for the same terminal refuses to paste
+# (correction-984). Generous relative to the slowest known real-world
+# component of that latency -- claude_code's own paste_submit_delay is up to
+# 2.0s -- plus margin for StatusMonitor's rising-edge detection (fires on the
+# first output chunk after quiet, not after a further debounce) to actually
+# observe and apply the transition. Not tunable per-provider: a single
+# generous bound keeps this fail-closed without needing to plumb provider
+# identity to the wait call.
+NATIVE_ACCEPTANCE_TIMEOUT_S = 8.0
+
+
 # Upper bound (bytes) on a single offset-ranged read of a terminal log
 # (U5 / #504, BR-2). ``read_output_range`` clamps its ``length`` to this so a
 # caller (playback fetching output around a selected event) can never trigger
@@ -2465,6 +2501,22 @@ def send_input(
     """
     with terminal_input_lock(terminal_id):
         try:
+            # Native acceptance/order fence (correction-984). The lock above
+            # only guarantees no OTHER send_input() call for this terminal_id
+            # is physically writing right now; it says nothing about whether
+            # a PRIOR dispatch (from before this call acquired the lock) has
+            # actually been accepted by the terminal's native process yet.
+            # Check this BEFORE touching anything of our own, so a still-
+            # pending prior turn can never be raced by this one's paste.
+            if not status_monitor.wait_for_native_acceptance(
+                terminal_id, timeout=NATIVE_ACCEPTANCE_TIMEOUT_S
+            ):
+                raise NativeAcceptanceTimeoutError(
+                    f"Terminal {terminal_id}: a prior dispatch was not confirmed "
+                    f"accepted within {NATIVE_ACCEPTANCE_TIMEOUT_S}s; refusing to "
+                    "paste to avoid landing inside an unconfirmed composer."
+                )
+
             metadata = get_terminal_metadata(terminal_id)
             if not metadata:
                 raise ValueError(f"Terminal '{terminal_id}' not found")

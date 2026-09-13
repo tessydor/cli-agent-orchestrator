@@ -7,44 +7,64 @@ transcript before a turn boundary, so the follow-up's bytes end up appended
 to the registered dispatch text with no separator. The dispatch-identity hash
 bind_completion_dispatch() recorded for that worker therefore covers only a
 PREFIX of what the native provider actually received; the remaining suffix
-is a genuine follow-up message that was never durably delivered as its own
-inbox row.
+is a genuine follow-up message.
 
-This module analyzes an ALREADY-corrupted assignment from archived evidence
-(a read-only transcript copy, the assignment's own registered dispatch
-digests) and, only if every fail-closed guard passes, produces the parameters
-for the ONE legitimate durable write recovery may ever make: re-queuing the
-proven unbound suffix as its own new, distinct PENDING inbox message via the
-existing, already-audited create_inbox_message() plumbing. It never edits
-provider/native transcript history, never mutates lifecycle/delivery_state/
-final_result, never forges a completion, and never silently marks anything
-delivered.
+IMPORTANT provenance correction (correction-984): the concatenated suffix is
+a message the ASSIGNING CALLER sent TO the worker (the exact same direction
+as the original dispatch itself -- both are native INPUT the worker's
+process was supposed to receive as two distinct turns). It is proof that a
+prior caller->worker follow-up got corrupted into the dispatch transcript --
+it is NEVER a worker-produced report, and recovering it is never equivalent
+to "the missing assignment result arrived." An earlier version of this
+module got this backwards: it built parameters for a NEW inbox message
+FROM the worker TO the caller (worker->caller, origin=SYSTEM), which would
+have fabricated a worker report out of what is actually caller input, and
+silently released the concatenated message. That behavior has been removed
+entirely -- this module now NEVER creates, replays, or re-delivers any inbox
+message. It also never claims to restore a missing assignment result and
+never releases any OTHER pending message's delivery barrier; only the
+proper, already-existing lifecycle transitions may do that.
 
-This is a general, reusable capability -- it does not know about, and is not
-scoped to, any specific incident. Binding a matched unbound suffix to an
-exact durable message record in some OTHER system (so a caller can supply
-`durable_suffix_reference` with confidence) is explicitly the caller's
-responsibility; when that binding cannot be established, check_recovery_
-guards fails closed with GUARD_DURABLE_SUFFIX_UNBOUND rather than guessing.
+What this module DOES do: analyze an already-corrupted assignment from
+archived evidence (a read-only transcript copy, the assignment's own
+registered dispatch digests, and a caller-supplied claim identifying the
+durable message believed to have been concatenated in) and, only if every
+fail-closed guard passes -- including that the claimed message is in the
+correct caller->worker direction and its content hash matches the
+independently recomputed unbound suffix exactly -- build a truthful,
+nonduplicating CorruptionRecord: the evidence needed to archive/reconcile
+the incident (exact registered-dispatch hash/prefix, exact transcript whole
+digest, exact concatenated-message identity/content-hash/sender/receiver/
+delivery-state/session, exact assignment/callback/lifecycle snapshot). It
+never mutates lifecycle/delivery_state/final_result, never forges a
+completion, and never silently marks anything delivered.
 
-apply_recovery_inbox_message() performs a real write and is fully unit
-tested, but nothing in this codebase calls it against live data -- executing
-it against a real corrupted assignment is a separate, explicit, owner-
-authorized operator action outside this module's and this PR's scope.
+Deliberately unresolved by this module (reported here as an explicit
+blocker rather than guessed at): WHERE a CorruptionRecord should be
+durably persisted in a real deployment. Candidates considered and rejected
+as unilateral guesses this correction should not make: (a) reusing
+assigned_worker_callbacks.reconciliation_evidence (PR #11) conflates this
+with "caller accepted the completion result," which a dispatch-corruption
+record is not, and would additionally make the assignment eligible for
+retirement as a side effect nobody asked for here; (b) a brand-new
+dedicated table/columns is a real schema change (migration + trigger +
+tests) out of proportion for "the smallest coherent fix." apply_corruption_
+record() therefore takes an explicit, caller-supplied persistence callback
+and an explicit existing-record lookup, so the identity/guard/idempotency
+logic is fully implemented and tested here while the actual storage
+location remains the owner's decision, not this module's guess.
 """
 
 from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable, Optional
 
-from cli_agent_orchestrator.clients.database import create_inbox_message
 from cli_agent_orchestrator.models.assigned_worker import (
     AssignedWorkerCallback,
     AssignmentLifecycle,
 )
-from cli_agent_orchestrator.models.inbox import InboxMessage, InboxMessageOrigin
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
 # Mirrors provider_completion_report.MAX_REPORT_BYTES: this is an offline
@@ -61,7 +81,9 @@ GUARD_HASH_PREFIX_MISMATCH = "hash_prefix_mismatch"
 GUARD_UNBOUND_SUFFIX_MISSING = "unbound_suffix_missing"
 GUARD_CHANGED_CALLBACK_STATE = "changed_callback_state"
 GUARD_LIVE_TERMINAL_ACTIVITY = "live_terminal_activity"
-GUARD_DURABLE_SUFFIX_UNBOUND = "unbound_suffix_not_durably_recorded"
+GUARD_CLAIM_UNBOUND = "concatenated_message_claim_unbound"
+GUARD_CONTENT_MISMATCH = "concatenated_message_content_mismatch"
+GUARD_WRONG_DIRECTION = "concatenated_message_wrong_direction"
 
 _ELIGIBLE_LIFECYCLES = (
     AssignmentLifecycle.DISPATCHED,
@@ -85,10 +107,10 @@ class DispatchCorruptionAnalysis:
     """
 
     matched: bool
-    bound_prefix_length: int | None
-    matched_digest: str | None
-    unbound_suffix: str | None
-    unbound_suffix_sha256: str | None
+    bound_prefix_length: Optional[int]
+    matched_digest: Optional[str]
+    unbound_suffix: Optional[str]
+    unbound_suffix_sha256: Optional[str]
 
 
 def analyze_native_dispatch_corruption(
@@ -100,11 +122,11 @@ def analyze_native_dispatch_corruption(
     it as the unbound suffix.
 
     Pure and read-only: no I/O, no mutation, no claim about whether the
-    suffix is SAFE to recover -- only where the immutable, already-durable
-    dispatch boundary provably ends. Independently recomputed from the raw
-    text every time; never trust an externally supplied length or hash claim
-    in its place (see check_recovery_guards' evidence-mutation guard for the
-    matching discipline this is meant to pair with).
+    suffix is SAFE to recover, and no claim about what the suffix IS (see
+    ConcatenatedMessageClaim for that) -- only where the immutable,
+    already-durable dispatch boundary provably ends. Independently
+    recomputed from the raw text every time; never trust an externally
+    supplied length or hash claim in its place.
     """
     encoded_len = len(transcript_first_user_text.encode("utf-8"))
     if encoded_len > MAX_TRANSCRIPT_BYTES:
@@ -136,33 +158,56 @@ def analyze_native_dispatch_corruption(
 
 
 @dataclass(frozen=True)
+class ConcatenatedMessageClaim:
+    """A caller's claim about which durable message was concatenated into
+    the unbound suffix -- e.g. an operator's independently-verified finding
+    from a database this module has no access to.
+
+    Never trusted on its own: check_recovery_guards cross-checks ``content``
+    against the independently recomputed ``analysis.unbound_suffix`` byte for
+    byte, and checks ``sender_id``/``receiver_id`` are in the caller->worker
+    direction the corruption mechanism requires (never worker->caller -- see
+    the module docstring's provenance correction). ``message_id`` is an
+    opaque identifier in whatever system holds the durable record (an int,
+    a string, a composite key) -- this module makes no assumption about its
+    shape.
+    """
+
+    message_id: Any
+    sender_id: str
+    receiver_id: str
+    content: str
+    delivery_state: str
+    session_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class RecoveryGuardResult:
     allowed: bool
-    reason_code: str | None
+    reason_code: Optional[str]
     detail: str
 
 
 def check_recovery_guards(
     *,
     requesting_caller_id: str,
-    callback: AssignedWorkerCallback | None,
+    callback: Optional[AssignedWorkerCallback],
     analysis: DispatchCorruptionAnalysis,
     live_status: TerminalStatus,
     archived_transcript_sha256: str,
     expected_archived_transcript_sha256: str,
-    durable_suffix_reference: str | None,
+    claim: Optional[ConcatenatedMessageClaim],
 ) -> RecoveryGuardResult:
     """Every check fails closed: the first failure wins and nothing
     downstream is trusted or evaluated. Passing every guard means it is safe
-    to hand ``analysis.unbound_suffix`` to
-    ``build_recovery_inbox_message_params`` for a real durable write -- it
-    does not perform that write itself.
+    to hand ``analysis``/``claim`` to ``build_corruption_record`` -- it does
+    not build or persist anything itself.
 
     Guard order is deliberate: identity and evidence integrity are checked
     before anything derived from the (unauthenticated-until-proven) archived
-    transcript is trusted, and liveness is re-checked last, right before any
-    caller would act on this result, to minimize the window between the
-    check and use.
+    transcript or claim is trusted, and liveness is checked last, right
+    before any caller would act on this result, to minimize the window
+    between the check and use.
     """
     if callback is None:
         return RecoveryGuardResult(
@@ -205,63 +250,122 @@ def check_recovery_guards(
             GUARD_LIVE_TERMINAL_ACTIVITY,
             f"terminal is currently {live_status.value}; recovery must wait for it to go idle",
         )
-    if not durable_suffix_reference:
+    if claim is None:
         return RecoveryGuardResult(
             False,
-            GUARD_DURABLE_SUFFIX_UNBOUND,
+            GUARD_CLAIM_UNBOUND,
             "the unbound suffix cannot be bound to an exact durable message record -- "
             "report this precise blocker rather than guessing at the follow-up's origin",
+        )
+    if claim.content != analysis.unbound_suffix:
+        return RecoveryGuardResult(
+            False,
+            GUARD_CONTENT_MISMATCH,
+            "the claimed message's content does not byte-for-byte match the independently "
+            "recomputed unbound suffix",
+        )
+    if claim.sender_id != callback.caller_id or claim.receiver_id != callback.worker_terminal_id:
+        return RecoveryGuardResult(
+            False,
+            GUARD_WRONG_DIRECTION,
+            "the claimed message is not in the caller->worker direction this corruption "
+            "mechanism requires (never worker->caller)",
         )
     return RecoveryGuardResult(True, None, "all guards passed")
 
 
-def build_recovery_inbox_message_params(
+@dataclass(frozen=True)
+class CorruptionRecord:
+    """Truthful, nonduplicating archive of one native-dispatch corruption
+    incident. Never a completion, never a report, never itself a release of
+    any pending message's delivery barrier -- purely an audit record of what
+    was independently proven.
+    """
+
+    assignment_id: str
+    completion_id: str
+    worker_terminal_id: str
+    caller_id: str
+    registered_dispatch_sha256: str
+    bound_prefix_length: int
+    transcript_sha256: str
+    concatenated_message_id: Any
+    concatenated_message_sender_id: str
+    concatenated_message_receiver_id: str
+    concatenated_message_content_sha256: str
+    concatenated_message_delivery_state: str
+    concatenated_message_session_id: Optional[str]
+    recorded_at: str
+
+    def record_key(self) -> str:
+        """Deterministic identity for idempotency/conflict checks -- one
+        corruption record per (assignment, exact concatenated message).
+        """
+        return f"native-dispatch-corruption:{self.assignment_id}:{self.concatenated_message_id}"
+
+
+def build_corruption_record(
     *,
     callback: AssignedWorkerCallback,
     analysis: DispatchCorruptionAnalysis,
-) -> dict[str, Any]:
-    """Exact, deterministic parameters for the one legitimate durable write
-    this recovery path may ever make: re-queuing the proven unbound suffix as
-    its OWN new, distinct inbox message -- never editing native transcript
-    history, never touching the original dispatch/callback/final_result.
-
-    Callers MUST have already obtained an ``allowed`` result from
-    check_recovery_guards for the same ``callback``/``analysis`` pair; this
-    function performs no guard checks of its own; it and
-    apply_recovery_inbox_message together are the "safely reviewable
-    portion" -- the write itself is always additive-only and idempotent
-    (see create_inbox_message's idempotency-key collision handling), never a
-    silent delivery-state mutation.
+    claim: ConcatenatedMessageClaim,
+    transcript_sha256: str,
+    recorded_at: str,
+) -> CorruptionRecord:
+    """Build the record. Callers MUST have already obtained an ``allowed``
+    result from check_recovery_guards for the same arguments -- this
+    function performs no guard checks of its own.
     """
-    if not analysis.unbound_suffix or not analysis.unbound_suffix_sha256:
-        raise ValueError("build_recovery_inbox_message_params requires a matched unbound suffix")
-    idempotency_key = (
-        f"native-dispatch-recovery:{callback.assignment_id}:{analysis.unbound_suffix_sha256}"
+    if not analysis.matched or not analysis.matched_digest or analysis.bound_prefix_length is None:
+        raise ValueError("build_corruption_record requires a matched dispatch analysis")
+    return CorruptionRecord(
+        assignment_id=callback.assignment_id,
+        completion_id=callback.completion_id,
+        worker_terminal_id=callback.worker_terminal_id,
+        caller_id=callback.caller_id,
+        registered_dispatch_sha256=analysis.matched_digest,
+        bound_prefix_length=analysis.bound_prefix_length,
+        transcript_sha256=transcript_sha256,
+        concatenated_message_id=claim.message_id,
+        concatenated_message_sender_id=claim.sender_id,
+        concatenated_message_receiver_id=claim.receiver_id,
+        concatenated_message_content_sha256=utf8_sha256(claim.content),
+        concatenated_message_delivery_state=claim.delivery_state,
+        concatenated_message_session_id=claim.session_id,
+        recorded_at=recorded_at,
     )
-    return {
-        "sender_id": callback.worker_terminal_id,
-        "receiver_id": callback.caller_id,
-        "message": analysis.unbound_suffix,
-        "origin": InboxMessageOrigin.SYSTEM,
-        "assignment_id": callback.assignment_id,
-        "idempotency_key": idempotency_key,
-    }
 
 
-def apply_recovery_inbox_message(params: dict[str, Any]) -> InboxMessage:
-    """Perform the one durable write ``build_recovery_inbox_message_params``
-    describes.
+def apply_corruption_record(
+    record: CorruptionRecord,
+    *,
+    existing_record: Optional[CorruptionRecord],
+    persist: Callable[[CorruptionRecord], None],
+) -> CorruptionRecord:
+    """Idempotently persist ``record`` via the caller-supplied ``persist``
+    callback -- see the module docstring for why the actual storage location
+    is deliberately left to the caller rather than guessed at here.
 
-    Delegates entirely to the existing, already-audited
-    ``create_inbox_message`` -- no parallel persistence path. That function's
-    own idempotency-key handling makes a byte-identical replay a safe no-op
-    and rejects a non-identical collision under the same key outright, so a
-    duplicate or altered recovery attempt for the same assignment/suffix can
-    never silently diverge.
+    ``existing_record`` must be whatever ``persist``'s backing store
+    currently holds under ``record.record_key()``, read by the caller inside
+    the SAME transaction/CAS boundary it will use to call ``persist`` --
+    this function does not read or write storage itself, only decides
+    whether writing is safe:
 
-    NOT invoked anywhere in this codebase against live data. Exposed and
-    unit-tested so an authorized operator with real database access to the
-    affected deployment can invoke it explicitly, only after independently
-    confirming every check_recovery_guards guard passes there.
+    - No existing record: ``persist(record)`` is called once; returns
+      ``record``.
+    - An existing, byte-identical record: a safe idempotent no-op --
+      ``persist`` is NOT called again; returns ``existing_record``.
+    - An existing, DIFFERENT record for the same key: refused outright
+      (``ValueError``) rather than silently overwritten -- mirrors
+      create_inbox_message's own idempotency-key collision handling.
     """
-    return create_inbox_message(**params)
+    if existing_record is not None:
+        if existing_record == record:
+            return existing_record
+        raise ValueError(
+            f"corruption record collision for {record.record_key()!r}: an existing, "
+            "DIFFERENT record already exists for this assignment/message identity"
+        )
+    persist(record)
+    return record

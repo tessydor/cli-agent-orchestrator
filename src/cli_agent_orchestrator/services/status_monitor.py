@@ -138,6 +138,21 @@ class StatusMonitor:
         # applied across that boundary would consume the arm and latch-block the new
         # turn's genuine PROCESSING.
         self._capture_generation: Dict[str, int] = {}
+        # Per-terminal native-acceptance fence (correction-984). Armed by
+        # notify_input_sent() whenever a dispatch is sent to a provider that
+        # does NOT assume_processing_on_dispatch (see providers/base.py):
+        # terminal_service's per-terminal lock (correction-971) already
+        # guarantees no two send_input() calls for the SAME terminal_id can
+        # physically write to the pane at once, but it says nothing about
+        # whether the terminal's own native process has actually registered
+        # a PRIOR dispatch by the time a SUBSEQUENT caller's turn to hold
+        # that lock arrives -- a too-early second paste could still land
+        # inside a composer the prior dispatch has not yet cleared. Released
+        # by _apply_detection_locked the moment a genuine transition away
+        # from IDLE is observed (proof the terminal registered SOMETHING).
+        # Absence of an entry means "nothing pending" -- safe to proceed
+        # immediately (see wait_for_native_acceptance).
+        self._acceptance_pending: Dict[str, threading.Event] = {}
         # --- pyte rendered-screen detection state (only used when CAO_PYTE_STATUS
         # is on AND the provider opts in via supports_screen_detection) ---
         # Per-terminal pyte Screen+Stream that composites the raw byte stream
@@ -319,6 +334,19 @@ class StatusMonitor:
             self._allow_processing_revert[terminal_id] = False
         elif detected in _STICKY_READY_STATUSES and last not in _STICKY_READY_STATUSES:
             self._allow_processing_revert[terminal_id] = False
+
+        if detected != TerminalStatus.IDLE:
+            # A genuine, accepted transition away from IDLE is proof the
+            # terminal's native process registered SOMETHING (started
+            # processing, asked a question, finished, or errored) -- release
+            # any native-acceptance fence a prior notify_input_sent() armed
+            # for this terminal (correction-984). IDLE itself never releases
+            # it: that is exactly the ambiguous "did it actually accept the
+            # paste, or is the composer just showing stale/cleared text"
+            # state the fence exists to wait past.
+            pending = self._acceptance_pending.get(terminal_id)
+            if pending is not None:
+                pending.set()
 
         return True
 
@@ -570,6 +598,15 @@ class StatusMonitor:
         cycle (terminal_service.send_input, provider.initialize warm-up
         and CLI-launch keystrokes). Without this, a previously-latched
         IDLE/COMPLETED would block the genuine PROCESSING transition.
+
+        When ``assume_processing`` is False, also arms the native-acceptance
+        fence (correction-984): this dispatch's acceptance is NOT assumed,
+        so any other send_input() call for this same terminal_id that
+        acquires the per-terminal lock next must wait for a real detected
+        transition away from IDLE before pasting (see
+        wait_for_native_acceptance). When True, PROCESSING is applied
+        synchronously below, which itself releases any such fence via the
+        normal _apply_detection_locked path -- no separate arm is needed.
         """
         with self._lock:
             self._allow_processing_revert[terminal_id] = True
@@ -582,8 +619,26 @@ class StatusMonitor:
             # stale verdict over the new turn (and consume the revert arm just set).
             self._pending_stale_capture.pop(terminal_id, None)
             self._capture_generation[terminal_id] = self._capture_generation.get(terminal_id, 0) + 1
+            if not assume_processing:
+                self._acceptance_pending[terminal_id] = threading.Event()
         if assume_processing:
             self._apply_detection(terminal_id, TerminalStatus.PROCESSING)
+
+    def wait_for_native_acceptance(self, terminal_id: str, timeout: float = 8.0) -> bool:
+        """Block until a PRIOR dispatch to this terminal is confirmed accepted.
+
+        Returns True immediately if nothing is pending (no dispatch has been
+        sent yet, or the pending one was already confirmed/superseded).
+        Otherwise blocks up to ``timeout`` seconds for
+        _apply_detection_locked to observe a real transition away from IDLE,
+        returning False on timeout (correction-984) -- callers MUST treat
+        False as a fail-closed refusal to paste, never as permission to
+        proceed anyway; no timeout may silently release this fence.
+        """
+        event = self._acceptance_pending.get(terminal_id)
+        if event is None:
+            return True
+        return event.wait(timeout=timeout)
 
     def clear_rolling_buffer(self, terminal_id: str, provider=None) -> None:
         """Clear ONLY the rolling byte buffer for a terminal — preserves
@@ -635,6 +690,12 @@ class StatusMonitor:
             self._pending_stale_capture.pop(terminal_id, None)
             self._capture_generation.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
+            # Release rather than leave any waiter blocked for up to its full
+            # timeout on a terminal that no longer exists -- deliberate, not
+            # the silent timeout-release wait_for_native_acceptance forbids.
+            pending = self._acceptance_pending.pop(terminal_id, None)
+            if pending is not None:
+                pending.set()
         self._cancel_quiesce_handle(handle)
 
     def reset_buffer(self, terminal_id: str) -> None:
@@ -659,6 +720,12 @@ class StatusMonitor:
             self._pending_stale_capture.pop(terminal_id, None)
             self._capture_generation.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
+            # The relaunched CLI mode's own dispatch will re-arm this if
+            # needed; a fence left over from the failed attempt must not
+            # block it or linger past the reset it is being reset for.
+            pending = self._acceptance_pending.pop(terminal_id, None)
+            if pending is not None:
+                pending.set()
         self._cancel_quiesce_handle(handle)
 
     def get_status(self, terminal_id: str) -> TerminalStatus:

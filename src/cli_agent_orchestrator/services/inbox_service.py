@@ -30,6 +30,7 @@ from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.status_monitor import status_monitor
+from cli_agent_orchestrator.services.terminal_service import NativeAcceptanceTimeoutError
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
@@ -208,6 +209,20 @@ class InboxService:
                 logger.warning(
                     f"Pane not resolvable for terminal {terminal_id}; leaving "
                     f"{len(batch)} message(s) pending for retry: {e}"
+                )
+            except NativeAcceptanceTimeoutError as e:
+                # A PRIOR dispatch to this terminal (from any send_input entry
+                # point) has not yet been confirmed accepted (correction-984).
+                # Transient by construction: the next IDLE/COMPLETED status
+                # event re-triggers deliver_pending, and by then the prior
+                # turn will either have been accepted (fence cleared) or the
+                # terminal genuinely never accepted it, which is not this
+                # delivery's failure to own. Never treat as FAILED.
+                for message in batch:
+                    resolve_inbox_claim(message.id, claim_token, MessageStatus.PENDING)
+                logger.warning(
+                    f"Prior dispatch to terminal {terminal_id} not yet confirmed accepted; "
+                    f"leaving {len(batch)} message(s) pending for retry: {e}"
                 )
             except Exception as e:
                 for message in batch:
