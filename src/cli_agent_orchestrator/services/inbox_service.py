@@ -8,7 +8,6 @@ import logging
 import threading
 import uuid
 from itertools import groupby
-from typing import Dict
 
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.clients.database import (
@@ -39,27 +38,37 @@ logger = logging.getLogger(__name__)
 class InboxService:
     """Delivers one pending message per terminal per IDLE cycle."""
 
-    def __init__(self) -> None:
-        # deliver_pending is read(PENDING) → status check → mark DELIVERED → send,
-        # with no atomic claim at the DB layer, so two concurrent calls for the
-        # SAME terminal can both read the same oldest row before either marks it
-        # and deliver one task twice. Concurrent callers are real: the status-event
-        # consumer and the immediate POST path both dispatch to worker threads, and
-        # the OpenCode poller and the reconcile sweep add more. Serialize the whole
-        # read→mark→send sequence per terminal; as a side effect this also keeps
-        # two pastes from ever interleaving in one pane. The lock map is tiny
-        # (one Lock per terminal id ever delivered to in this process) and is not
-        # reaped — terminal ids are bounded by session lifecycle.
-        self._delivery_locks_guard = threading.Lock()
-        self._delivery_locks: Dict[str, threading.Lock] = {}
+    def _delivery_lock(self, terminal_id: str) -> threading.RLock:
+        """Return the shared per-terminal lock guarding native-input delivery.
 
-    def _delivery_lock(self, terminal_id: str) -> threading.Lock:
-        with self._delivery_locks_guard:
-            lock = self._delivery_locks.get(terminal_id)
-            if lock is None:
-                lock = threading.Lock()
-                self._delivery_locks[terminal_id] = lock
-            return lock
+        deliver_pending is read(PENDING) → status check → capture-barrier wait
+        → mark DELIVERED → send, with no atomic claim at the DB layer, so two
+        concurrent calls for the SAME terminal can both read the same oldest
+        row before either marks it and deliver one task twice. Concurrent
+        callers are real: the status-event consumer and the immediate POST
+        path both dispatch to worker threads, and the OpenCode poller and the
+        reconcile sweep add more.
+
+        This used to be a private per-terminal Lock of InboxService's own,
+        which only ever serialized InboxService's OWN deliveries against each
+        other -- not against the other three send_input entry points
+        (agent_step's initial assignment dispatch, the raw
+        POST /terminals/{id}/input route, and agui's handoff-approval send).
+        A follow-up delivered here could therefore still physically interleave
+        its tmux paste with one of those (the proven correction-971 defect: a
+        follow-up landing inside an assignment's still-open first-user paste,
+        corrupting the dispatch-identity hash bind_completion_dispatch
+        records). Using terminal_service's shared lock instead -- and holding
+        it across wait_for_capture_before_input() too, not just around the
+        eventual send_input() call -- closes the specific gap where that wait
+        returns, the lock is momentarily not held, and a concurrent caller's
+        send_input slips in before this delivery's own send_input call:
+        extending the capture barrier's protection to every entry point
+        uniformly, not just the physical tmux write. Safe because
+        terminal_input_lock is an RLock and send_input (called from within
+        this same held lock, on the same thread) reacquires it reentrantly.
+        """
+        return terminal_service.terminal_input_lock(terminal_id)
 
     async def run(self, registry: PluginRegistry | None = None) -> None:
         queue = bus.subscribe("terminal.*.status")

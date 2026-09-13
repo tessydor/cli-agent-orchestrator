@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from threading import Barrier, Lock
+from threading import Barrier, Lock, RLock
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
@@ -19,6 +19,7 @@ from cli_agent_orchestrator.models.inbox import (
     InboxMessage,
     InboxMessageOrigin,
     MessageStatus,
+    OrchestrationType,
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import inbox_service as inbox_mod
@@ -327,6 +328,19 @@ def _create_delivery_row(server_callback: bool):
 
 @pytest.mark.parametrize("server_callback", [False, True])
 def test_concurrent_delivery_has_one_durable_paste(inbox_db, monkeypatch, server_callback):
+    """The DB-level claim (claim_inbox_message) is the ultimate guarantor of
+    exactly-once delivery -- defense in depth, independent of any in-process
+    lock. _delivery_lock is forced to a FRESH, unshared RLock per call (via
+    two separate InboxService instances plus this patch) specifically to
+    remove in-process serialization from the picture: since correction-971,
+    _delivery_lock returns terminal_service's module-level shared per-
+    terminal lock, which now correctly serializes deliver_pending calls
+    across instances too (see test_native_input_serialization_race.py for
+    that guarantee) -- so without this patch the two threads below would
+    never race at the read in the first place. This test intentionally
+    forces the race anyway to prove the DB claim alone -- not merely the
+    lock -- prevents a duplicate paste.
+    """
     caller, message = _create_delivery_row(server_callback)
     real_get = db.get_pending_messages
     both_read_pending = Barrier(2)
@@ -338,6 +352,7 @@ def test_concurrent_delivery_has_one_durable_paste(inbox_db, monkeypatch, server
 
     monkeypatch.setattr(inbox_mod, "get_pending_messages", racing_read)
     monkeypatch.setattr(inbox_mod.status_monitor, "get_status", lambda _id: TerminalStatus.IDLE)
+    monkeypatch.setattr(InboxService, "_delivery_lock", lambda self, terminal_id: RLock())
     pastes = []
     paste_lock = Lock()
 
@@ -356,6 +371,138 @@ def test_concurrent_delivery_has_one_durable_paste(inbox_db, monkeypatch, server
     stored = db.get_inbox_messages(caller, limit=10)
     assert [row.id for row in stored] == [message.id]
     assert stored[0].status == MessageStatus.DELIVERED
+
+
+def test_deferred_follow_up_never_overlaps_a_concurrent_assign_dispatch(monkeypatch):
+    """Correction-971's real-world shape, end to end across both modules.
+
+    A completed assigned worker's capture barrier has just cleared, and
+    InboxService.deliver_pending is about to deliver a queued follow-up to it
+    -- racing, for the SAME terminal_id, against a genuinely concurrent
+    ASSIGN-orchestration send_input() call made directly (standing in for
+    agent_step.py's initial-dispatch entry point, the one InboxService's own
+    private lock never shared anything with pre-fix). Both threads run the
+    REAL InboxService.deliver_pending / terminal_service.send_input code
+    (only DB/tmux/provider edges are mocked), so this proves the shared lock
+    actually closes the gap across the two modules -- not merely within one.
+    """
+    terminal_id = "shared-completed-worker"
+    message = _make_message(id=42, receiver_id=terminal_id, message="queued follow-up")
+    monkeypatch.setattr(inbox_mod, "get_pending_messages", MagicMock(return_value=[message]))
+    monkeypatch.setattr(
+        inbox_mod,
+        "claim_inbox_message",
+        MagicMock(
+            return_value=message.model_copy(
+                update={
+                    "status": MessageStatus.DELIVERING,
+                    "claim_token": "tok",
+                    "claimed_at": datetime.now(),
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(inbox_mod, "resolve_inbox_claim", MagicMock(return_value=True))
+    monkeypatch.setattr(
+        inbox_mod, "is_assigned_worker_callback_inbox_message", MagicMock(return_value=False)
+    )
+    # status_monitor is the SAME singleton imported into both inbox_service and
+    # terminal_service -- patching it here makes both modules' checks agree,
+    # matching the real deployment.
+    monkeypatch.setattr(
+        inbox_mod.status_monitor, "get_status", MagicMock(return_value=TerminalStatus.COMPLETED)
+    )
+    from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+        assigned_worker_completion_service,
+    )
+
+    # The capture barrier has already cleared by the time both callers race --
+    # this isolates the remaining gap correction-971 actually found (nothing
+    # serializing the recheck-then-send step against a concurrent caller),
+    # rather than re-testing the barrier itself (already covered elsewhere).
+    monkeypatch.setattr(
+        assigned_worker_completion_service, "wait_for_capture_before_input", lambda _id: True
+    )
+
+    from cli_agent_orchestrator.services import terminal_service as real_terminal_service
+
+    monkeypatch.setattr(
+        real_terminal_service,
+        "get_terminal_metadata",
+        MagicMock(
+            return_value={
+                "tmux_session": "cao-session",
+                "tmux_window": "developer-shared",
+                "provider": "codex",
+            }
+        ),
+    )
+    monkeypatch.setattr(real_terminal_service, "update_last_active", MagicMock())
+    monkeypatch.setattr(
+        real_terminal_service,
+        "inject_memory_context",
+        lambda message, terminal_id, frozen_memory=None: message,
+    )
+    callback = MagicMock()
+    callback.completion_id = "1" * 32
+    monkeypatch.setattr(
+        real_terminal_service, "get_assigned_worker_callback", MagicMock(return_value=callback)
+    )
+    mock_bind = MagicMock()
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.provider_completion_report.bind_completion_dispatch",
+        mock_bind,
+    )
+    provider = MagicMock()
+    provider.paste_enter_count = 2
+    provider.paste_submit_delay = 0.0
+    real_terminal_service.provider_manager.get_provider = MagicMock(return_value=provider)
+
+    occupancy = 0
+    max_seen = 0
+    occ_guard = Lock()
+    writes = []
+
+    def send_keys_side_effect(session, window, message, **kwargs):
+        nonlocal occupancy, max_seen
+        with occ_guard:
+            occupancy += 1
+            max_seen = max(max_seen, occupancy)
+            writes.append(message)
+        import time as _time
+
+        _time.sleep(0.02)
+        with occ_guard:
+            occupancy -= 1
+        return None
+
+    with patch("cli_agent_orchestrator.backends.registry._backend") as mock_backend:
+        mock_backend.send_keys.side_effect = send_keys_side_effect
+        assign_text = "assigned task bytes"
+        barrier = Barrier(2)
+
+        def call_follow_up():
+            barrier.wait(timeout=5)
+            InboxService().deliver_pending(terminal_id)
+
+        def call_assign():
+            barrier.wait(timeout=5)
+            real_terminal_service.send_input(
+                terminal_id, assign_text, orchestration_type=OrchestrationType.ASSIGN
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            f1 = executor.submit(call_follow_up)
+            f2 = executor.submit(call_assign)
+            f1.result(timeout=5)
+            f2.result(timeout=5)
+
+    assert max_seen == 1, (
+        f"follow-up and ASSIGN dispatch tmux writes overlapped ({max_seen} concurrent) "
+        "-- correction-971's cross-module race reproduced"
+    )
+    assert sorted(writes) == sorted(["queued follow-up", assign_text])
+    mock_bind.assert_called_once_with("codex", terminal_id, "1" * 32, assign_text)
 
 
 @pytest.mark.parametrize(

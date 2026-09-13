@@ -182,6 +182,54 @@ _CURRENT_COMPOSER_PROBE_MAX_CHARS = 64
 # silently leaving a worker uninitialized. Tasks drop themselves on completion.
 _deferred_init_tasks: set = set()
 
+# One RLock per terminal ever sent input to in this process, guarding
+# send_input()'s entire physical-write critical section (status/dispatch-
+# identity bookkeeping through the actual tmux paste + Enter keys) against
+# ANY concurrent caller for the SAME terminal_id.
+#
+# Before this, ONLY InboxService's own private per-terminal lock serialized
+# its OWN sequential deliveries against each other; nothing serialized those
+# against send_input's other three callers (agent_step's initial dispatch,
+# the raw POST /terminals/{id}/input endpoint, agui's handoff-approval send).
+# Two calls to send_input for the same terminal from different entry points
+# could therefore have their tmux writes genuinely overlap: bracketed-paste
+# text from one call landing inside the still-open paste of another before
+# either's Enter key was sent, merging two logically distinct turns into one
+# from the native provider's point of view (correction-971's proven defect:
+# an assigned worker's registered first-user dispatch, whose exact bytes are
+# bound by bind_completion_dispatch() below, ends up with an unrelated
+# follow-up message physically appended to it in the native transcript with
+# no turn boundary — corrupting the very identity bind_completion_dispatch
+# exists to protect).
+#
+# An RLock (not a plain Lock) because InboxService.deliver_pending acquires
+# this SAME lock (see terminal_input_lock() below) before calling
+# wait_for_capture_before_input() and holds it across its own eventual call
+# into send_input() -- extending the capture-barrier's protection to every
+# entry point, not just InboxService's own -- and send_input() re-acquires
+# it internally; same-thread reentrant acquisition must not deadlock.
+_terminal_input_locks_guard = threading.Lock()
+_terminal_input_locks: dict[str, threading.RLock] = {}
+
+
+def terminal_input_lock(terminal_id: str) -> threading.RLock:
+    """Return the stable per-terminal RLock guarding native-input delivery.
+
+    Every caller of :func:`send_input` for a given ``terminal_id`` is
+    automatically serialized against every other, because ``send_input``
+    itself acquires this lock (see its body). Callers that also need to
+    serialize a PRE-send step against send_input for the same terminal (see
+    ``InboxService.deliver_pending``) acquire it explicitly first and hold it
+    across their own call into ``send_input`` -- safe because this is an
+    ``RLock`` and both acquisitions happen on the same thread.
+    """
+    with _terminal_input_locks_guard:
+        lock = _terminal_input_locks.get(terminal_id)
+        if lock is None:
+            lock = threading.RLock()
+            _terminal_input_locks[terminal_id] = lock
+        return lock
+
 
 def inject_memory_context(
     first_message: str, terminal_id: str, frozen_memory: str | None = None
@@ -2415,175 +2463,176 @@ def send_input(
     ``agent_step.run_agent_step``, which passes exactly two arguments) are
     unaffected.
     """
-    try:
-        metadata = get_terminal_metadata(terminal_id)
-        if not metadata:
-            raise ValueError(f"Terminal '{terminal_id}' not found")
-
-        if (
-            metadata.get("provider") == ProviderType.KIRO_CLI.value
-            and resolve_kiro_engine(persisted=metadata.get("engine")) == KiroEngine.KAS
-        ):
-            raise KiroPhase0KASError(profile_has_v2_policy=False)
-
-        provider = provider_manager.get_provider(terminal_id)
-        orchestration_value = (
-            orchestration_type.value
-            if isinstance(orchestration_type, OrchestrationType)
-            else str(orchestration_type or "")
-        )
-
-        if provider:
-            current_status = status_monitor.get_status(terminal_id)
-
-            # Guard: refuse to type into a terminal whose provider process has
-            # exited. Without this check, queued messages would be pasted into
-            # a bare shell and executed as arbitrary commands.
-            if current_status == TerminalStatus.ERROR:
-                raise TerminalInputBlockedError(
-                    f"Terminal {terminal_id} provider is in ERROR state "
-                    "(provider process may have exited). Refusing to deliver input."
-                )
+    with terminal_input_lock(terminal_id):
+        try:
+            metadata = get_terminal_metadata(terminal_id)
+            if not metadata:
+                raise ValueError(f"Terminal '{terminal_id}' not found")
 
             if (
-                provider.blocks_orchestrated_input_while_waiting_user_answer is True
-                and orchestration_value
-                in {OrchestrationType.ASSIGN.value, OrchestrationType.HANDOFF.value}
-                and current_status == TerminalStatus.WAITING_USER_ANSWER
+                metadata.get("provider") == ProviderType.KIRO_CLI.value
+                and resolve_kiro_engine(persisted=metadata.get("engine")) == KiroEngine.KAS
             ):
-                raise TerminalInputBlockedError(
-                    f"Terminal {terminal_id} is waiting for a user answer. "
-                    "Use answer_user_prompt to submit a selection or approval before "
-                    f"sending {orchestration_value} input."
-                )
+                raise KiroPhase0KASError(profile_has_v2_policy=False)
 
-        # Inject memory context into the very first user message after init.
-        # Phase 1 wires injection inline for every provider. The Kiro
-        # AgentSpawn hook will replace this path once the plugin
-        # migration PR lands; until then, inline injection is the only
-        # delivery path.
-        # Keep the original message for the PostSendMessageEvent so
-        # plugins/webhooks see what the caller sent — not the
-        # internal <cao-memory> block that we paste into the TUI.
-        original_message = message
-        message = inject_memory_context(message, terminal_id, frozen_memory)
-
-        if orchestration_value == OrchestrationType.ASSIGN.value:
-            callback = get_assigned_worker_callback(terminal_id)
-            if callback is not None:
-                # Bind the exact post-injection bytes before the external paste
-                # can occur. Provider completion reports must correlate to this
-                # immutable completion and one of its bounded dispatch attempts.
-                from cli_agent_orchestrator.services.provider_completion_report import (
-                    bind_completion_dispatch,
-                )
-
-                bind_completion_dispatch(
-                    metadata["provider"],
-                    terminal_id,
-                    callback.completion_id,
-                    message,
-                )
-
-        # Provider wire encoding happens only after the exact logical task
-        # bytes above are bound.  Assigned Claude Code uses one-line SDK JSONL
-        # so multiline/Unicode task content reaches stream-json without tmux
-        # treating embedded newlines as separate submissions.
-        terminal_input = message
-        force_bracketed_paste = True
-        if provider:
-            encoded_input = provider.encode_terminal_input(message, orchestration_value)
-            # Defensive compatibility for third-party/test provider doubles
-            # that predate the optional structured-input hook.
-            if isinstance(encoded_input, str):
-                terminal_input = encoded_input
-            provider_bracketed_paste = provider.force_bracketed_paste
-            if isinstance(provider_bracketed_paste, bool):
-                force_bracketed_paste = provider_bracketed_paste
-
-        # Check how many Enter keys the provider needs after paste
-        enter_count = provider.paste_enter_count if provider else 1
-
-        # Arm the StatusMonitor stickiness gate so that the next provider-
-        # detected PROCESSING transition is honored (overriding the latched
-        # IDLE/COMPLETED). Without this, sticky ready-status would block
-        # the genuine PROCESSING signal that arrives once the agent starts
-        # working on the new message.
-        if provider and provider.assume_processing_on_dispatch is True:
-            status_monitor.notify_input_sent(terminal_id, assume_processing=True)
-        else:
-            status_monitor.notify_input_sent(terminal_id)
-
-        # Clear ONLY the rolling byte buffer BEFORE sending keys, so stale idle
-        # prompts from BEFORE the input can't trigger a false COMPLETED
-        # (kiro-cli 2.11's TUI keeps the "ask a question" placeholder in the raw
-        # buffer, which combined with input_received=True would return COMPLETED
-        # within seconds of send_input). Clearing here — not after send_keys —
-        # avoids a race: send_keys includes a submit-delay sleep during which
-        # the agent can begin emitting output; a post-send_keys clear would wipe
-        # that newly-emitted first chunk of the turn (lost from
-        # GET /terminals/{id}/output?mode=full and from early detection). This
-        # uses clear_rolling_buffer (byte-only), which preserves the sticky-latch
-        # arm set by notify_input_sent above; reset_buffer would wipe the arm and
-        # latch-block the IDLE→PROCESSING transition for the whole turn.
-        # Give stateful providers the same explicit generation boundary as the
-        # rolling byte buffer.  Grok uses this to distinguish a new,
-        # byte-identical completion from a retained completion screen.
-        status_monitor.clear_rolling_buffer(terminal_id, provider)
-
-        # Mark the provider before send_keys rather than after it.  send_keys
-        # includes the provider-specific submit delay, during which a fast CLI
-        # can already emit its first processing and completion frames.  Those
-        # frames must be parsed as belonging to this turn, not as a stale
-        # post-clear redraw.  StatusMonitor has already armed and cleared the
-        # same dispatch boundary above.
-        if provider:
-            provider.mark_input_received()
-
-        get_backend().send_keys(
-            metadata["tmux_session"],
-            metadata["tmux_window"],
-            terminal_input,
-            enter_count=enter_count,
-            force_bracketed_paste=force_bracketed_paste,
-            submit_delay=provider.paste_submit_delay if provider else 0.3,
-        )
-
-        update_last_active(terminal_id)
-        logger.info(f"Sent input to terminal: {terminal_id}")
-        if registry is not None and sender_id is not None and orchestration_type is not None:
-            # Telemetry (opt-in; no-ops without the [otel] extra or when the SDK
-            # is disabled): record a GenAI ``execute_tool`` span for the dispatch,
-            # count it, and propagate the active trace context into the plugin
-            # event so downstream consumers can continue the trace.
-            from cli_agent_orchestrator.telemetry import (
-                execute_tool_span,
-                inject_traceparent,
-                record_orchestration_dispatch,
+            provider = provider_manager.get_provider(terminal_id)
+            orchestration_value = (
+                orchestration_type.value
+                if isinstance(orchestration_type, OrchestrationType)
+                else str(orchestration_type or "")
             )
 
-            with execute_tool_span(
-                f"send_message:{orchestration_value}",
-                conversation_id=metadata["tmux_session"],
-            ):
-                record_orchestration_dispatch(orchestration_value)
-                dispatch_plugin_event(
-                    registry,
-                    "post_send_message",
-                    PostSendMessageEvent(
-                        session_id=metadata["tmux_session"],
-                        sender=sender_id,
-                        receiver=terminal_id,
-                        message=original_message,
-                        orchestration_type=orchestration_type,
-                        traceparent=inject_traceparent(),
-                    ),
-                )
-        return True
+            if provider:
+                current_status = status_monitor.get_status(terminal_id)
 
-    except Exception as e:
-        logger.error(f"Failed to send input to terminal {terminal_id}: {e}")
-        raise
+                # Guard: refuse to type into a terminal whose provider process has
+                # exited. Without this check, queued messages would be pasted into
+                # a bare shell and executed as arbitrary commands.
+                if current_status == TerminalStatus.ERROR:
+                    raise TerminalInputBlockedError(
+                        f"Terminal {terminal_id} provider is in ERROR state "
+                        "(provider process may have exited). Refusing to deliver input."
+                    )
+
+                if (
+                    provider.blocks_orchestrated_input_while_waiting_user_answer is True
+                    and orchestration_value
+                    in {OrchestrationType.ASSIGN.value, OrchestrationType.HANDOFF.value}
+                    and current_status == TerminalStatus.WAITING_USER_ANSWER
+                ):
+                    raise TerminalInputBlockedError(
+                        f"Terminal {terminal_id} is waiting for a user answer. "
+                        "Use answer_user_prompt to submit a selection or approval before "
+                        f"sending {orchestration_value} input."
+                    )
+
+            # Inject memory context into the very first user message after init.
+            # Phase 1 wires injection inline for every provider. The Kiro
+            # AgentSpawn hook will replace this path once the plugin
+            # migration PR lands; until then, inline injection is the only
+            # delivery path.
+            # Keep the original message for the PostSendMessageEvent so
+            # plugins/webhooks see what the caller sent — not the
+            # internal <cao-memory> block that we paste into the TUI.
+            original_message = message
+            message = inject_memory_context(message, terminal_id, frozen_memory)
+
+            if orchestration_value == OrchestrationType.ASSIGN.value:
+                callback = get_assigned_worker_callback(terminal_id)
+                if callback is not None:
+                    # Bind the exact post-injection bytes before the external paste
+                    # can occur. Provider completion reports must correlate to this
+                    # immutable completion and one of its bounded dispatch attempts.
+                    from cli_agent_orchestrator.services.provider_completion_report import (
+                        bind_completion_dispatch,
+                    )
+
+                    bind_completion_dispatch(
+                        metadata["provider"],
+                        terminal_id,
+                        callback.completion_id,
+                        message,
+                    )
+
+            # Provider wire encoding happens only after the exact logical task
+            # bytes above are bound.  Assigned Claude Code uses one-line SDK JSONL
+            # so multiline/Unicode task content reaches stream-json without tmux
+            # treating embedded newlines as separate submissions.
+            terminal_input = message
+            force_bracketed_paste = True
+            if provider:
+                encoded_input = provider.encode_terminal_input(message, orchestration_value)
+                # Defensive compatibility for third-party/test provider doubles
+                # that predate the optional structured-input hook.
+                if isinstance(encoded_input, str):
+                    terminal_input = encoded_input
+                provider_bracketed_paste = provider.force_bracketed_paste
+                if isinstance(provider_bracketed_paste, bool):
+                    force_bracketed_paste = provider_bracketed_paste
+
+            # Check how many Enter keys the provider needs after paste
+            enter_count = provider.paste_enter_count if provider else 1
+
+            # Arm the StatusMonitor stickiness gate so that the next provider-
+            # detected PROCESSING transition is honored (overriding the latched
+            # IDLE/COMPLETED). Without this, sticky ready-status would block
+            # the genuine PROCESSING signal that arrives once the agent starts
+            # working on the new message.
+            if provider and provider.assume_processing_on_dispatch is True:
+                status_monitor.notify_input_sent(terminal_id, assume_processing=True)
+            else:
+                status_monitor.notify_input_sent(terminal_id)
+
+            # Clear ONLY the rolling byte buffer BEFORE sending keys, so stale idle
+            # prompts from BEFORE the input can't trigger a false COMPLETED
+            # (kiro-cli 2.11's TUI keeps the "ask a question" placeholder in the raw
+            # buffer, which combined with input_received=True would return COMPLETED
+            # within seconds of send_input). Clearing here — not after send_keys —
+            # avoids a race: send_keys includes a submit-delay sleep during which
+            # the agent can begin emitting output; a post-send_keys clear would wipe
+            # that newly-emitted first chunk of the turn (lost from
+            # GET /terminals/{id}/output?mode=full and from early detection). This
+            # uses clear_rolling_buffer (byte-only), which preserves the sticky-latch
+            # arm set by notify_input_sent above; reset_buffer would wipe the arm and
+            # latch-block the IDLE→PROCESSING transition for the whole turn.
+            # Give stateful providers the same explicit generation boundary as the
+            # rolling byte buffer.  Grok uses this to distinguish a new,
+            # byte-identical completion from a retained completion screen.
+            status_monitor.clear_rolling_buffer(terminal_id, provider)
+
+            # Mark the provider before send_keys rather than after it.  send_keys
+            # includes the provider-specific submit delay, during which a fast CLI
+            # can already emit its first processing and completion frames.  Those
+            # frames must be parsed as belonging to this turn, not as a stale
+            # post-clear redraw.  StatusMonitor has already armed and cleared the
+            # same dispatch boundary above.
+            if provider:
+                provider.mark_input_received()
+
+            get_backend().send_keys(
+                metadata["tmux_session"],
+                metadata["tmux_window"],
+                terminal_input,
+                enter_count=enter_count,
+                force_bracketed_paste=force_bracketed_paste,
+                submit_delay=provider.paste_submit_delay if provider else 0.3,
+            )
+
+            update_last_active(terminal_id)
+            logger.info(f"Sent input to terminal: {terminal_id}")
+            if registry is not None and sender_id is not None and orchestration_type is not None:
+                # Telemetry (opt-in; no-ops without the [otel] extra or when the SDK
+                # is disabled): record a GenAI ``execute_tool`` span for the dispatch,
+                # count it, and propagate the active trace context into the plugin
+                # event so downstream consumers can continue the trace.
+                from cli_agent_orchestrator.telemetry import (
+                    execute_tool_span,
+                    inject_traceparent,
+                    record_orchestration_dispatch,
+                )
+
+                with execute_tool_span(
+                    f"send_message:{orchestration_value}",
+                    conversation_id=metadata["tmux_session"],
+                ):
+                    record_orchestration_dispatch(orchestration_value)
+                    dispatch_plugin_event(
+                        registry,
+                        "post_send_message",
+                        PostSendMessageEvent(
+                            session_id=metadata["tmux_session"],
+                            sender=sender_id,
+                            receiver=terminal_id,
+                            message=original_message,
+                            orchestration_type=orchestration_type,
+                            traceparent=inject_traceparent(),
+                        ),
+                    )
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to send input to terminal {terminal_id}: {e}")
+            raise
 
 
 def send_special_key(terminal_id: str, key: str) -> bool:
@@ -2601,26 +2650,36 @@ def send_special_key(terminal_id: str, key: str) -> bool:
 
     Raises:
         ValueError: If terminal not found
+
+    Guarded by the same per-terminal terminal_input_lock as send_input(): a
+    caller commonly sends a special key (e.g. C-u to clear a partial line)
+    immediately before a send_input() paste for the same terminal (see
+    agui/handoff_approval.py's TerminalServiceAnswerDelivery), and both are
+    genuine tmux writes to the same pane. Without sharing the lock, that
+    special key could still land in the middle of an unrelated concurrent
+    caller's paste even after send_input() itself was made safe against
+    other send_input() calls (correction-971).
     """
-    try:
-        metadata = get_terminal_metadata(terminal_id)
-        if not metadata:
-            raise ValueError(f"Terminal '{terminal_id}' not found")
+    with terminal_input_lock(terminal_id):
+        try:
+            metadata = get_terminal_metadata(terminal_id)
+            if not metadata:
+                raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        # Arm StatusMonitor stickiness: special keys (Enter on a permission
-        # prompt, C-c interrupting work, C-d sending EOF) all initiate a new
-        # processing cycle that must be allowed to push past any latched
-        # ready status.
-        status_monitor.notify_input_sent(terminal_id)
-        get_backend().send_special_key(metadata["tmux_session"], metadata["tmux_window"], key)
+            # Arm StatusMonitor stickiness: special keys (Enter on a permission
+            # prompt, C-c interrupting work, C-d sending EOF) all initiate a new
+            # processing cycle that must be allowed to push past any latched
+            # ready status.
+            status_monitor.notify_input_sent(terminal_id)
+            get_backend().send_special_key(metadata["tmux_session"], metadata["tmux_window"], key)
 
-        update_last_active(terminal_id)
-        logger.info(f"Sent special key '{key}' to terminal: {terminal_id}")
-        return True
+            update_last_active(terminal_id)
+            logger.info(f"Sent special key '{key}' to terminal: {terminal_id}")
+            return True
 
-    except Exception as e:
-        logger.error(f"Failed to send special key to terminal {terminal_id}: {e}")
-        raise
+        except Exception as e:
+            logger.error(f"Failed to send special key to terminal {terminal_id}: {e}")
+            raise
 
 
 def exit_terminal_cli(terminal_id: str) -> None:
