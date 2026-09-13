@@ -6,8 +6,6 @@ copied into this repository.
 """
 
 import inspect
-import threading
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import pytest
@@ -35,7 +33,6 @@ from cli_agent_orchestrator.services.native_dispatch_recovery import (
     ConcatenatedMessageClaim,
     CorruptionRecord,
     analyze_native_dispatch_corruption,
-    apply_corruption_record,
     build_corruption_record,
     check_recovery_guards,
     utf8_sha256,
@@ -362,66 +359,6 @@ def _record(**overrides) -> CorruptionRecord:
     return record
 
 
-class TestApplyCorruptionRecord:
-    """apply_corruption_record never writes to any real database in these
-    tests (or anywhere in this codebase) -- ``persist`` is always a fake, and
-    the module docstring explains why the real storage target is left to the
-    owner to decide.
-    """
-
-    def test_first_apply_persists_once(self):
-        persisted = []
-        record = _record()
-        result = apply_corruption_record(record, existing_record=None, persist=persisted.append)
-        assert result == record
-        assert persisted == [record]
-
-    def test_byte_identical_replay_is_idempotent_and_does_not_persist_again(self):
-        persisted = []
-        record = _record()
-        result = apply_corruption_record(record, existing_record=record, persist=persisted.append)
-        assert result == record
-        assert persisted == []  # NOT called again -- already durable
-
-    def test_conflicting_record_for_the_same_key_is_refused(self):
-        original = _record()
-        conflicting = _record(concatenated_message_content_sha256="different" * 8)
-        assert original.record_key() == conflicting.record_key()
-        with pytest.raises(ValueError, match="collision"):
-            apply_corruption_record(conflicting, existing_record=original, persist=lambda r: None)
-
-    def test_no_duplicate_or_fabricated_completion_across_concurrent_apply(self):
-        """Concurrent identical applies against ONE shared fake store must
-        result in exactly one persisted record, never two, and never any
-        field resembling a fabricated final_result/completion."""
-        record = _record()
-        store_lock = threading.Lock()
-        store: dict[str, CorruptionRecord] = {}
-        persist_calls = []
-
-        def transactional_apply():
-            # Models "read existing under the same lock/transaction the
-            # write uses" -- the discipline apply_corruption_record's own
-            # docstring requires of callers.
-            with store_lock:
-                existing = store.get(record.record_key())
-                result = apply_corruption_record(
-                    record, existing_record=existing, persist=persist_calls.append
-                )
-                store[record.record_key()] = result
-            return result
-
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            futures = [pool.submit(transactional_apply) for _ in range(8)]
-            results = [f.result(timeout=5) for f in futures]
-
-        assert all(r == record for r in results)
-        assert (
-            len(persist_calls) == 1
-        ), f"expected exactly one durable persist call, got {len(persist_calls)}"
-        assert len(store) == 1
-
-
 class TestModuleNeverCreatesOrReplaysMessages:
     """Structural guarantee (correction-984): this module must never create,
     replay, or re-deliver any inbox message, and must carry no field
@@ -431,20 +368,34 @@ class TestModuleNeverCreatesOrReplaysMessages:
     guard, not merely true today.
     """
 
-    def test_module_never_imports_inbox_message_creation(self):
+    def test_module_never_imports_inbox_message_creation_or_the_database_client(self):
+        """No inbox-message machinery, and (correction-994) no clients.database
+        access at all -- the real DB-backed CAS mutation lives in
+        clients.database.record_native_dispatch_corruption instead, so this
+        module stays pure/read-only/no-I/O, independently testable without a
+        database, and unable to ever mutate anything by construction.
+        """
         import ast
 
         tree = ast.parse(inspect.getsource(recovery_mod))
         imported_names = set()
+        imported_modules = set()
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
                 imported_names.update(alias.name for alias in node.names)
+                if node.module:
+                    imported_modules.add(node.module)
             elif isinstance(node, ast.Import):
                 imported_names.update(alias.name for alias in node.names)
-        forbidden = {"create_inbox_message", "InboxMessageOrigin", "resolve_inbox_claim"}
-        assert not (imported_names & forbidden), (
+                imported_modules.update(alias.name for alias in node.names)
+        forbidden_names = {"create_inbox_message", "InboxMessageOrigin", "resolve_inbox_claim"}
+        assert not (imported_names & forbidden_names), (
             "native_dispatch_recovery.py must never import inbox-message creation/"
-            f"delivery machinery -- found: {imported_names & forbidden}"
+            f"delivery machinery -- found: {imported_names & forbidden_names}"
+        )
+        assert not any("clients.database" in module for module in imported_modules), (
+            "native_dispatch_recovery.py must never import clients.database -- found "
+            f"in: {imported_modules}"
         )
 
     def test_corruption_record_has_no_completion_or_report_shaped_fields(self):

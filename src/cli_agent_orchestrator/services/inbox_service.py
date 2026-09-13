@@ -30,7 +30,10 @@ from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.status_monitor import status_monitor
-from cli_agent_orchestrator.services.terminal_service import NativeAcceptanceTimeoutError
+from cli_agent_orchestrator.services.terminal_service import (
+    NativeAcceptanceTimeoutError,
+    TerminalCaptureNotDurableError,
+)
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
@@ -223,6 +226,21 @@ class InboxService:
                 logger.warning(
                     f"Prior dispatch to terminal {terminal_id} not yet confirmed accepted; "
                     f"leaving {len(batch)} message(s) pending for retry: {e}"
+                )
+            except TerminalCaptureNotDurableError as e:
+                # This terminal completed its turn WHILE send_input was
+                # blocked inside the acceptance wait above (correction-994) --
+                # this read's own earlier IDLE/COMPLETED check could not have
+                # seen that. Transient for the same reason as
+                # NativeAcceptanceTimeoutError: the next status event
+                # re-triggers delivery, and by then the capture will either
+                # be durable or the terminal has moved on again.
+                for message in batch:
+                    resolve_inbox_claim(message.id, claim_token, MessageStatus.PENDING)
+                logger.warning(
+                    f"Terminal {terminal_id} completed during the acceptance wait and its "
+                    f"report is not yet durably captured; leaving {len(batch)} message(s) "
+                    f"pending for retry: {e}"
                 )
             except Exception as e:
                 for message in batch:

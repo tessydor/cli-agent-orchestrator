@@ -25,41 +25,37 @@ message. It also never claims to restore a missing assignment result and
 never releases any OTHER pending message's delivery barrier; only the
 proper, already-existing lifecycle transitions may do that.
 
-What this module DOES do: analyze an already-corrupted assignment from
-archived evidence (a read-only transcript copy, the assignment's own
-registered dispatch digests, and a caller-supplied claim identifying the
-durable message believed to have been concatenated in) and, only if every
-fail-closed guard passes -- including that the claimed message is in the
-correct caller->worker direction and its content hash matches the
-independently recomputed unbound suffix exactly -- build a truthful,
-nonduplicating CorruptionRecord: the evidence needed to archive/reconcile
-the incident (exact registered-dispatch hash/prefix, exact transcript whole
-digest, exact concatenated-message identity/content-hash/sender/receiver/
-delivery-state/session, exact assignment/callback/lifecycle snapshot). It
-never mutates lifecycle/delivery_state/final_result, never forges a
-completion, and never silently marks anything delivered.
+What this module DOES do: pure, read-only, no-I/O analysis and guard logic --
+analyze_native_dispatch_corruption() matches an already-corrupted assignment's
+archived transcript against its own registered dispatch digests;
+check_recovery_guards() fails closed unless a caller-supplied claim
+identifying the durable message believed to have been concatenated in is in
+the correct caller->worker direction and its content hash matches the
+independently recomputed unbound suffix exactly (plus identity/liveness/
+lifecycle/tamper checks); build_corruption_record() assembles a truthful,
+nonduplicating CorruptionRecord from a callback+analysis+claim that already
+passed those guards. None of this mutates lifecycle/delivery_state/
+final_result, forges a completion, or marks anything delivered.
 
-Deliberately unresolved by this module (reported here as an explicit
-blocker rather than guessed at): WHERE a CorruptionRecord should be
-durably persisted in a real deployment. Candidates considered and rejected
-as unilateral guesses this correction should not make: (a) reusing
-assigned_worker_callbacks.reconciliation_evidence (PR #11) conflates this
-with "caller accepted the completion result," which a dispatch-corruption
-record is not, and would additionally make the assignment eligible for
-retirement as a side effect nobody asked for here; (b) a brand-new
-dedicated table/columns is a real schema change (migration + trigger +
-tests) out of proportion for "the smallest coherent fix." apply_corruption_
-record() therefore takes an explicit, caller-supplied persistence callback
-and an explicit existing-record lookup, so the identity/guard/idempotency
-logic is fully implemented and tested here while the actual storage
-location remains the owner's decision, not this module's guess.
+Correction-994 (real DB-backed CAS mutation): the actual durable write --
+freshly re-reading the assignment/callback row, rerunning every guard above
+inside one transaction, and inserting the resulting CorruptionRecord under
+enforced uniqueness -- is clients.database.record_native_dispatch_corruption(),
+NOT this module (this module has no database access at all, deliberately;
+see test_module_never_imports_inbox_message_creation and its sibling
+structural tests). It stores into the dedicated
+native_dispatch_corruption_records table (NativeDispatchCorruptionModel),
+never assigned_worker_callbacks.reconciliation_evidence (PR #11) -- reusing
+that field would conflate this with "caller accepted the completion result,"
+which a dispatch-corruption record is not, and would additionally make the
+assignment eligible for retirement as a side effect nobody asked for here.
 """
 
 from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 from cli_agent_orchestrator.models.assigned_worker import (
     AssignedWorkerCallback,
@@ -334,38 +330,3 @@ def build_corruption_record(
         concatenated_message_session_id=claim.session_id,
         recorded_at=recorded_at,
     )
-
-
-def apply_corruption_record(
-    record: CorruptionRecord,
-    *,
-    existing_record: Optional[CorruptionRecord],
-    persist: Callable[[CorruptionRecord], None],
-) -> CorruptionRecord:
-    """Idempotently persist ``record`` via the caller-supplied ``persist``
-    callback -- see the module docstring for why the actual storage location
-    is deliberately left to the caller rather than guessed at here.
-
-    ``existing_record`` must be whatever ``persist``'s backing store
-    currently holds under ``record.record_key()``, read by the caller inside
-    the SAME transaction/CAS boundary it will use to call ``persist`` --
-    this function does not read or write storage itself, only decides
-    whether writing is safe:
-
-    - No existing record: ``persist(record)`` is called once; returns
-      ``record``.
-    - An existing, byte-identical record: a safe idempotent no-op --
-      ``persist`` is NOT called again; returns ``existing_record``.
-    - An existing, DIFFERENT record for the same key: refused outright
-      (``ValueError``) rather than silently overwritten -- mirrors
-      create_inbox_message's own idempotency-key collision handling.
-    """
-    if existing_record is not None:
-        if existing_record == record:
-            return existing_record
-        raise ValueError(
-            f"corruption record collision for {record.record_key()!r}: an existing, "
-            "DIFFERENT record already exists for this assignment/message identity"
-        )
-    persist(record)
-    return record

@@ -179,6 +179,27 @@ class NativeAcceptanceTimeoutError(Exception):
     """
 
 
+class TerminalCaptureNotDurableError(Exception):
+    """A terminal is (now) COMPLETED but its final report is not yet
+    durably captured; refusing to paste rather than risk transcript loss.
+
+    Correction-994: a caller (typically InboxService) can legitimately read
+    IDLE and skip its own COMPLETED-capture check, only for the terminal to
+    finish its turn WHILE this call is blocked inside
+    wait_for_native_acceptance() -- the same detection that releases the
+    acceptance fence also arms AssignedWorkerCompletionService's capture
+    barrier for the newly-COMPLETED status. Without a fresh recheck here,
+    send_input would then observe COMPLETED and paste straight through,
+    before the just-finished turn's report is safely durable -- exactly the
+    kind of premature paste this whole correction chain exists to prevent,
+    just arriving via a different door. Checked once, here, at the single
+    boundary shared by every send_input() caller, rather than duplicated
+    (and inevitably drifting out of sync) in each of the four entry points.
+    Treat identically to NativeAcceptanceTimeoutError: transient, safe to
+    retry later, never a permanent failure.
+    """
+
+
 # Bounded wait (seconds) for a PRIOR dispatch's native acceptance before a
 # SUBSEQUENT send_input() call for the same terminal refuses to paste
 # (correction-984). Generous relative to the slowest known real-world
@@ -2537,6 +2558,31 @@ def send_input(
             if provider:
                 current_status = status_monitor.get_status(terminal_id)
 
+                # Re-check completion-capture eligibility HERE, after the
+                # acceptance-fence wait above, not just wherever a caller
+                # happened to check status before calling send_input()
+                # (correction-994): a fresh COMPLETED can be observed for
+                # the first time in the gap between an earlier IDLE read and
+                # this point, since the same detection event that just
+                # released the acceptance fence also arms the capture
+                # barrier below. This is the ONE shared boundary; it does
+                # not duplicate or replace InboxService's OWN earlier check
+                # (still load-bearing to avoid claiming a message row before
+                # even getting here) -- it exists because that check cannot
+                # see a completion that lands strictly after it ran.
+                if current_status == TerminalStatus.COMPLETED:
+                    from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+                        assigned_worker_completion_service,
+                    )
+
+                    if not assigned_worker_completion_service.wait_for_capture_before_input(
+                        terminal_id
+                    ):
+                        raise TerminalCaptureNotDurableError(
+                            f"Terminal {terminal_id} is COMPLETED but its final report "
+                            "is not yet durably captured; refusing to paste."
+                        )
+
                 # Guard: refuse to type into a terminal whose provider process has
                 # exited. Without this check, queued messages would be pasted into
                 # a bare shell and executed as arbitrary commands.
@@ -2652,42 +2698,55 @@ def send_input(
 
             update_last_active(terminal_id)
             logger.info(f"Sent input to terminal: {terminal_id}")
-            if registry is not None and sender_id is not None and orchestration_type is not None:
-                # Telemetry (opt-in; no-ops without the [otel] extra or when the SDK
-                # is disabled): record a GenAI ``execute_tool`` span for the dispatch,
-                # count it, and propagate the active trace context into the plugin
-                # event so downstream consumers can continue the trace.
-                from cli_agent_orchestrator.telemetry import (
-                    execute_tool_span,
-                    inject_traceparent,
-                    record_orchestration_dispatch,
-                )
-
-                with execute_tool_span(
-                    f"send_message:{orchestration_value}",
-                    conversation_id=metadata["tmux_session"],
-                ):
-                    record_orchestration_dispatch(orchestration_value)
-                    dispatch_plugin_event(
-                        registry,
-                        "post_send_message",
-                        PostSendMessageEvent(
-                            session_id=metadata["tmux_session"],
-                            sender=sender_id,
-                            receiver=terminal_id,
-                            message=original_message,
-                            orchestration_type=orchestration_type,
-                            traceparent=inject_traceparent(),
-                        ),
-                    )
-            return True
 
         except Exception as e:
             logger.error(f"Failed to send input to terminal {terminal_id}: {e}")
             raise
 
+    # Plugin dispatch happens AFTER the per-terminal lock above is released
+    # (correction-994). dispatch_plugin_event can run a plugin's handler
+    # SYNCHRONOUSLY (asyncio.run) whenever no event loop is active on this
+    # thread -- plugins are arbitrary, out-of-tree code and must never
+    # execute while holding the physical-write/acceptance-fence lock every
+    # other send_input()/send_special_key() caller for this SAME terminal_id
+    # is waiting on: a plugin that happens to (directly or transitively)
+    # touch this terminal_id would otherwise deadlock against itself, and
+    # even a plugin that never does still needlessly extends how long
+    # unrelated callers for this terminal are blocked. The one legitimate
+    # dispatch still fires exactly once, still strictly after the physical
+    # send, using values captured while the lock was held.
+    if registry is not None and sender_id is not None and orchestration_type is not None:
+        # Telemetry (opt-in; no-ops without the [otel] extra or when the SDK
+        # is disabled): record a GenAI ``execute_tool`` span for the dispatch,
+        # count it, and propagate the active trace context into the plugin
+        # event so downstream consumers can continue the trace.
+        from cli_agent_orchestrator.telemetry import (
+            execute_tool_span,
+            inject_traceparent,
+            record_orchestration_dispatch,
+        )
 
-def send_special_key(terminal_id: str, key: str) -> bool:
+        with execute_tool_span(
+            f"send_message:{orchestration_value}",
+            conversation_id=metadata["tmux_session"],
+        ):
+            record_orchestration_dispatch(orchestration_value)
+            dispatch_plugin_event(
+                registry,
+                "post_send_message",
+                PostSendMessageEvent(
+                    session_id=metadata["tmux_session"],
+                    sender=sender_id,
+                    receiver=terminal_id,
+                    message=original_message,
+                    orchestration_type=orchestration_type,
+                    traceparent=inject_traceparent(),
+                ),
+            )
+    return True
+
+
+def send_special_key(terminal_id: str, key: str, *, submits_turn: bool = True) -> bool:
     """Send a tmux special key sequence (e.g., C-d, C-c) to terminal.
 
     Unlike send_input(), this sends the key as a tmux key name (not literal text)
@@ -2696,12 +2755,17 @@ def send_special_key(terminal_id: str, key: str) -> bool:
     Args:
         terminal_id: Target terminal identifier
         key: Tmux key name (e.g., "C-d", "C-c", "Escape")
+        submits_turn: Whether this key is expected to start a new native
+            processing turn (correction-994). Default True matches every
+            call site's actual behavior except the two documented below.
 
     Returns:
         True if the key was sent successfully
 
     Raises:
         ValueError: If terminal not found
+        NativeAcceptanceTimeoutError: if ``submits_turn`` and a PRIOR
+            dispatch's acceptance is not confirmed within the bound.
 
     Guarded by the same per-terminal terminal_input_lock as send_input(): a
     caller commonly sends a special key (e.g. C-u to clear a partial line)
@@ -2711,18 +2775,44 @@ def send_special_key(terminal_id: str, key: str) -> bool:
     special key could still land in the middle of an unrelated concurrent
     caller's paste even after send_input() itself was made safe against
     other send_input() calls (correction-971).
+
+    ``submits_turn=False`` (correction-994): C-u (clearing a partially-typed
+    composer line before a retry paste) and menu-navigation Up/Down (moving a
+    selection cursor, claude_question.py) never cause the terminal's native
+    process to start a new processing cycle -- nothing about them can ever
+    produce the real IDLE->non-IDLE transition the acceptance fence waits
+    for. Treating them as submitted turns anyway means the very NEXT
+    genuine send_input()/submitting send_special_key() for the same terminal
+    -- e.g. TerminalServiceAnswerDelivery.send_input's C-u immediately
+    followed by the real answer paste -- would wait the full
+    NATIVE_ACCEPTANCE_TIMEOUT_S for evidence that can never arrive, then fail
+    closed for no reason. ``submits_turn=False`` skips both the wait (a
+    non-submitting key is safe to send regardless of a prior unconfirmed
+    dispatch: at worst it clears an already-cleared or still-open composer,
+    never corrupts one) and the arm (nothing here should make a later caller
+    wait on IT either) -- the physical-write mutex above still fully applies.
     """
     with terminal_input_lock(terminal_id):
         try:
+            if submits_turn and not status_monitor.wait_for_native_acceptance(
+                terminal_id, timeout=NATIVE_ACCEPTANCE_TIMEOUT_S
+            ):
+                raise NativeAcceptanceTimeoutError(
+                    f"Terminal {terminal_id}: a prior dispatch was not confirmed "
+                    f"accepted within {NATIVE_ACCEPTANCE_TIMEOUT_S}s; refusing to "
+                    "send this special key."
+                )
+
             metadata = get_terminal_metadata(terminal_id)
             if not metadata:
                 raise ValueError(f"Terminal '{terminal_id}' not found")
 
-            # Arm StatusMonitor stickiness: special keys (Enter on a permission
-            # prompt, C-c interrupting work, C-d sending EOF) all initiate a new
-            # processing cycle that must be allowed to push past any latched
-            # ready status.
-            status_monitor.notify_input_sent(terminal_id)
+            if submits_turn:
+                # Arm StatusMonitor stickiness: special keys (Enter on a permission
+                # prompt, C-c interrupting work, C-d sending EOF) all initiate a new
+                # processing cycle that must be allowed to push past any latched
+                # ready status. Also arms the native-acceptance fence (see above).
+                status_monitor.notify_input_sent(terminal_id)
             get_backend().send_special_key(metadata["tmux_session"], metadata["tmux_window"], key)
 
             update_last_active(terminal_id)

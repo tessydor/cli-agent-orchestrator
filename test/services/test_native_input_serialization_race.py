@@ -42,6 +42,17 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 
+# send_input() ultimately reaches inject_memory_context/MemoryService, which
+# touches the database. Most tests below mock that path away, but a few
+# (e.g. TestCompletionCaptureRecheckedAfterAcceptanceWait) exercise real
+# terminal_service/status_monitor/assigned_worker_completion_service code
+# without mocking it. Without this isolated per-test DB, whatever
+# db.SessionLocal happens to be pointed at when this file runs (which varies
+# by what other test files/fixtures ran earlier in the same session) leaks
+# in -- matching the same isolation test_terminal_service_full.py already
+# requires for the identical reason.
+pytestmark = pytest.mark.usefixtures("isolated_memory_db")
+
 
 class TestNativeInputNeverOverlapsForSameTerminal:
     """send_input must never let two callers' tmux writes overlap for one terminal."""
@@ -422,6 +433,130 @@ class TestNativeAcceptanceFence:
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_unknown_before_acceptance_never_releases_the_fence(
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_pm,
+        mock_update,
+    ):
+        """Correction-994: UNKNOWN is "no signal", never acceptance evidence.
+
+        A brand-new terminal_id has no prior _last_status, so UNKNOWN passes
+        the early "UNKNOWN never overwrites a known status" guard (last is
+        None) and, before this fix, reached the release code and
+        incorrectly released the fence on the very first post-dispatch
+        detection -- exactly the scenario a fresh ASSIGN dispatch to a new
+        terminal can hit before its pane stabilizes.
+        """
+        terminal_id = "fence-terminal-unknown-before-acceptance"
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        provider = mock_pm.get_provider.return_value
+        provider.paste_enter_count = 1
+        provider.paste_submit_delay = 0.0
+
+        writes: list[str] = []
+        mock_tmux.send_keys.side_effect = lambda session, window, message, **kw: writes.append(
+            message
+        )
+
+        first_text = "initial assignment dispatch"
+        second_text = "message874 follow-up"
+
+        try:
+            terminal_service.send_input(terminal_id, first_text)
+            assert writes == [first_text]
+
+            # UNKNOWN must never count as acceptance -- the fence stays armed.
+            status_monitor._apply_detection(terminal_id, TerminalStatus.UNKNOWN)
+
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(terminal_service.send_input, terminal_id, second_text)
+                time.sleep(0.2)
+                assert writes == [first_text], (
+                    "follow-up pasted after only an UNKNOWN detection -- UNKNOWN must "
+                    "never release the native-acceptance fence"
+                )
+
+                # A genuine post-arm transition still releases it correctly.
+                status_monitor._apply_detection(terminal_id, TerminalStatus.PROCESSING)
+                future.result(timeout=5)
+
+            assert writes == [first_text, second_text]
+        finally:
+            status_monitor.clear_terminal(terminal_id)
+
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_stale_pre_arm_evidence_never_releases_but_fresh_evidence_does(
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_pm,
+        mock_update,
+    ):
+        """Correction-994: evidence timestamped BEFORE this fence's own arm
+        (a chunk that was already in flight, whose _process_chunk handling
+        was merely delayed past arm by independent thread/asyncio
+        scheduling -- not reflecting this dispatch at all) must not release
+        it. Genuinely fresh evidence, timestamped at/after arm, still does.
+        """
+        terminal_id = "fence-terminal-stale-pre-arm-evidence"
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        provider = mock_pm.get_provider.return_value
+        provider.paste_enter_count = 1
+        provider.paste_submit_delay = 0.0
+
+        writes: list[str] = []
+        mock_tmux.send_keys.side_effect = lambda session, window, message, **kw: writes.append(
+            message
+        )
+
+        first_text = "initial assignment dispatch"
+        second_text = "message874 follow-up"
+
+        try:
+            terminal_service.send_input(terminal_id, first_text)
+            assert writes == [first_text]
+
+            # Simulate a chunk that was ALREADY captured before this dispatch
+            # (its timestamp predates arm), whose _apply_detection call is
+            # only reaching us now -- PROCESSING chosen deliberately: it
+            # does not participate in the sticky-ready suppress guards, so
+            # this test isolates the acceptance-fence timestamp check from
+            # that unrelated, pre-existing mechanism.
+            status_monitor._buffer_changed_at[terminal_id] = time.monotonic() - 100.0
+            status_monitor._apply_detection(terminal_id, TerminalStatus.PROCESSING)
+
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(terminal_service.send_input, terminal_id, second_text)
+                time.sleep(0.2)
+                assert writes == [first_text], (
+                    "follow-up pasted after only stale, pre-arm-timestamped evidence -- "
+                    "the native-acceptance fence did not hold"
+                )
+
+                # Genuinely fresh (post-arm) evidence still releases it.
+                status_monitor._buffer_changed_at[terminal_id] = time.monotonic()
+                status_monitor._apply_detection(terminal_id, TerminalStatus.COMPLETED)
+                future.result(timeout=5)
+
+            assert writes == [first_text, second_text]
+        finally:
+            status_monitor.clear_terminal(terminal_id)
+
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_follow_up_fails_closed_when_acceptance_never_arrives(
         self,
         mock_get_metadata,
@@ -526,3 +661,267 @@ class TestTerminalInputLockPrimitive:
                 f.result(timeout=5)
 
         assert max_seen == 1
+
+
+class TestNonSubmittingSpecialKeysDoNotFenceTheNextTurn:
+    """Correction-994 item A: a special key that never causes a native
+    processing transition (C-u clearing the composer; menu Up/Down
+    navigation) must not arm or wait on the acceptance fence a REAL
+    submitted turn checks -- otherwise the very next genuine send blocks for
+    the full NATIVE_ACCEPTANCE_TIMEOUT_S and then fails closed for no
+    reason. Uses the REAL StatusMonitor singleton so the fence actually
+    engages; only the tmux backend/metadata/provider are mocked.
+    """
+
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_handoff_approval_c_u_then_send_input_completes_without_delay(
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_pm,
+        mock_update,
+    ):
+        from cli_agent_orchestrator.services.agui.handoff_approval import (
+            TerminalServiceAnswerDelivery,
+        )
+
+        terminal_id = "handoff-c-u-terminal"
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        provider = mock_pm.get_provider.return_value
+        provider.paste_enter_count = 1
+        provider.paste_submit_delay = 0.0
+
+        calls: list[tuple] = []
+        mock_tmux.send_special_key.side_effect = lambda *a, **k: calls.append(("key", a, k))
+        mock_tmux.send_keys.side_effect = lambda *a, **k: calls.append(("input", a, k))
+
+        try:
+            started = time.monotonic()
+            TerminalServiceAnswerDelivery().send_input(terminal_id, "the approval answer")
+            elapsed = time.monotonic() - started
+        finally:
+            status_monitor.clear_terminal(terminal_id)
+
+        assert elapsed < 1.0, (
+            f"C-u incorrectly armed/waited on the acceptance fence -- took {elapsed:.2f}s "
+            "(expected well under NATIVE_ACCEPTANCE_TIMEOUT_S)"
+        )
+        assert [c[0] for c in calls] == ["key", "input"], "exactly one clear, one text submit"
+
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_menu_navigation_does_not_fence_the_answering_enter(
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_pm,
+        mock_update,
+    ):
+        terminal_id = "menu-nav-terminal"
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_tmux.send_special_key.side_effect = lambda *a, **k: None
+
+        try:
+            started = time.monotonic()
+            terminal_service.send_special_key(terminal_id, "Down", submits_turn=False)
+            terminal_service.send_special_key(terminal_id, "Down", submits_turn=False)
+            terminal_service.send_special_key(terminal_id, "Enter")  # the real answer, submits
+            elapsed = time.monotonic() - started
+        finally:
+            status_monitor.clear_terminal(terminal_id)
+
+        assert elapsed < 1.0, (
+            f"non-submitting navigation incorrectly fenced the answering Enter -- "
+            f"took {elapsed:.2f}s"
+        )
+        assert mock_tmux.send_special_key.call_count == 3
+
+
+class TestPluginDispatchRunsOutsideTheTerminalInputLock:
+    """Correction-994 item 3: dispatch_plugin_event can run a plugin's
+    handler SYNCHRONOUSLY (asyncio.run) when no event loop is active on the
+    calling thread -- a genuine, untrusted, out-of-tree code execution that
+    must never happen while the per-terminal physical-write/acceptance-fence
+    lock is held, since any plugin that (directly or transitively) touches
+    the same terminal_id from a different thread would otherwise deadlock
+    against the still-blocked original call.
+    """
+
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_plugin_dispatch_finds_the_lock_already_released(
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_pm,
+        mock_update,
+    ):
+        terminal_id = "plugin-dispatch-terminal"
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        provider = mock_pm.get_provider.return_value
+        provider.paste_enter_count = 1
+        provider.paste_submit_delay = 0.0
+
+        events: list[tuple] = []
+        mock_tmux.send_keys.side_effect = lambda *a, **k: events.append(("sent",))
+
+        class _FakeRegistry:
+            async def dispatch(self, event_type, event):
+                # dispatch_plugin_event's no-loop branch runs THIS coroutine
+                # synchronously (asyncio.run) on send_input()'s OWN thread --
+                # exactly the case that used to execute while send_input()'s
+                # `with terminal_input_lock(...)` was still open. Checking
+                # the lock from THIS same thread would be meaningless
+                # (RLock's same-thread reentrance would report "free" either
+                # way); probe from a genuinely SEPARATE thread instead, whose
+                # acquire attempt only succeeds if NO thread -- including
+                # this one -- currently holds it.
+                lock = terminal_service.terminal_input_lock(terminal_id)
+                with ThreadPoolExecutor(max_workers=1) as probe_pool:
+                    acquired = probe_pool.submit(lock.acquire, True, 1.0).result(timeout=5)
+                events.append(("dispatch", event_type, acquired))
+                if acquired:
+                    lock.release()
+
+        try:
+            result = terminal_service.send_input(
+                terminal_id,
+                "hello",
+                registry=_FakeRegistry(),
+                sender_id="caller-1",
+                orchestration_type=OrchestrationType.SEND_MESSAGE,
+            )
+        finally:
+            status_monitor.clear_terminal(terminal_id)
+
+        assert result is True
+        assert events == [
+            ("sent",),
+            ("dispatch", "post_send_message", True),
+        ], f"expected exactly one dispatch, after the send, with the lock free; got {events!r}"
+
+
+class TestCompletionCaptureRecheckedAfterAcceptanceWait:
+    """Correction-994 item B: send_input() must recheck BOTH native
+    acceptance AND completion-capture eligibility at its one shared
+    boundary. A caller (e.g. InboxService) can legitimately read IDLE and
+    skip its own COMPLETED-capture check, only for the terminal to finish
+    its turn WHILE this call is blocked inside the acceptance wait -- the
+    SAME detection event that releases the acceptance fence also arms
+    AssignedWorkerCompletionService's capture barrier. Uses the REAL
+    StatusMonitor AND the REAL AssignedWorkerCompletionService singletons so
+    both barriers actually engage; only the tmux backend/metadata/provider
+    are mocked.
+    """
+
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_fast_completion_during_acceptance_wait_still_blocks_on_capture(
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_pm,
+        mock_status_pm,
+        mock_update,
+    ):
+        from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+            assigned_worker_completion_service,
+        )
+
+        # status_monitor.py imports provider_manager independently from
+        # terminal_service.py (a SEPARATE module-level name binding, even
+        # though both normally point at the same real singleton) -- mocking
+        # only terminal_service's copy leaves status_monitor.get_status()'s
+        # own get_backend().supports_event_inbox() branch calling into the
+        # REAL provider manager. None here forces that branch to fall
+        # through to the real _last_status-based cached logic this test
+        # actually needs, deterministically, regardless of what the real
+        # provider manager happens to have cached from other tests.
+        mock_status_pm.get_provider.return_value = None
+
+        terminal_id = "completion-recheck-terminal"
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        provider = mock_pm.get_provider.return_value
+        provider.paste_enter_count = 1
+        provider.paste_submit_delay = 0.0
+
+        writes: list[str] = []
+        mock_tmux.send_keys.side_effect = lambda session, window, message, **kw: writes.append(
+            message
+        )
+
+        first_text = "initial assignment dispatch"
+        second_text = "message874 follow-up"
+
+        try:
+            # A known assigned worker: announce_terminal_status only arms a
+            # capture barrier for terminals register_assignment has marked.
+            assigned_worker_completion_service.register_assignment(terminal_id)
+
+            terminal_service.send_input(terminal_id, first_text)
+            assert writes == [first_text]
+
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                # Blocks inside wait_for_native_acceptance -- nothing has
+                # released the fence armed by the dispatch above yet.
+                # future.result(timeout=...) raising TimeoutError is the
+                # synchronization-based proof of "still genuinely blocked"
+                # (it can only return once the call actually finishes,
+                # success or exception) -- robust under system load, unlike
+                # a fixed sleep-then-check-a-side-effect assertion.
+                future = pool.submit(terminal_service.send_input, terminal_id, second_text)
+                with pytest.raises(TimeoutError):
+                    future.result(timeout=0.5)
+                assert writes == [first_text]
+
+                # The first turn completes WHILE the follow-up is still
+                # blocked on acceptance. The same detection event releases
+                # the acceptance fence (COMPLETED != IDLE) AND arms the
+                # capture barrier (announce_terminal_status, called
+                # synchronously from inside _apply_detection_locked).
+                status_monitor._apply_detection(terminal_id, TerminalStatus.COMPLETED)
+
+                # Acceptance is now satisfied, but the capture barrier is
+                # STILL armed (nothing has released it yet) -- the
+                # follow-up must remain blocked, now on the FRESH capture
+                # recheck, not the (already-cleared) acceptance fence.
+                with pytest.raises(TimeoutError):
+                    future.result(timeout=0.5)
+                assert writes == [first_text], (
+                    "follow-up pasted into a COMPLETED terminal before its report was "
+                    "durably captured -- correction-994's capture recheck did not hold"
+                )
+
+                # NOW the capture completes.
+                assigned_worker_completion_service._release_capture_barrier(terminal_id)
+                future.result(timeout=5)
+
+            assert writes == [
+                first_text,
+                second_text,
+            ], f"expected exact order [first, follow-up] once captured, got {writes!r}"
+        finally:
+            status_monitor.clear_terminal(terminal_id)
+            assigned_worker_completion_service._release_capture_barrier(terminal_id)

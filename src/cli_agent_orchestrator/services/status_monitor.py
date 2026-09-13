@@ -149,10 +149,25 @@ class StatusMonitor:
         # that lock arrives -- a too-early second paste could still land
         # inside a composer the prior dispatch has not yet cleared. Released
         # by _apply_detection_locked the moment a genuine transition away
-        # from IDLE is observed (proof the terminal registered SOMETHING).
-        # Absence of an entry means "nothing pending" -- safe to proceed
-        # immediately (see wait_for_native_acceptance).
-        self._acceptance_pending: Dict[str, threading.Event] = {}
+        # from IDLE is observed (proof the terminal registered SOMETHING) --
+        # EXCEPT UNKNOWN, which is "no signal" (see _apply_detection_locked's
+        # own UNKNOWN handling) and never counts as acceptance evidence
+        # (correction-994). Absence of an entry means "nothing pending" --
+        # safe to proceed immediately (see wait_for_native_acceptance).
+        #
+        # Value is (event, armed_at): armed_at is time.monotonic() at the
+        # moment THIS fence was armed, paired with _buffer_changed_at's own
+        # per-chunk timestamp at release time (correction-994) so a
+        # detection driven by a chunk that was already in flight BEFORE this
+        # arm -- delayed only by independent thread/asyncio scheduling, not
+        # reflecting anything about THIS dispatch -- cannot release it. This
+        # does not (and cannot, without plumbing real OS-level capture
+        # timestamps through the FIFO->EventBus pipeline, which carries none
+        # today) distinguish a genuinely fresh chunk whose rendered CONTENT
+        # happens to still visually echo a stale prior-turn frame; that is a
+        # deeper, acknowledged limitation of content-based detection, not
+        # something this timestamp guards against.
+        self._acceptance_pending: Dict[str, Tuple[threading.Event, float]] = {}
         # --- pyte rendered-screen detection state (only used when CAO_PYTE_STATUS
         # is on AND the provider opts in via supports_screen_detection) ---
         # Per-terminal pyte Screen+Stream that composites the raw byte stream
@@ -335,7 +350,7 @@ class StatusMonitor:
         elif detected in _STICKY_READY_STATUSES and last not in _STICKY_READY_STATUSES:
             self._allow_processing_revert[terminal_id] = False
 
-        if detected != TerminalStatus.IDLE:
+        if detected not in (TerminalStatus.IDLE, TerminalStatus.UNKNOWN):
             # A genuine, accepted transition away from IDLE is proof the
             # terminal's native process registered SOMETHING (started
             # processing, asked a question, finished, or errored) -- release
@@ -343,10 +358,32 @@ class StatusMonitor:
             # for this terminal (correction-984). IDLE itself never releases
             # it: that is exactly the ambiguous "did it actually accept the
             # paste, or is the composer just showing stale/cleared text"
-            # state the fence exists to wait past.
+            # state the fence exists to wait past. UNKNOWN never releases it
+            # either (correction-994): it is "no signal" (see this
+            # function's own UNKNOWN handling above), not evidence of
+            # anything -- a brand-new terminal's very first post-dispatch
+            # detection can legitimately be UNKNOWN before the pane
+            # stabilizes, and that alone must never count as acceptance.
             pending = self._acceptance_pending.get(terminal_id)
             if pending is not None:
-                pending.set()
+                event, armed_at = pending
+                # Correction-994: only release for evidence that is at least
+                # as recent as this fence's own arming. _buffer_changed_at is
+                # stamped by _process_chunk BEFORE it schedules the detection
+                # that leads here, so for any chunk-driven detection this
+                # closes the cross-thread race where a chunk already queued
+                # BEFORE notify_input_sent's arm has its actual processing
+                # (an independent thread/asyncio scheduling artifact, not
+                # reflecting this dispatch at all) delayed until after arm.
+                # No timestamp recorded at all (a detection reached this
+                # point some other way than the chunk pipeline, e.g. a
+                # direct/test-only _apply_detection call) fails OPEN here --
+                # this check can only ever narrow an otherwise-valid
+                # release, never manufacture one that would not already
+                # have fired.
+                changed_at = self._buffer_changed_at.get(terminal_id)
+                if changed_at is None or changed_at >= armed_at:
+                    event.set()
 
         return True
 
@@ -620,7 +657,7 @@ class StatusMonitor:
             self._pending_stale_capture.pop(terminal_id, None)
             self._capture_generation[terminal_id] = self._capture_generation.get(terminal_id, 0) + 1
             if not assume_processing:
-                self._acceptance_pending[terminal_id] = threading.Event()
+                self._acceptance_pending[terminal_id] = (threading.Event(), time.monotonic())
         if assume_processing:
             self._apply_detection(terminal_id, TerminalStatus.PROCESSING)
 
@@ -635,9 +672,10 @@ class StatusMonitor:
         False as a fail-closed refusal to paste, never as permission to
         proceed anyway; no timeout may silently release this fence.
         """
-        event = self._acceptance_pending.get(terminal_id)
-        if event is None:
+        pending = self._acceptance_pending.get(terminal_id)
+        if pending is None:
             return True
+        event, _armed_at = pending
         return event.wait(timeout=timeout)
 
     def clear_rolling_buffer(self, terminal_id: str, provider=None) -> None:
@@ -695,7 +733,7 @@ class StatusMonitor:
             # the silent timeout-release wait_for_native_acceptance forbids.
             pending = self._acceptance_pending.pop(terminal_id, None)
             if pending is not None:
-                pending.set()
+                pending[0].set()
         self._cancel_quiesce_handle(handle)
 
     def reset_buffer(self, terminal_id: str) -> None:
@@ -725,7 +763,7 @@ class StatusMonitor:
             # block it or linger past the reset it is being reset for.
             pending = self._acceptance_pending.pop(terminal_id, None)
             if pending is not None:
-                pending.set()
+                pending[0].set()
         self._cancel_quiesce_handle(handle)
 
     def get_status(self, terminal_id: str) -> TerminalStatus:

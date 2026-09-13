@@ -605,6 +605,45 @@ class IdempotencyKeyModel(Base):
     created_at = Column(DateTime, default=datetime.now)
 
 
+class NativeDispatchCorruptionModel(Base):
+    """Durable, insert-only archive of one proven native-dispatch corruption
+    incident (correction-971/984/994; see services/native_dispatch_recovery.py).
+
+    ``record_key`` (``f"native-dispatch-corruption:{assignment_id}:{concatenated_message_id}"``,
+    matching ``CorruptionRecord.record_key()``) is the PRIMARY KEY specifically
+    so a second ``INSERT`` for an already-recorded incident raises
+    ``IntegrityError`` at ``commit()`` time -- true DB-level compare-and-swap,
+    not merely an in-process lock -- mirroring ``IdempotencyKeyModel``'s own
+    key-as-PK design one section above.
+
+    Deliberately carries NO lifecycle/delivery_state/final_result/receiver_state
+    columns and is never read by retirement/reconciliation logic: writing a row
+    here can never make an assignment eligible for retirement, forge a
+    completion, or otherwise touch completion semantics -- unlike
+    ``assigned_worker_callbacks.reconciliation_evidence`` (PR #11), which this
+    correction deliberately does not reuse for exactly that reason (see
+    ``record_native_dispatch_corruption``'s docstring).
+    """
+
+    __tablename__ = "native_dispatch_corruption_records"
+
+    record_key = Column(String, primary_key=True)
+    assignment_id = Column(String, nullable=False)
+    completion_id = Column(String, nullable=False)
+    worker_terminal_id = Column(String, nullable=False)
+    caller_id = Column(String, nullable=False)
+    registered_dispatch_sha256 = Column(String, nullable=False)
+    bound_prefix_length = Column(Integer, nullable=False)
+    transcript_sha256 = Column(String, nullable=False)
+    concatenated_message_id = Column(String, nullable=False)
+    concatenated_message_sender_id = Column(String, nullable=False)
+    concatenated_message_receiver_id = Column(String, nullable=False)
+    concatenated_message_content_sha256 = Column(String, nullable=False)
+    concatenated_message_delivery_state = Column(String, nullable=False)
+    concatenated_message_session_id = Column(String, nullable=True)
+    recorded_at = Column(String, nullable=False)
+
+
 def _ensure_db_dir() -> None:
     """Create the DB dir owner-only (0o700).
 
@@ -3183,6 +3222,225 @@ def get_assigned_worker_callback_by_assignment(
             return None
         _validate_assigned_worker_callback_row(db, row)
         return _assigned_worker_callback_from_row(row)
+
+
+class NativeDispatchCorruptionGuardError(Exception):
+    """One of native_dispatch_recovery.check_recovery_guards' fail-closed
+    guards refused this corruption-record mutation. Carries the exact
+    ``reason_code``/``detail`` from that guard result. Callers must not
+    react by relaxing or re-deriving inputs to force a pass -- a refusal
+    here means the fresh, mutation-time-rechecked state genuinely does not
+    satisfy one of: assignment/callback exists and belongs to the
+    requesting caller, the archived transcript matches its expected digest,
+    the transcript actually corrupts a registered dispatch, there is a
+    genuine unbound suffix, the callback's lifecycle is still eligible, the
+    terminal is not currently live, or the claimed concatenated message's
+    content/direction matches what was independently recomputed.
+    """
+
+    def __init__(self, reason_code: Optional[str], detail: str) -> None:
+        super().__init__(f"{reason_code}: {detail}")
+        self.reason_code = reason_code
+        self.detail = detail
+
+
+def _corruption_record_matches_row(record: Any, row: "NativeDispatchCorruptionModel") -> bool:
+    """True if ``record`` (a native_dispatch_recovery.CorruptionRecord) and
+    an existing durable ``row`` describe the SAME incident.
+
+    ``recorded_at`` is deliberately excluded: two independent, otherwise-
+    identical recordings of the same real incident (e.g. a caller retrying
+    after a transient failure) legitimately carry different wall-clock
+    timestamps and must still be recognized as an idempotent replay, not a
+    conflict -- every field that is actually EVIDENCE of the incident itself
+    must still match exactly.
+    """
+    return (
+        record.assignment_id == row.assignment_id
+        and record.completion_id == row.completion_id
+        and record.worker_terminal_id == row.worker_terminal_id
+        and record.caller_id == row.caller_id
+        and record.registered_dispatch_sha256 == row.registered_dispatch_sha256
+        and record.bound_prefix_length == row.bound_prefix_length
+        and record.transcript_sha256 == row.transcript_sha256
+        and str(record.concatenated_message_id) == row.concatenated_message_id
+        and record.concatenated_message_sender_id == row.concatenated_message_sender_id
+        and record.concatenated_message_receiver_id == row.concatenated_message_receiver_id
+        and record.concatenated_message_content_sha256 == row.concatenated_message_content_sha256
+        and record.concatenated_message_delivery_state == row.concatenated_message_delivery_state
+        and record.concatenated_message_session_id == row.concatenated_message_session_id
+    )
+
+
+def record_native_dispatch_corruption(
+    *,
+    assignment_id: str,
+    requesting_caller_id: str,
+    live_status: Any,
+    transcript_first_user_text: str,
+    expected_transcript_sha256: str,
+    admissible_dispatch_sha256: List[str],
+    concatenated_message_id: str,
+    concatenated_message_sender_id: str,
+    concatenated_message_receiver_id: str,
+    concatenated_message_content: str,
+    concatenated_message_delivery_state: str,
+    concatenated_message_session_id: Optional[str],
+    recorded_at: str,
+) -> Any:
+    """The one supported, real durable mutation for a proven native-dispatch
+    corruption incident (correction-971/984/994).
+
+    Everything guard-relevant is freshly resolved and bound INSIDE this one
+    ``BEGIN IMMEDIATE`` transaction, at mutation time -- not trusted from any
+    caller-supplied pre-computed guard result:
+
+    - The assignment/callback row is re-read from the database right here
+      (never a snapshot the caller might be holding from earlier).
+    - The transcript's SHA-256 is recomputed from ``transcript_first_user_text``
+      right here (never trusted from a caller-supplied digest) and compared
+      against ``expected_transcript_sha256`` -- a mismatch means the archived
+      transcript was tampered with or is stale, and fails closed.
+    - The corruption analysis (which admissible dispatch digest the
+      transcript's prefix matches, and what the exact unbound suffix is) is
+      recomputed right here from the fresh transcript text.
+    - Every check_recovery_guards() guard (identity, evidence integrity,
+      hash/prefix match, lifecycle eligibility, live-terminal activity,
+      claimed-message content/direction) is rerun right here, against all of
+      the above freshly-resolved values -- never a stale prior guard result.
+
+    ``live_status`` is the one input this function cannot itself resolve
+    inside the SQL transaction (a live terminal's status comes from reading
+    tmux/provider state, not the database) -- callers must read it as close
+    as practical to this call, mirroring how ``prepare_terminal_retirement``
+    (PR #11) already accepts this same real, documented, non-SQL-transactional
+    gap for the identical reason. Everything else above IS bound inside the
+    one transaction.
+
+    Insert-only and idempotent, enforced by the database itself, not merely
+    application logic: ``NativeDispatchCorruptionModel.record_key`` is a
+    PRIMARY KEY, so a concurrent transaction that already committed the same
+    record raises ``IntegrityError`` here, which this function resolves the
+    same way as an existing row found by its own SELECT -- a byte-for-byte
+    (except ``recorded_at``) matching existing record is a safe no-op;
+    anything else is refused outright, never silently overwritten.
+
+    Raises ``NativeDispatchCorruptionGuardError`` (guard refused, fail
+    closed) or ``ValueError`` (a genuine, different existing record already
+    occupies this identity). Never mutates
+    lifecycle/delivery_state/final_result/receiver_state on the assignment,
+    never creates/replays/resolves any inbox message, never releases any
+    OTHER pending message's delivery barrier.
+    """
+    from cli_agent_orchestrator.services.native_dispatch_recovery import (
+        ConcatenatedMessageClaim,
+        analyze_native_dispatch_corruption,
+        build_corruption_record,
+        check_recovery_guards,
+        utf8_sha256,
+    )
+
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+
+        row = (
+            db.query(AssignedWorkerCallbackModel)
+            .filter(AssignedWorkerCallbackModel.assignment_id == assignment_id)
+            .first()
+        )
+        callback = None
+        if row is not None:
+            _validate_assigned_worker_callback_row(db, row)
+            callback = _assigned_worker_callback_from_row(row)
+
+        transcript_sha256 = utf8_sha256(transcript_first_user_text)
+        analysis = analyze_native_dispatch_corruption(
+            transcript_first_user_text, admissible_dispatch_sha256
+        )
+        claim = ConcatenatedMessageClaim(
+            message_id=concatenated_message_id,
+            sender_id=concatenated_message_sender_id,
+            receiver_id=concatenated_message_receiver_id,
+            content=concatenated_message_content,
+            delivery_state=concatenated_message_delivery_state,
+            session_id=concatenated_message_session_id,
+        )
+        guard = check_recovery_guards(
+            requesting_caller_id=requesting_caller_id,
+            callback=callback,
+            analysis=analysis,
+            live_status=live_status,
+            archived_transcript_sha256=transcript_sha256,
+            expected_archived_transcript_sha256=expected_transcript_sha256,
+            claim=claim,
+        )
+        if not guard.allowed:
+            db.rollback()
+            raise NativeDispatchCorruptionGuardError(guard.reason_code, guard.detail)
+
+        record = build_corruption_record(
+            callback=callback,
+            analysis=analysis,
+            claim=claim,
+            transcript_sha256=transcript_sha256,
+            recorded_at=recorded_at,
+        )
+
+        existing = (
+            db.query(NativeDispatchCorruptionModel)
+            .filter(NativeDispatchCorruptionModel.record_key == record.record_key())
+            .first()
+        )
+        if existing is not None:
+            if _corruption_record_matches_row(record, existing):
+                db.commit()
+                return record
+            db.rollback()
+            raise ValueError(
+                f"corruption record collision for {record.record_key()!r}: an existing, "
+                "DIFFERENT record already exists for this assignment/message identity"
+            )
+
+        db.add(
+            NativeDispatchCorruptionModel(
+                record_key=record.record_key(),
+                assignment_id=record.assignment_id,
+                completion_id=record.completion_id,
+                worker_terminal_id=record.worker_terminal_id,
+                caller_id=record.caller_id,
+                registered_dispatch_sha256=record.registered_dispatch_sha256,
+                bound_prefix_length=record.bound_prefix_length,
+                transcript_sha256=record.transcript_sha256,
+                concatenated_message_id=str(record.concatenated_message_id),
+                concatenated_message_sender_id=record.concatenated_message_sender_id,
+                concatenated_message_receiver_id=record.concatenated_message_receiver_id,
+                concatenated_message_content_sha256=record.concatenated_message_content_sha256,
+                concatenated_message_delivery_state=record.concatenated_message_delivery_state,
+                concatenated_message_session_id=record.concatenated_message_session_id,
+                recorded_at=record.recorded_at,
+            )
+        )
+        try:
+            db.commit()
+        except IntegrityError:
+            # Genuine DB-level CAS: another transaction committed the same
+            # record_key between our SELECT above and this INSERT. Resolve
+            # exactly like the existing-row branch above -- never silently
+            # overwrite, never treat this as this call's own success without
+            # verifying the winner recorded the SAME incident.
+            db.rollback()
+            existing = (
+                db.query(NativeDispatchCorruptionModel)
+                .filter(NativeDispatchCorruptionModel.record_key == record.record_key())
+                .first()
+            )
+            if existing is not None and _corruption_record_matches_row(record, existing):
+                return record
+            raise ValueError(
+                f"corruption record collision for {record.record_key()!r}: a concurrent "
+                "transaction recorded a DIFFERENT record for this identity first"
+            )
+        return record
 
 
 def list_reconcilable_assigned_worker_callbacks() -> List[AssignedWorkerCallback]:

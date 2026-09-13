@@ -25,7 +25,7 @@ def transport(monkeypatch):
     state = {"selected": 1, "title": "Choose implementation", "keys": []}
     monkeypatch.setattr(q, "_screen", lambda *args: menu(state["selected"], state["title"]))
 
-    def send(worker, key):
+    def send(worker, key, **kwargs):
         state["keys"].append(key)
         if key == "Down":
             state["selected"] += 1
@@ -64,7 +64,7 @@ def test_stale_menu_sends_nothing(transport):
 def test_changed_during_navigation_never_sends_enter(transport, monkeypatch):
     s = q.snapshot("worker", "caller")
 
-    def send(*args):
+    def send(*args, **kwargs):
         transport["keys"].append(args[1])
         transport["title"] = "New question"
 

@@ -101,7 +101,12 @@ def answer(terminal_id: str, caller_id: str, prompt_sha256: str, index: int) -> 
         _CONSUMED[(terminal_id, caller_id)] = digest
         while selected != index:
             expected = selected + (1 if index > selected else -1)
-            terminals.send_special_key(terminal_id, "Down" if index > selected else "Up")
+            # submits_turn=False (correction-994): moving the menu cursor
+            # starts no new native processing turn -- must not arm/wait on
+            # the acceptance fence the answering Enter below checks.
+            terminals.send_special_key(
+                terminal_id, "Down" if index > selected else "Up", submits_turn=False
+            )
             deadline = time.monotonic() + 1
             while True:
                 digest, _, observed = parse_screen(_screen(terminal_id, caller_id))
