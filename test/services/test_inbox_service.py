@@ -153,6 +153,11 @@ class TestDeliverPending:
         InboxService().deliver_pending("term-1", num_messages=0, registry=registry)
 
         fakes.get.assert_called_once_with("term-1", limit=100)
+        # _defer_plugin_dispatch=[] (correction-1007 item 3): deliver_pending
+        # always passes its own deferred-dispatch collector through to
+        # send_input now, so plugin dispatch can be deferred past
+        # deliver_pending's own outer lock rather than running while
+        # send_input's REENTRANT inner lock acquisition merely re-enters it.
         assert fakes.terminal.send_input.call_args_list == [
             call(
                 "term-1",
@@ -160,6 +165,7 @@ class TestDeliverPending:
                 registry=registry,
                 sender_id="sender-a",
                 orchestration_type=inbox_mod.OrchestrationType.SEND_MESSAGE,
+                _defer_plugin_dispatch=[],
             ),
             call(
                 "term-1",
@@ -167,6 +173,7 @@ class TestDeliverPending:
                 registry=registry,
                 sender_id="sender-b",
                 orchestration_type=inbox_mod.OrchestrationType.SEND_MESSAGE,
+                _defer_plugin_dispatch=[],
             ),
         ]
         assert fakes.resolve.call_count == 3
@@ -525,6 +532,113 @@ def test_deferred_follow_up_never_overlaps_a_concurrent_assign_dispatch(monkeypa
         "queued follow-up",
     ], f"expected exact order [assign, follow-up], got {writes!r}"
     mock_bind.assert_called_once_with("codex", terminal_id, "1" * 32, assign_text)
+
+
+def test_deliver_pending_plugin_dispatch_finds_the_outer_lock_already_released(monkeypatch):
+    """Correction-1007 item 3 / message 1004: moving PostSendMessageEvent
+    dispatch outside send_input()'s OWN ``with terminal_input_lock(...):``
+    block (correction-994) is insufficient when InboxService.deliver_pending
+    already holds that SAME per-terminal RLock around
+    ``_deliver_pending_locked -> send_input``. send_input's own lock
+    acquisition there is a REENTRANT re-acquire of the lock deliver_pending
+    already holds, so the lock is still held by deliver_pending's own
+    ``with`` block while send_input's "after the lock" code runs.
+
+    This exercises the REAL ``InboxService.deliver_pending ->
+    _deliver_pending_locked -> terminal_service.send_input`` call chain
+    (only DB/tmux/provider edges are mocked) with a genuinely cross-thread
+    lock probe -- direct send_input-only coverage (see
+    test_native_input_serialization_race.py's own
+    ``test_plugin_dispatch_finds_the_lock_already_released``) cannot see
+    this defect, because that test never nests send_input inside an outer
+    holder of the same lock the way deliver_pending does.
+    """
+    terminal_id = "inbox-plugin-dispatch-terminal"
+    message = _make_message(id=99, receiver_id=terminal_id, message="queued follow-up")
+    monkeypatch.setattr(inbox_mod, "get_pending_messages", MagicMock(return_value=[message]))
+    monkeypatch.setattr(
+        inbox_mod,
+        "claim_inbox_message",
+        MagicMock(
+            return_value=message.model_copy(
+                update={
+                    "status": MessageStatus.DELIVERING,
+                    "claim_token": "tok",
+                    "claimed_at": datetime.now(),
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(inbox_mod, "resolve_inbox_claim", MagicMock(return_value=True))
+    monkeypatch.setattr(
+        inbox_mod, "is_assigned_worker_callback_inbox_message", MagicMock(return_value=False)
+    )
+    monkeypatch.setattr(
+        inbox_mod.status_monitor, "get_status", MagicMock(return_value=TerminalStatus.IDLE)
+    )
+
+    from cli_agent_orchestrator.services import terminal_service as real_terminal_service
+
+    monkeypatch.setattr(
+        real_terminal_service,
+        "get_terminal_metadata",
+        MagicMock(
+            return_value={
+                "tmux_session": "cao-session",
+                "tmux_window": "developer-plugin",
+                "provider": "codex",
+            }
+        ),
+    )
+    monkeypatch.setattr(real_terminal_service, "update_last_active", MagicMock())
+    monkeypatch.setattr(
+        real_terminal_service,
+        "inject_memory_context",
+        lambda message, terminal_id, frozen_memory=None: message,
+    )
+    provider = MagicMock()
+    provider.paste_enter_count = 1
+    provider.paste_submit_delay = 0.0
+    # provider_manager is the real shared singleton -- monkeypatch (not a
+    # raw assignment) so it is restored; see the sibling test above.
+    monkeypatch.setattr(
+        real_terminal_service.provider_manager, "get_provider", MagicMock(return_value=provider)
+    )
+
+    events: list[tuple] = []
+    writes: list[str] = []
+
+    def send_keys_side_effect(*args, **kwargs):
+        writes.append("sent")
+        return None
+
+    class _FakeRegistry:
+        async def dispatch(self, event_type, event):
+            # dispatch_plugin_event's no-loop branch runs THIS coroutine
+            # synchronously (asyncio.run) on deliver_pending's OWN thread --
+            # exactly the case that, pre-fix, ran while InboxService.
+            # deliver_pending's OWN _delivery_lock (== terminal_input_lock)
+            # was still held. Probe from a genuinely separate thread; a
+            # same-thread check would be meaningless under RLock
+            # reentrance (it would report "free" either way).
+            lock = real_terminal_service.terminal_input_lock(terminal_id)
+            with ThreadPoolExecutor(max_workers=1) as probe_pool:
+                acquired = probe_pool.submit(lock.acquire, True, 1.0).result(timeout=5)
+            events.append(("dispatch", event_type, acquired))
+            if acquired:
+                lock.release()
+
+    try:
+        with patch("cli_agent_orchestrator.backends.registry._backend") as mock_backend:
+            mock_backend.send_keys.side_effect = send_keys_side_effect
+            InboxService().deliver_pending(terminal_id, registry=_FakeRegistry())
+    finally:
+        inbox_mod.status_monitor.clear_terminal(terminal_id)
+
+    assert writes == ["sent"]
+    assert events == [
+        ("dispatch", "post_send_message", True)
+    ], f"expected exactly one dispatch, with the OUTER deliver_pending lock free; got {events!r}"
 
 
 @pytest.mark.parametrize(

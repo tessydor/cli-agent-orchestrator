@@ -2506,6 +2506,8 @@ def send_input(
     sender_id: str | None = None,
     orchestration_type: OrchestrationType | None = None,
     frozen_memory: str | None = None,
+    *,
+    _defer_plugin_dispatch: Optional[List[Callable[[], None]]] = None,
 ) -> bool:
     """Send input to terminal via tmux paste buffer.
 
@@ -2519,6 +2521,23 @@ def send_input(
     not logged. It is last and defaulted so existing positional callers (notably
     ``agent_step.run_agent_step``, which passes exactly two arguments) are
     unaffected.
+
+    ``_defer_plugin_dispatch`` is a private, keyword-only escape hatch
+    (correction-1007 item 3 / message 1004): when the caller already holds
+    ``terminal_input_lock(terminal_id)`` OUTSIDE this call (today, only
+    ``InboxService.deliver_pending``, via ``_deliver_pending_locked``),
+    moving plugin dispatch to after THIS function's own ``with
+    terminal_input_lock(...):`` block (correction-994) is not enough --
+    that block is a REENTRANT acquire of the SAME RLock the caller already
+    holds, so the lock is still held by the caller's own outer critical
+    section while this function's "after the lock" code runs. Passing a
+    list here defers the actual dispatch (as a zero-arg callable, appended
+    in call order) instead of invoking it inline, so the true outermost
+    lock holder can drain and run it after ITS OWN lock genuinely releases.
+    Every other caller leaves this ``None`` and keeps today's behavior
+    (dispatch immediately after this function's own lock releases), which
+    is already correct for them since none of them are nested inside
+    another holder of this same lock.
     """
     with terminal_input_lock(terminal_id):
         try:
@@ -2704,45 +2723,56 @@ def send_input(
             raise
 
     # Plugin dispatch happens AFTER the per-terminal lock above is released
-    # (correction-994). dispatch_plugin_event can run a plugin's handler
-    # SYNCHRONOUSLY (asyncio.run) whenever no event loop is active on this
-    # thread -- plugins are arbitrary, out-of-tree code and must never
-    # execute while holding the physical-write/acceptance-fence lock every
-    # other send_input()/send_special_key() caller for this SAME terminal_id
-    # is waiting on: a plugin that happens to (directly or transitively)
-    # touch this terminal_id would otherwise deadlock against itself, and
-    # even a plugin that never does still needlessly extends how long
-    # unrelated callers for this terminal are blocked. The one legitimate
-    # dispatch still fires exactly once, still strictly after the physical
-    # send, using values captured while the lock was held.
+    # (correction-994) -- or, when this call is nested inside a caller that
+    # already holds the SAME lock (correction-1007 item 3), is deferred to
+    # that caller via _defer_plugin_dispatch instead of running here.
+    # dispatch_plugin_event can run a plugin's handler SYNCHRONOUSLY
+    # (asyncio.run) whenever no event loop is active on this thread --
+    # plugins are arbitrary, out-of-tree code and must never execute while
+    # holding the physical-write/acceptance-fence lock every other
+    # send_input()/send_special_key() caller for this SAME terminal_id is
+    # waiting on: a plugin that happens to (directly or transitively) touch
+    # this terminal_id would otherwise deadlock against itself, and even a
+    # plugin that never does still needlessly extends how long unrelated
+    # callers for this terminal are blocked. The one legitimate dispatch
+    # still fires exactly once, still strictly after the physical send,
+    # using values captured while the lock was held.
     if registry is not None and sender_id is not None and orchestration_type is not None:
-        # Telemetry (opt-in; no-ops without the [otel] extra or when the SDK
-        # is disabled): record a GenAI ``execute_tool`` span for the dispatch,
-        # count it, and propagate the active trace context into the plugin
-        # event so downstream consumers can continue the trace.
-        from cli_agent_orchestrator.telemetry import (
-            execute_tool_span,
-            inject_traceparent,
-            record_orchestration_dispatch,
-        )
 
-        with execute_tool_span(
-            f"send_message:{orchestration_value}",
-            conversation_id=metadata["tmux_session"],
-        ):
-            record_orchestration_dispatch(orchestration_value)
-            dispatch_plugin_event(
-                registry,
-                "post_send_message",
-                PostSendMessageEvent(
-                    session_id=metadata["tmux_session"],
-                    sender=sender_id,
-                    receiver=terminal_id,
-                    message=original_message,
-                    orchestration_type=orchestration_type,
-                    traceparent=inject_traceparent(),
-                ),
+        def _dispatch() -> None:
+            # Telemetry (opt-in; no-ops without the [otel] extra or when
+            # the SDK is disabled): record a GenAI ``execute_tool`` span
+            # for the dispatch, count it, and propagate the active trace
+            # context into the plugin event so downstream consumers can
+            # continue the trace.
+            from cli_agent_orchestrator.telemetry import (
+                execute_tool_span,
+                inject_traceparent,
+                record_orchestration_dispatch,
             )
+
+            with execute_tool_span(
+                f"send_message:{orchestration_value}",
+                conversation_id=metadata["tmux_session"],
+            ):
+                record_orchestration_dispatch(orchestration_value)
+                dispatch_plugin_event(
+                    registry,
+                    "post_send_message",
+                    PostSendMessageEvent(
+                        session_id=metadata["tmux_session"],
+                        sender=sender_id,
+                        receiver=terminal_id,
+                        message=original_message,
+                        orchestration_type=orchestration_type,
+                        traceparent=inject_traceparent(),
+                    ),
+                )
+
+        if _defer_plugin_dispatch is not None:
+            _defer_plugin_dispatch.append(_dispatch)
+        else:
+            _dispatch()
     return True
 
 

@@ -114,14 +114,27 @@ class InboxService:
         Safe to call from any thread: the whole read→mark→send sequence is
         serialized per terminal (see __init__ for why that is load-bearing).
         """
+        # Plugin dispatch must never run while _delivery_lock (== terminal_
+        # input_lock) is held (correction-1007 item 3 / message 1004):
+        # send_input's own "dispatch after MY lock releases" (correction-994)
+        # is a no-op here, because send_input's lock acquisition is a
+        # REENTRANT re-acquire of the SAME RLock this method already holds --
+        # the lock is still held by THIS method's own `with` block while
+        # send_input's "after the lock" code runs. Collect deferred
+        # dispatches (in original per-batch order) and run them only after
+        # the lock below has genuinely, fully released.
+        deferred_dispatches: list = []
         with self._delivery_lock(terminal_id):
-            self._deliver_pending_locked(terminal_id, num_messages, registry)
+            self._deliver_pending_locked(terminal_id, num_messages, registry, deferred_dispatches)
+        for dispatch in deferred_dispatches:
+            dispatch()
 
     def _deliver_pending_locked(
         self,
         terminal_id: str,
         num_messages: int,
         registry: PluginRegistry | None,
+        deferred_dispatches: list,
     ) -> None:
         limit = num_messages if num_messages > 0 else 100
         messages = get_pending_messages(terminal_id, limit=limit)
@@ -202,6 +215,7 @@ class InboxService:
                         registry=registry,
                         sender_id=sender_id,
                         orchestration_type=OrchestrationType.SEND_MESSAGE,
+                        _defer_plugin_dispatch=deferred_dispatches,
                     )
             except TerminalNotFoundError as e:
                 # Pane not resolvable yet (e.g. a herdr pane that isn't mapped

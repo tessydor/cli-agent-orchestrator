@@ -18,6 +18,8 @@ nothing from any real assignment, terminal, or archive is copied into this
 repository.
 """
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
@@ -408,3 +410,175 @@ class TestGuardedCaptureReleaseLockOrdering:
         # missing exit would leave it locked -- assert it is free.
         assert real_lock.acquire(blocking=False) is True
         real_lock.release()
+
+
+class TestGuardedCaptureReleaseDoesNotDeadlockAgainstAConcurrentWaiter:
+    """Correction-1007 item 1: a concurrent InboxService/send_input-style
+    caller that already holds terminal_input_lock(worker_id) and is
+    blocked inside wait_for_capture_before_input(), waiting on the SAME
+    barrier this transition exists to release, must not prevent this
+    transition from completing. Uses the REAL terminal_input_lock and the
+    REAL wait_for_capture_before_input to reproduce/prove this
+    deterministically -- no sleeps as the proof (only bounded
+    future.result() timeouts and real threading.Event synchronization).
+    """
+
+    def test_concurrent_holder_blocked_on_the_same_barrier_does_not_starve_the_release(
+        self, capture_release_db, monkeypatch
+    ):
+        service = _seed_incident(monkeypatch)
+        monkeypatch.setattr(
+            status_monitor_mod.status_monitor, "get_status", lambda _id: TerminalStatus.IDLE
+        )
+
+        lock = real_terminal_service.terminal_input_lock(WORKER_ID)
+        thread_a_ready = threading.Event()
+
+        def thread_a() -> bool:
+            # Mirrors the exact real shape of send_input / InboxService.
+            # deliver_pending: acquire terminal_input_lock for this
+            # worker, THEN call wait_for_capture_before_input while still
+            # holding it. The 20s timeout is deliberately much larger
+            # than any bounded future.result() below is given -- on
+            # unfixed code this thread would not release the lock again
+            # until this wait actually times out or is genuinely
+            # notified, so a short future.result() on thread B below is
+            # the deterministic, sleep-free proof of the hang.
+            with lock:
+                thread_a_ready.set()
+                return service.wait_for_capture_before_input(WORKER_ID, timeout=20.0)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            future_a = pool.submit(thread_a)
+            assert thread_a_ready.wait(timeout=2), "thread A did not reach its wait in time"
+
+            future_b = pool.submit(_apply, service)
+            # On 53b031b6, reconcile_corrupted_dispatch_capture_release
+            # needs this SAME terminal_input_lock, which thread A holds
+            # while blocked -- this call would not return within any
+            # short bound. The fix must let it complete almost
+            # immediately, without depending on thread A's own timeout.
+            result = future_b.result(timeout=3)
+            assert result.released_now is True
+
+            # Thread A must then be released promptly too -- well before
+            # its own 20s timeout -- proving the barrier was genuinely
+            # released (not merely that thread B failed closed and gave
+            # up without releasing anything).
+            assert future_a.result(timeout=3) is True
+
+
+class TestGuardedCaptureReleaseSurvivesACrashBetweenCommitAndRelease:
+    """Correction-1007 item 2: a process that dies after the DB
+    acknowledgement durably commits but before the in-memory capture
+    barrier is released must not strand that barrier forever. Uses the
+    real fault-injection seam (_capture_release_checkpoint) to simulate
+    the crash deterministically, then proves a plain retry of the exact
+    same acknowledgement -- an idempotent DB replay, released_now=False --
+    still releases the barrier, and that ordinary InboxService delivery
+    then delivers the existing pending 948 analogue exactly once, without
+    replaying 874, creating any duplicate row, or marking the corrupted
+    task successful/retirement-eligible.
+    """
+
+    def test_retry_after_simulated_crash_releases_the_stranded_barrier(
+        self, capture_release_db, monkeypatch
+    ):
+        service = _seed_incident(monkeypatch)
+        monkeypatch.setattr(
+            status_monitor_mod.status_monitor, "get_status", lambda _id: TerminalStatus.IDLE
+        )
+
+        def _simulate_crash(worker_terminal_id, result):
+            raise RuntimeError("simulated process crash after DB commit, before barrier release")
+
+        # A scoped patch.object context manager (not monkeypatch.setattr)
+        # so it reverts on its own at the `with` block's end -- calling
+        # monkeypatch.undo() here would also undo capture_release_db's own
+        # SessionLocal patch, since fixtures and the test body share one
+        # monkeypatch instance.
+        with patch.object(service, "_capture_release_checkpoint", _simulate_crash):
+            # The DB acknowledgement commits (acknowledge_native_dispatch_
+            # corruption's own transaction has already returned/committed
+            # by the time the checkpoint above runs), but the simulated
+            # crash propagates out of this call before
+            # _release_capture_barrier ever executes -- the barrier is
+            # durably acknowledged in the DB, yet stranded armed in
+            # memory, exactly the scenario item 2 describes.
+            with pytest.raises(RuntimeError, match="simulated process crash"):
+                _apply(service)
+        assert (
+            service.wait_for_capture_before_input(WORKER_ID, timeout=0.2) is False
+        ), "barrier must be stranded armed immediately after the simulated crash"
+        with db.SessionLocal() as session:
+            row = (
+                session.query(db.NativeDispatchCorruptionModel)
+                .filter(db.NativeDispatchCorruptionModel.assignment_id == ASSIGNMENT_ID)
+                .first()
+            )
+        assert (
+            row is not None and row.capture_release_acknowledged_at is not None
+        ), "the DB acknowledgement itself must have durably committed despite the crash"
+
+        # Retry with the IDENTICAL acknowledgement -- an idempotent DB
+        # replay (released_now=False), yet it must still release the
+        # now-stranded barrier. The real (no-op) checkpoint is back in
+        # effect now that the `with patch.object(...)` block above exited.
+        retry = _apply(service)
+        assert (
+            retry.released_now is False
+        ), "the DB side is an idempotent replay, not a fresh transition"
+        assert (
+            service.wait_for_capture_before_input(WORKER_ID, timeout=1.0) is True
+        ), "the retry must release the barrier despite released_now=False"
+
+        # The corrupted task stays not-successful; 874 is never replayed;
+        # no duplicate row was created by either the crashed attempt or
+        # the retry.
+        after = db.get_assigned_worker_callback(WORKER_ID)
+        assert after.lifecycle == AssignmentLifecycle.DISPATCHED
+        assert after.final_result is None
+        assert after.delivery_state == CompletionDeliveryState.NOT_READY
+        all_rows = db.get_inbox_messages(WORKER_ID, limit=10)
+        assert len(all_rows) == 2, "no duplicate row from the crashed attempt or the retry"
+        matching_874 = [r for r in all_rows if r.message == MESSAGE_874_CONTENT]
+        assert len(matching_874) == 1
+
+        # Ordinary InboxService delivery then delivers the existing
+        # pending 948 exactly once, through the real send_input path.
+        inbox = InboxService()
+        writes = []
+
+        def send_keys_side_effect(session, window, message, **kwargs):
+            writes.append(message)
+
+        provider = MagicMock()
+        provider.paste_enter_count = 1
+        provider.paste_submit_delay = 0.0
+        provider.accepts_input_while_processing = False
+        provider.assume_processing_on_dispatch = False
+        provider.blocks_orchestrated_input_while_waiting_user_answer = False
+        provider.force_bracketed_paste = True
+        provider.encode_terminal_input = lambda message, orchestration_value: message
+
+        with (
+            patch("cli_agent_orchestrator.backends.registry._backend") as mock_backend,
+            patch.object(
+                real_terminal_service.provider_manager,
+                "get_provider",
+                return_value=provider,
+            ),
+        ):
+            mock_backend.send_keys.side_effect = send_keys_side_effect
+            mock_backend.supports_event_inbox.return_value = False
+            mock_backend.session_exists.return_value = True
+            mock_backend.get_history.return_value = ""
+            inbox.deliver_pending(WORKER_ID)
+
+        assert writes == [MESSAGE_948_CONTENT]
+        delivered_948 = [
+            r
+            for r in db.get_inbox_messages(WORKER_ID, limit=10, status=MessageStatus.DELIVERED)
+            if r.message == MESSAGE_948_CONTENT
+        ]
+        assert len(delivered_948) == 1

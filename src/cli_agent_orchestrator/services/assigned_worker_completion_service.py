@@ -11,6 +11,7 @@ import asyncio
 import logging
 import re
 import threading
+import time
 from typing import Any, Optional, Tuple
 
 from sqlalchemy.exc import OperationalError
@@ -67,6 +68,37 @@ _DELIVERY_TERMINAL_STATES = frozenset(
 )
 
 
+class _CaptureBarrier:
+    """A capture-release wait/notify primitive built on ONE specific
+    worker terminal's own ``terminal_input_lock`` (correction-1007).
+
+    Both existing callers of ``wait_for_capture_before_input``
+    (``terminal_service.send_input`` and ``InboxService.deliver_pending``)
+    already hold that exact lock for the whole duration of their call --
+    that is the entire reason a prior plain ``threading.Event`` was unsafe
+    here: blocking on a bare Event while still holding the lock starves
+    ANY other thread that needs the SAME lock to perform the release (the
+    guarded capture-release transition, correction-997/1001, needs exactly
+    this lock for its own fresh-status-read-then-CAS). A
+    ``threading.Condition`` built on that SAME lock is the correct,
+    standard fix: ``Condition.wait()`` atomically releases the underlying
+    lock while blocked and reacquires it before returning, exactly as if
+    the waiting thread had briefly exited its own ``with
+    terminal_input_lock(...):`` block -- so the release-side transition
+    can actually acquire the lock, act, and notify, and the waiter picks
+    back up exactly where a normal (non-reentrant) reacquire would leave
+    it. No caller-visible behavior changes: from every existing caller's
+    point of view this is still "acquire the lock, then block until
+    release or timeout."
+    """
+
+    __slots__ = ("condition", "released")
+
+    def __init__(self, lock: threading.RLock) -> None:
+        self.condition = threading.Condition(lock)
+        self.released = False
+
+
 class AssignedWorkerCompletionService:
     """Capture and deliver successful assigned-worker terminal completions."""
 
@@ -85,7 +117,7 @@ class AssignedWorkerCompletionService:
         self._worker_locks_guard = threading.Lock()
         self._known_workers: set[str] = set()
         self._failure_notice_pending: set[str] = set()
-        self._capture_barriers: dict[str, threading.Event] = {}
+        self._capture_barriers: dict[str, _CaptureBarrier] = {}
         self._retry_initial_delay = retry_initial_delay
         self._retry_max_delay = retry_max_delay
         self._retry_lifecycle_guard = threading.Lock()
@@ -119,7 +151,17 @@ class AssignedWorkerCompletionService:
         with self._worker_locks_guard:
             if worker_terminal_id not in self._known_workers:
                 return
-            self._capture_barriers.setdefault(worker_terminal_id, threading.Event())
+            if worker_terminal_id not in self._capture_barriers:
+                # Local import: avoids a module-level import cycle (see
+                # reconcile_corrupted_dispatch_capture_release's own local
+                # import of the same name, same rationale).
+                from cli_agent_orchestrator.services.terminal_service import (
+                    terminal_input_lock,
+                )
+
+                self._capture_barriers[worker_terminal_id] = _CaptureBarrier(
+                    terminal_input_lock(worker_terminal_id)
+                )
 
     def wait_for_capture_before_input(self, worker_terminal_id: str, timeout: float = 5.0) -> bool:
         """Return only when a known completed worker's report is safely durable.
@@ -127,17 +169,50 @@ class AssignedWorkerCompletionService:
         Unknown/non-assigned terminals have no barrier and retain the existing
         zero-wait inbox path.  On timeout the caller leaves the inbox row PENDING;
         reconciliation retries after capture rather than risking transcript loss.
+
+        Both real callers (``terminal_service.send_input``,
+        ``InboxService.deliver_pending``) already hold
+        ``terminal_input_lock(worker_terminal_id)`` for their entire call
+        into this method -- the barrier's own condition is built on that
+        SAME lock (see ``_CaptureBarrier``), so blocking here via
+        ``condition.wait()`` correctly releases it for the duration of the
+        wait (correction-1007) rather than starving the one path that can
+        actually release it (``reconcile_corrupted_dispatch_capture_
+        release``, which needs this identical lock for its own guarded
+        read-then-CAS).
         """
         with self._worker_locks_guard:
             barrier = self._capture_barriers.get(worker_terminal_id)
-        return True if barrier is None else barrier.wait(timeout)
+        if barrier is None:
+            return True
+        deadline = time.monotonic() + timeout
+        with barrier.condition:
+            while not barrier.released:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                barrier.condition.wait(timeout=remaining)
+        return True
 
     def _release_capture_barrier(self, worker_terminal_id: str) -> None:
         with self._worker_locks_guard:
             barrier = self._capture_barriers.pop(worker_terminal_id, None)
             self._known_workers.discard(worker_terminal_id)
         if barrier is not None:
-            barrier.set()
+            # notify_all() requires holding the condition's own lock
+            # (terminal_input_lock(worker_terminal_id)). Callers that
+            # already hold it (reconcile_corrupted_dispatch_capture_
+            # release) reenter for free (RLock); callers that don't
+            # (the async status-event consumer's normal completion path)
+            # acquire it here -- safe, since no path anywhere acquires
+            # _worker_lock and terminal_input_lock for the SAME
+            # terminal_id in the opposite order (verified: the only two
+            # wait_for_capture_before_input callers never touch
+            # _worker_lock at all), so this can never invert against
+            # anything that holds _worker_lock and waits on this lock.
+            with barrier.condition:
+                barrier.released = True
+                barrier.condition.notify_all()
 
     def reconcile_corrupted_dispatch_capture_release(
         self,
@@ -183,19 +258,54 @@ class AssignedWorkerCompletionService:
         OTHER worker-lifecycle methods for the same worker; every existing
         caller of ``_worker_lock`` that also touches a lock for THIS SAME
         terminal_id only ever does so via ``wait_for_capture_before_input``
-        (which takes only the short-lived ``_worker_locks_guard``, never
-        ``terminal_input_lock`` itself), so this nesting introduces no new
-        lock-order inversion.
+        (which never touches ``_worker_lock`` at all -- see below), so this
+        nesting introduces no lock-order inversion between these two locks.
 
-        The barrier is released, if at all, strictly INSIDE both locks --
-        never after unlocking, and never across any plugin hook or inbox
-        delivery (none occur in this path at all, unlike ``_drive_delivery``).
-        Only a real transition from unacknowledged to acknowledged
-        (``released_now=True``) releases the barrier; an idempotent replay of
-        an already-acknowledged incident performs no barrier operation at
-        all, so calling this method twice with the same acknowledgement can
-        never double-release or resurrect a barrier for a since-reused
-        worker_terminal_id.
+        Message-1007's real-call-graph finding: the claimed ``_worker_lock``
+        inversion above did not actually exist in the code (verified by
+        reading ``wait_for_capture_before_input``'s body, which only ever
+        touches the short-lived ``_worker_locks_guard``) -- but a REAL
+        starvation issue did, in ``terminal_input_lock`` alone. Both
+        ``send_input`` and ``InboxService.deliver_pending`` hold
+        ``terminal_input_lock(worker_terminal_id)`` for their entire call
+        into ``wait_for_capture_before_input``; that call used to block on a
+        bare ``threading.Event`` while still holding the lock, so a
+        concurrent call to THIS method (which needs that same lock to
+        perform its guarded read-then-CAS) could never acquire it until the
+        waiter's own timeout expired -- functionally a deadlock, bounded
+        only by an unrelated caller's timeout constant rather than by
+        design. Fixed at the barrier's own definition (see
+        ``_CaptureBarrier``): its wait/notify is now a ``threading.
+        Condition`` built on that SAME ``terminal_input_lock``, whose
+        ``wait()`` atomically releases the lock while blocked and
+        reacquires it before returning -- so this method's acquisition
+        below can succeed immediately regardless of any concurrent waiter,
+        and the waiter resumes normally once notified. This required no
+        change to ``send_input``/``deliver_pending``'s own code or lock
+        order at all (the "already-live delivery order" is preserved
+        exactly); only the barrier's internal wait mechanism changed.
+
+        The barrier release is idempotent regardless of ``released_now``
+        (correction-1007 item 2): a process that dies after the DB
+        acknowledgement above durably commits but before
+        ``_release_capture_barrier`` runs would otherwise strand the
+        barrier forever, because a later retry of the SAME acknowledgement
+        sees ``released_now=False`` (the DB already reflects this exact,
+        matching acknowledgement) and -- under the OLD gated logic -- would
+        never attempt release again. ``released_now`` is therefore now only
+        an audit/transition signal in the returned record, never a gate on
+        whether to release. This is safe to call unconditionally because
+        (a) ``_release_capture_barrier`` is already a no-op when no barrier
+        is armed for this worker_terminal_id, and (b) reaching this line at
+        all already required ``acknowledge_native_dispatch_corruption``'s
+        fresh guard revalidation (the exact same guards as message 997) to
+        succeed against the CURRENT callback row for this exact assignment
+        -- so a stale/reused-terminal_id retry for a since-superseded
+        assignment is refused with an exception well before this point,
+        never reaching (and therefore never able to mis-release) a
+        different, later, unrelated barrier for a reused worker_terminal_id.
+        Never happens across any plugin hook or inbox delivery (none occur
+        in this path at all, unlike ``_drive_delivery``).
 
         Raises the same ``NativeDispatchCorruptionGuardError``/``ValueError``
         as ``acknowledge_native_dispatch_corruption`` on any guard failure or
@@ -231,9 +341,24 @@ class AssignedWorkerCompletionService:
                     acknowledgement=acknowledgement,
                     acknowledged_at=acknowledged_at,
                 )
-                if result.released_now:
-                    self._release_capture_barrier(worker_terminal_id)
+                # Fault-injection seam (correction-1007 item 2): a test can
+                # monkeypatch this to raise, simulating a process crash
+                # exactly at the post-commit/pre-release boundary. A
+                # subsequent retry of the identical acknowledgement must
+                # still release the barrier below, since the release is
+                # unconditional rather than gated on released_now.
+                self._capture_release_checkpoint(worker_terminal_id, result)
+                self._release_capture_barrier(worker_terminal_id)
                 return result
+
+    @staticmethod
+    def _capture_release_checkpoint(worker_terminal_id: str, result: Any) -> None:
+        """No-op fault-injection seam between the durable acknowledgement
+        commit and the in-memory capture-barrier release (correction-1007
+        item 2). Mirrors ``_phase_checkpoint``'s existing role for the
+        completion-delivery state machine.
+        """
+        del worker_terminal_id, result
 
     def start_retry_scheduler(self) -> None:
         """Start the single event-woken retry scheduler on the running loop.
