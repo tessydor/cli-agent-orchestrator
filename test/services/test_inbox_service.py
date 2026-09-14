@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from threading import Barrier, Lock, RLock
@@ -460,7 +461,14 @@ def test_deferred_follow_up_never_overlaps_a_concurrent_assign_dispatch(monkeypa
     provider = MagicMock()
     provider.paste_enter_count = 2
     provider.paste_submit_delay = 0.0
-    real_terminal_service.provider_manager.get_provider = MagicMock(return_value=provider)
+    # provider_manager is the real shared singleton (also imported
+    # independently into status_monitor.py) -- a raw attribute assignment
+    # here would leak a stub get_provider into every later test in the
+    # session (this was found causing cross-file pollution of
+    # test_status_monitor.py). Use monkeypatch so it is restored.
+    monkeypatch.setattr(
+        real_terminal_service.provider_manager, "get_provider", MagicMock(return_value=provider)
+    )
 
     occupancy = 0
     max_seen = 0
@@ -495,7 +503,11 @@ def test_deferred_follow_up_never_overlaps_a_concurrent_assign_dispatch(monkeypa
             # ...its native acceptance is then explicitly, deliberately
             # confirmed -- simulating StatusMonitor's real detection loop --
             # releasing the fence armed by that dispatch's own
-            # notify_input_sent (called internally by send_input above)...
+            # notify_input_sent (called internally by send_input above).
+            # correction-1001: a missing freshness timestamp now fails
+            # CLOSED, so this simulated "real detection" must supply one,
+            # exactly as a genuine _process_chunk-driven detection would.
+            inbox_mod.status_monitor._buffer_changed_at[terminal_id] = time.monotonic()
             inbox_mod.status_monitor._apply_detection(terminal_id, TerminalStatus.PROCESSING)
 
             # ...only THEN does the completed worker's queued follow-up

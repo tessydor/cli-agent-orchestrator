@@ -1,5 +1,6 @@
 """Minimal database client with only terminal metadata."""
 
+import dataclasses
 import hashlib
 import logging
 import os
@@ -623,6 +624,15 @@ class NativeDispatchCorruptionModel(Base):
     ``assigned_worker_callbacks.reconciliation_evidence`` (PR #11), which this
     correction deliberately does not reuse for exactly that reason (see
     ``record_native_dispatch_corruption``'s docstring).
+
+    ``caller_acknowledgement``/``capture_release_acknowledged_at`` (correction-
+    997/1001) are NULL for a plain record-only row. They are filled in ONLY by
+    ``acknowledge_native_dispatch_corruption`` -- their presence is the
+    durable, idempotent proof that the SEPARATE, explicit-acknowledgement
+    capture-release transition already ran once for this exact incident;
+    still no lifecycle/delivery_state/final_result column exists here, so
+    that transition remains structurally incapable of touching completion or
+    retirement semantics too.
     """
 
     __tablename__ = "native_dispatch_corruption_records"
@@ -642,6 +652,8 @@ class NativeDispatchCorruptionModel(Base):
     concatenated_message_delivery_state = Column(String, nullable=False)
     concatenated_message_session_id = Column(String, nullable=True)
     recorded_at = Column(String, nullable=False)
+    caller_acknowledgement = Column(String, nullable=True)
+    capture_release_acknowledged_at = Column(String, nullable=True)
 
 
 def _ensure_db_dir() -> None:
@@ -3253,7 +3265,11 @@ def _corruption_record_matches_row(record: Any, row: "NativeDispatchCorruptionMo
     after a transient failure) legitimately carry different wall-clock
     timestamps and must still be recognized as an idempotent replay, not a
     conflict -- every field that is actually EVIDENCE of the incident itself
-    must still match exactly.
+    must still match exactly. The acknowledgement columns are compared
+    separately by callers that care about them (record_native_dispatch_
+    corruption does not; acknowledge_native_dispatch_corruption does) --
+    two callers racing to RECORD (not acknowledge) the same incident must
+    still match here regardless of whether either has been acknowledged.
     """
     return (
         record.assignment_id == row.assignment_id
@@ -3269,6 +3285,110 @@ def _corruption_record_matches_row(record: Any, row: "NativeDispatchCorruptionMo
         and record.concatenated_message_content_sha256 == row.concatenated_message_content_sha256
         and record.concatenated_message_delivery_state == row.concatenated_message_delivery_state
         and record.concatenated_message_session_id == row.concatenated_message_session_id
+    )
+
+
+def _row_to_corruption_record(row: "NativeDispatchCorruptionModel") -> Any:
+    """Reconstruct a native_dispatch_recovery.CorruptionRecord from a durable row."""
+    from cli_agent_orchestrator.services.native_dispatch_recovery import CorruptionRecord
+
+    return CorruptionRecord(
+        assignment_id=row.assignment_id,
+        completion_id=row.completion_id,
+        worker_terminal_id=row.worker_terminal_id,
+        caller_id=row.caller_id,
+        registered_dispatch_sha256=row.registered_dispatch_sha256,
+        bound_prefix_length=row.bound_prefix_length,
+        transcript_sha256=row.transcript_sha256,
+        concatenated_message_id=row.concatenated_message_id,
+        concatenated_message_sender_id=row.concatenated_message_sender_id,
+        concatenated_message_receiver_id=row.concatenated_message_receiver_id,
+        concatenated_message_content_sha256=row.concatenated_message_content_sha256,
+        concatenated_message_delivery_state=row.concatenated_message_delivery_state,
+        concatenated_message_session_id=row.concatenated_message_session_id,
+        recorded_at=row.recorded_at,
+        caller_acknowledgement=row.caller_acknowledgement,
+        capture_release_acknowledged_at=row.capture_release_acknowledged_at,
+    )
+
+
+def _resolve_and_guard_corruption_record(
+    db: Any,
+    *,
+    assignment_id: str,
+    requesting_caller_id: str,
+    live_status: Any,
+    transcript_first_user_text: str,
+    expected_transcript_sha256: str,
+    admissible_dispatch_sha256: List[str],
+    concatenated_message_id: str,
+    concatenated_message_sender_id: str,
+    concatenated_message_receiver_id: str,
+    concatenated_message_content: str,
+    concatenated_message_delivery_state: str,
+    concatenated_message_session_id: Optional[str],
+    recorded_at: str,
+) -> Any:
+    """Shared mutation-time resolve-and-guard core for BOTH
+    record_native_dispatch_corruption and acknowledge_native_dispatch_
+    corruption (correction-997): re-read the assignment/callback row fresh
+    from ``db`` (an already-open, caller-owned transaction), recompute the
+    transcript digest and corruption analysis from the raw inputs, rerun
+    every check_recovery_guards() guard against those fresh values, and
+    build the resulting CorruptionRecord. Raises
+    NativeDispatchCorruptionGuardError on any guard failure. Callers own
+    the transaction (begin/commit/rollback) and any acknowledgement-
+    specific guard on top of this.
+    """
+    from cli_agent_orchestrator.services.native_dispatch_recovery import (
+        ConcatenatedMessageClaim,
+        analyze_native_dispatch_corruption,
+        build_corruption_record,
+        check_recovery_guards,
+        utf8_sha256,
+    )
+
+    row = (
+        db.query(AssignedWorkerCallbackModel)
+        .filter(AssignedWorkerCallbackModel.assignment_id == assignment_id)
+        .first()
+    )
+    callback = None
+    if row is not None:
+        _validate_assigned_worker_callback_row(db, row)
+        callback = _assigned_worker_callback_from_row(row)
+
+    transcript_sha256 = utf8_sha256(transcript_first_user_text)
+    analysis = analyze_native_dispatch_corruption(
+        transcript_first_user_text, admissible_dispatch_sha256
+    )
+    claim = ConcatenatedMessageClaim(
+        message_id=concatenated_message_id,
+        sender_id=concatenated_message_sender_id,
+        receiver_id=concatenated_message_receiver_id,
+        content=concatenated_message_content,
+        delivery_state=concatenated_message_delivery_state,
+        session_id=concatenated_message_session_id,
+    )
+    guard = check_recovery_guards(
+        requesting_caller_id=requesting_caller_id,
+        callback=callback,
+        analysis=analysis,
+        live_status=live_status,
+        archived_transcript_sha256=transcript_sha256,
+        expected_archived_transcript_sha256=expected_transcript_sha256,
+        claim=claim,
+    )
+    if not guard.allowed:
+        db.rollback()
+        raise NativeDispatchCorruptionGuardError(guard.reason_code, guard.detail)
+
+    return build_corruption_record(
+        callback=callback,
+        analysis=analysis,
+        claim=claim,
+        transcript_sha256=transcript_sha256,
+        recorded_at=recorded_at,
     )
 
 
@@ -3332,57 +3452,23 @@ def record_native_dispatch_corruption(
     never creates/replays/resolves any inbox message, never releases any
     OTHER pending message's delivery barrier.
     """
-    from cli_agent_orchestrator.services.native_dispatch_recovery import (
-        ConcatenatedMessageClaim,
-        analyze_native_dispatch_corruption,
-        build_corruption_record,
-        check_recovery_guards,
-        utf8_sha256,
-    )
-
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
 
-        row = (
-            db.query(AssignedWorkerCallbackModel)
-            .filter(AssignedWorkerCallbackModel.assignment_id == assignment_id)
-            .first()
-        )
-        callback = None
-        if row is not None:
-            _validate_assigned_worker_callback_row(db, row)
-            callback = _assigned_worker_callback_from_row(row)
-
-        transcript_sha256 = utf8_sha256(transcript_first_user_text)
-        analysis = analyze_native_dispatch_corruption(
-            transcript_first_user_text, admissible_dispatch_sha256
-        )
-        claim = ConcatenatedMessageClaim(
-            message_id=concatenated_message_id,
-            sender_id=concatenated_message_sender_id,
-            receiver_id=concatenated_message_receiver_id,
-            content=concatenated_message_content,
-            delivery_state=concatenated_message_delivery_state,
-            session_id=concatenated_message_session_id,
-        )
-        guard = check_recovery_guards(
+        record = _resolve_and_guard_corruption_record(
+            db,
+            assignment_id=assignment_id,
             requesting_caller_id=requesting_caller_id,
-            callback=callback,
-            analysis=analysis,
             live_status=live_status,
-            archived_transcript_sha256=transcript_sha256,
-            expected_archived_transcript_sha256=expected_transcript_sha256,
-            claim=claim,
-        )
-        if not guard.allowed:
-            db.rollback()
-            raise NativeDispatchCorruptionGuardError(guard.reason_code, guard.detail)
-
-        record = build_corruption_record(
-            callback=callback,
-            analysis=analysis,
-            claim=claim,
-            transcript_sha256=transcript_sha256,
+            transcript_first_user_text=transcript_first_user_text,
+            expected_transcript_sha256=expected_transcript_sha256,
+            admissible_dispatch_sha256=admissible_dispatch_sha256,
+            concatenated_message_id=concatenated_message_id,
+            concatenated_message_sender_id=concatenated_message_sender_id,
+            concatenated_message_receiver_id=concatenated_message_receiver_id,
+            concatenated_message_content=concatenated_message_content,
+            concatenated_message_delivery_state=concatenated_message_delivery_state,
+            concatenated_message_session_id=concatenated_message_session_id,
             recorded_at=recorded_at,
         )
 
@@ -3441,6 +3527,182 @@ def record_native_dispatch_corruption(
                 "transaction recorded a DIFFERENT record for this identity first"
             )
         return record
+
+
+class AcknowledgedCorruptionRecord(NamedTuple):
+    """Result of acknowledge_native_dispatch_corruption.
+
+    ``released_now`` is True only on the transition from unacknowledged to
+    acknowledged that THIS call itself performed -- False for an idempotent
+    replay of an already-acknowledged incident. Callers (the guarded
+    capture-release orchestrator) use this to decide whether the in-memory
+    capture barrier actually needs releasing, vs. a repeat call that must
+    not try to release it again.
+    """
+
+    record: Any
+    released_now: bool
+
+
+def acknowledge_native_dispatch_corruption(
+    *,
+    assignment_id: str,
+    requesting_caller_id: str,
+    live_status: Any,
+    transcript_first_user_text: str,
+    expected_transcript_sha256: str,
+    admissible_dispatch_sha256: List[str],
+    concatenated_message_id: str,
+    concatenated_message_sender_id: str,
+    concatenated_message_receiver_id: str,
+    concatenated_message_content: str,
+    concatenated_message_delivery_state: str,
+    concatenated_message_session_id: Optional[str],
+    recorded_at: str,
+    acknowledgement: str,
+    acknowledged_at: str,
+) -> AcknowledgedCorruptionRecord:
+    """The narrow, explicit-caller-acknowledged transition that a plain
+    record_native_dispatch_corruption() row does NOT perform (correction-
+    997/1001): re-verify every mutation-time binding fresh (reusing
+    _resolve_and_guard_corruption_record -- the exact same guards as
+    record_native_dispatch_corruption, at the exact same freshness), require
+    a non-empty explicit ``acknowledgement`` from the requesting caller, and
+    durably mark this exact incident acknowledged.
+
+    This function does NOT itself touch the in-memory capture barrier --
+    see AssignedWorkerCompletionService.reconcile_corrupted_dispatch_
+    capture_release for the orchestrating transition that acquires the
+    per-terminal lock, calls this function for the DB-side CAS, and only
+    then releases the barrier. ``live_status`` here is deliberately still a
+    plain parameter (not read by this function) -- the orchestrator is
+    responsible for reading it freshly INSIDE that lock, immediately before
+    calling this function, never as a stale pre-lock snapshot (message
+    1001's TOCTOU finding).
+
+    Idempotent-or-refuse, same discipline as record_native_dispatch_
+    corruption: no existing row -- inserts one, already acknowledged.
+    Existing row, not yet acknowledged, matching content -- upgrades it in
+    place (this is the one real "release" transition; ``released_now`` is
+    True). Existing row, already acknowledged with the SAME acknowledgement
+    text -- safe idempotent no-op (``released_now`` False; the orchestrator
+    must not re-release). Existing row that differs in content OR in a
+    DIFFERENT prior acknowledgement text -- refused outright as a
+    collision, never silently overwritten.
+
+    Never mutates lifecycle/delivery_state/final_result/receiver_state
+    (the table has no such columns at all), never marks the task
+    successful, never replays the concatenated message, never creates any
+    inbox row.
+    """
+    from cli_agent_orchestrator.services.native_dispatch_recovery import (
+        check_acknowledgement_guard,
+    )
+
+    ack_guard = check_acknowledgement_guard(acknowledgement)
+    if not ack_guard.allowed:
+        raise NativeDispatchCorruptionGuardError(ack_guard.reason_code, ack_guard.detail)
+
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+
+        record = _resolve_and_guard_corruption_record(
+            db,
+            assignment_id=assignment_id,
+            requesting_caller_id=requesting_caller_id,
+            live_status=live_status,
+            transcript_first_user_text=transcript_first_user_text,
+            expected_transcript_sha256=expected_transcript_sha256,
+            admissible_dispatch_sha256=admissible_dispatch_sha256,
+            concatenated_message_id=concatenated_message_id,
+            concatenated_message_sender_id=concatenated_message_sender_id,
+            concatenated_message_receiver_id=concatenated_message_receiver_id,
+            concatenated_message_content=concatenated_message_content,
+            concatenated_message_delivery_state=concatenated_message_delivery_state,
+            concatenated_message_session_id=concatenated_message_session_id,
+            recorded_at=recorded_at,
+        )
+
+        existing = (
+            db.query(NativeDispatchCorruptionModel)
+            .filter(NativeDispatchCorruptionModel.record_key == record.record_key())
+            .first()
+        )
+        if existing is not None:
+            if not _corruption_record_matches_row(record, existing):
+                db.rollback()
+                raise ValueError(
+                    f"corruption record collision for {record.record_key()!r}: an existing, "
+                    "DIFFERENT record already exists for this assignment/message identity"
+                )
+            if existing.capture_release_acknowledged_at is not None:
+                if existing.caller_acknowledgement == acknowledgement:
+                    db.commit()
+                    return AcknowledgedCorruptionRecord(_row_to_corruption_record(existing), False)
+                db.rollback()
+                raise ValueError(
+                    f"corruption record {record.record_key()!r} was already acknowledged with "
+                    "a DIFFERENT acknowledgement text -- refusing to overwrite"
+                )
+            existing.caller_acknowledgement = acknowledgement
+            existing.capture_release_acknowledged_at = acknowledged_at
+            db.commit()
+            return AcknowledgedCorruptionRecord(_row_to_corruption_record(existing), True)
+
+        db.add(
+            NativeDispatchCorruptionModel(
+                record_key=record.record_key(),
+                assignment_id=record.assignment_id,
+                completion_id=record.completion_id,
+                worker_terminal_id=record.worker_terminal_id,
+                caller_id=record.caller_id,
+                registered_dispatch_sha256=record.registered_dispatch_sha256,
+                bound_prefix_length=record.bound_prefix_length,
+                transcript_sha256=record.transcript_sha256,
+                concatenated_message_id=str(record.concatenated_message_id),
+                concatenated_message_sender_id=record.concatenated_message_sender_id,
+                concatenated_message_receiver_id=record.concatenated_message_receiver_id,
+                concatenated_message_content_sha256=record.concatenated_message_content_sha256,
+                concatenated_message_delivery_state=record.concatenated_message_delivery_state,
+                concatenated_message_session_id=record.concatenated_message_session_id,
+                recorded_at=record.recorded_at,
+                caller_acknowledgement=acknowledgement,
+                capture_release_acknowledged_at=acknowledged_at,
+            )
+        )
+        try:
+            db.commit()
+        except IntegrityError:
+            # See record_native_dispatch_corruption's own comment: SQLite's
+            # BEGIN IMMEDIATE already serializes genuinely concurrent callers
+            # against each other, so this is a defensive fallback, not the
+            # primary mechanism. Resolve the same way: match content AND an
+            # identical prior acknowledgement is a safe no-op; anything else
+            # (different content, not-yet-acknowledged, or a DIFFERENT
+            # acknowledgement) is refused rather than silently overwritten.
+            db.rollback()
+            existing = (
+                db.query(NativeDispatchCorruptionModel)
+                .filter(NativeDispatchCorruptionModel.record_key == record.record_key())
+                .first()
+            )
+            if (
+                existing is not None
+                and _corruption_record_matches_row(record, existing)
+                and existing.capture_release_acknowledged_at is not None
+                and existing.caller_acknowledgement == acknowledgement
+            ):
+                return AcknowledgedCorruptionRecord(_row_to_corruption_record(existing), False)
+            raise ValueError(
+                f"corruption record collision for {record.record_key()!r}: a concurrent "
+                "transaction recorded a DIFFERENT or not-yet-acknowledged record first"
+            )
+        acknowledged_record = dataclasses.replace(
+            record,
+            caller_acknowledgement=acknowledgement,
+            capture_release_acknowledged_at=acknowledged_at,
+        )
+        return AcknowledgedCorruptionRecord(acknowledged_record, True)
 
 
 def list_reconcilable_assigned_worker_callbacks() -> List[AssignedWorkerCallback]:

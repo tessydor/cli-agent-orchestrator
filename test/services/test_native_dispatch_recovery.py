@@ -19,6 +19,7 @@ from cli_agent_orchestrator.models.assigned_worker import (
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import native_dispatch_recovery as recovery_mod
 from cli_agent_orchestrator.services.native_dispatch_recovery import (
+    GUARD_ACKNOWLEDGEMENT_MISSING,
     GUARD_CALLER_MISMATCH,
     GUARD_CHANGED_CALLBACK_STATE,
     GUARD_CLAIM_UNBOUND,
@@ -34,6 +35,7 @@ from cli_agent_orchestrator.services.native_dispatch_recovery import (
     CorruptionRecord,
     analyze_native_dispatch_corruption,
     build_corruption_record,
+    check_acknowledgement_guard,
     check_recovery_guards,
     utf8_sha256,
 )
@@ -339,6 +341,34 @@ class TestBuildCorruptionRecord:
                 transcript_sha256="a" * 64,
                 recorded_at=RECORDED_AT,
             )
+
+
+class TestCheckAcknowledgementGuard:
+    """The one guard specific to the capture-release transition (correction-
+    997/1001): kept separate from check_recovery_guards() because the plain
+    record-only path never needs an acknowledgement at all."""
+
+    def test_none_is_refused(self):
+        result = check_acknowledgement_guard(None)
+        assert result.allowed is False
+        assert result.reason_code == GUARD_ACKNOWLEDGEMENT_MISSING
+
+    def test_empty_string_is_refused(self):
+        result = check_acknowledgement_guard("")
+        assert result.allowed is False
+        assert result.reason_code == GUARD_ACKNOWLEDGEMENT_MISSING
+
+    def test_whitespace_only_is_refused(self):
+        result = check_acknowledgement_guard("   \n\t  ")
+        assert result.allowed is False
+        assert result.reason_code == GUARD_ACKNOWLEDGEMENT_MISSING
+
+    def test_non_empty_explicit_text_is_allowed(self):
+        result = check_acknowledgement_guard(
+            "synthetic-caller acknowledges the corrupted dispatch is abandoned"
+        )
+        assert result.allowed is True
+        assert result.reason_code is None
 
 
 def _record(**overrides) -> CorruptionRecord:

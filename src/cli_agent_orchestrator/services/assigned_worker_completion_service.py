@@ -139,6 +139,102 @@ class AssignedWorkerCompletionService:
         if barrier is not None:
             barrier.set()
 
+    def reconcile_corrupted_dispatch_capture_release(
+        self,
+        worker_terminal_id: str,
+        *,
+        assignment_id: str,
+        requesting_caller_id: str,
+        transcript_first_user_text: str,
+        expected_transcript_sha256: str,
+        admissible_dispatch_sha256: list[str],
+        concatenated_message_id: str,
+        concatenated_message_sender_id: str,
+        concatenated_message_receiver_id: str,
+        concatenated_message_content: str,
+        concatenated_message_delivery_state: str,
+        concatenated_message_session_id: Optional[str],
+        recorded_at: str,
+        acknowledgement: str,
+        acknowledged_at: str,
+    ) -> Any:
+        """The one supported guarded recovery transition (correction-997/1001).
+
+        Consumes an immutable corrupted-dispatch archive plus an explicit,
+        non-empty caller acknowledgement, re-verifies every mutation-time
+        binding fresh (via :func:`clients.database.acknowledge_native_dispatch_
+        corruption`), records the incident as reconciled/abandoned-for-
+        input-capture WITHOUT marking the task successful, and releases ONLY
+        this exact dispatch's capture barrier. It never sends or delivers
+        anything -- the existing pending follow-up row is left completely
+        untouched for ordinary InboxService delivery to observe exactly once.
+
+        Message-1001's TOCTOU finding: a ``live_status`` read taken BEFORE
+        acquiring the per-terminal input/capture lock can be stale by the
+        time the DB CAS runs -- a concurrent ``send_input``/status detection
+        could change what "live" means in between. This method closes that
+        gap by acquiring ``terminal_input_lock`` (the same per-terminal
+        physical-write/acceptance-fence guard every other native-input entry
+        point serializes against -- see terminal_service.terminal_input_lock)
+        and reading live status only AFTER acquiring it, immediately before
+        the DB call. ``self._worker_lock`` is held OUTER (this class's own
+        existing convention for every state-mutating method) purely to
+        serialize this transition's callback-row view against this class's
+        OTHER worker-lifecycle methods for the same worker; every existing
+        caller of ``_worker_lock`` that also touches a lock for THIS SAME
+        terminal_id only ever does so via ``wait_for_capture_before_input``
+        (which takes only the short-lived ``_worker_locks_guard``, never
+        ``terminal_input_lock`` itself), so this nesting introduces no new
+        lock-order inversion.
+
+        The barrier is released, if at all, strictly INSIDE both locks --
+        never after unlocking, and never across any plugin hook or inbox
+        delivery (none occur in this path at all, unlike ``_drive_delivery``).
+        Only a real transition from unacknowledged to acknowledged
+        (``released_now=True``) releases the barrier; an idempotent replay of
+        an already-acknowledged incident performs no barrier operation at
+        all, so calling this method twice with the same acknowledgement can
+        never double-release or resurrect a barrier for a since-reused
+        worker_terminal_id.
+
+        Raises the same ``NativeDispatchCorruptionGuardError``/``ValueError``
+        as ``acknowledge_native_dispatch_corruption`` on any guard failure or
+        collision -- this method adds no additional silent-success paths.
+        """
+        from cli_agent_orchestrator.clients.database import (
+            acknowledge_native_dispatch_corruption,
+        )
+        from cli_agent_orchestrator.services.terminal_service import terminal_input_lock
+
+        with self._worker_lock(worker_terminal_id):
+            with terminal_input_lock(worker_terminal_id):
+                # Freshly read live status only now, INSIDE the same guard
+                # that serializes every physical native-input write and the
+                # acceptance fence for this terminal -- never a snapshot
+                # read before this lock was acquired.
+                live_status = status_monitor.get_status(worker_terminal_id)
+
+                result = acknowledge_native_dispatch_corruption(
+                    assignment_id=assignment_id,
+                    requesting_caller_id=requesting_caller_id,
+                    live_status=live_status,
+                    transcript_first_user_text=transcript_first_user_text,
+                    expected_transcript_sha256=expected_transcript_sha256,
+                    admissible_dispatch_sha256=admissible_dispatch_sha256,
+                    concatenated_message_id=concatenated_message_id,
+                    concatenated_message_sender_id=concatenated_message_sender_id,
+                    concatenated_message_receiver_id=concatenated_message_receiver_id,
+                    concatenated_message_content=concatenated_message_content,
+                    concatenated_message_delivery_state=concatenated_message_delivery_state,
+                    concatenated_message_session_id=concatenated_message_session_id,
+                    recorded_at=recorded_at,
+                    acknowledgement=acknowledgement,
+                    acknowledged_at=acknowledged_at,
+                )
+                if result.released_now:
+                    self._release_capture_barrier(worker_terminal_id)
+                return result
+
     def start_retry_scheduler(self) -> None:
         """Start the single event-woken retry scheduler on the running loop.
 

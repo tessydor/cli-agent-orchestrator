@@ -49,6 +49,27 @@ never assigned_worker_callbacks.reconciliation_evidence (PR #11) -- reusing
 that field would conflate this with "caller accepted the completion result,"
 which a dispatch-corruption record is not, and would additionally make the
 assignment eligible for retirement as a side effect nobody asked for here.
+
+Correction-997/1001 (the guarded recovery transition): a plain
+CorruptionRecord is an audit trail only -- it does not, by itself, unblock
+the corrupted assignment's next-input capture barrier. The narrow,
+additional, explicit-caller-acknowledged transition that DOES so is
+clients.database.acknowledge_native_dispatch_corruption() (the DB-side
+guard rerun + idempotent-or-refuse CAS, reusing this module's same guards)
+orchestrated end to end by AssignedWorkerCompletionService.
+reconcile_corrupted_dispatch_capture_release() (which owns the per-terminal
+lock acquisition, the fresh live-status read taken INSIDE that lock rather
+than as a stale parameter, the DB call, and the actual capture-barrier
+release -- see that method's own docstring for the full guard-ordering
+rationale). check_acknowledgement_guard() below is the one guard specific
+to that transition (a non-empty, explicit caller acknowledgement is
+required); every identity/evidence/direction/liveness guard is still
+check_recovery_guards() unchanged. The acknowledgement transition NEVER
+marks the task successful, fabricates a final_result/completion, replays
+the concatenated message, changes its historical delivery, or creates any
+new inbox row -- it only ever appends the two acknowledgement columns to
+the SAME durable row and, once, releases the SAME in-memory capture
+barrier record_native_dispatch_corruption never touches.
 """
 
 from __future__ import annotations
@@ -80,6 +101,7 @@ GUARD_LIVE_TERMINAL_ACTIVITY = "live_terminal_activity"
 GUARD_CLAIM_UNBOUND = "concatenated_message_claim_unbound"
 GUARD_CONTENT_MISMATCH = "concatenated_message_content_mismatch"
 GUARD_WRONG_DIRECTION = "concatenated_message_wrong_direction"
+GUARD_ACKNOWLEDGEMENT_MISSING = "caller_acknowledgement_missing"
 
 _ELIGIBLE_LIFECYCLES = (
     AssignmentLifecycle.DISPATCHED,
@@ -270,12 +292,36 @@ def check_recovery_guards(
     return RecoveryGuardResult(True, None, "all guards passed")
 
 
+def check_acknowledgement_guard(acknowledgement: Optional[str]) -> RecoveryGuardResult:
+    """The one guard specific to the capture-release transition (correction-
+    997): a non-empty, explicit caller acknowledgement is required. Kept
+    separate from check_recovery_guards() because the plain record-only
+    path (record_native_dispatch_corruption) never needs an acknowledgement
+    at all -- only the transition that actually releases the capture
+    barrier does.
+    """
+    if not acknowledgement or not acknowledgement.strip():
+        return RecoveryGuardResult(
+            False,
+            GUARD_ACKNOWLEDGEMENT_MISSING,
+            "an explicit, non-empty caller acknowledgement is required to release the "
+            "capture barrier -- this is not implied by merely matching the recorded caller",
+        )
+    return RecoveryGuardResult(True, None, "acknowledgement present")
+
+
 @dataclass(frozen=True)
 class CorruptionRecord:
     """Truthful, nonduplicating archive of one native-dispatch corruption
     incident. Never a completion, never a report, never itself a release of
     any pending message's delivery barrier -- purely an audit record of what
     was independently proven.
+
+    ``caller_acknowledgement``/``capture_release_acknowledged_at`` are None
+    for a plain (record-only) row and are filled in ONLY by the separate,
+    explicit-acknowledgement capture-release transition (correction-997) --
+    their presence is itself the durable, idempotent proof that transition
+    already ran once for this exact incident.
     """
 
     assignment_id: str
@@ -292,6 +338,8 @@ class CorruptionRecord:
     concatenated_message_delivery_state: str
     concatenated_message_session_id: Optional[str]
     recorded_at: str
+    caller_acknowledgement: Optional[str] = None
+    capture_release_acknowledged_at: Optional[str] = None
 
     def record_key(self) -> str:
         """Deterministic identity for idempotency/conflict checks -- one

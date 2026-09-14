@@ -54,6 +54,21 @@ from cli_agent_orchestrator.services.status_monitor import status_monitor
 pytestmark = pytest.mark.usefixtures("isolated_memory_db")
 
 
+def _apply_detection_with_fresh_evidence(terminal_id: str, detected: TerminalStatus) -> None:
+    """Clearly-scoped test helper (correction-1001): tests that simulate the
+    real chunk-driven detection loop by calling status_monitor.
+    _apply_detection() directly bypass _process_chunk entirely, so they
+    never stamp _buffer_changed_at the way a genuine chunk arrival would --
+    and since correction-1001, a missing freshness timestamp now fails
+    CLOSED (same as UNKNOWN), exactly like real production code. Tests that
+    mean to simulate GENUINE post-arm acceptance evidence must supply that
+    freshness explicitly, here, rather than relying on any implicit
+    fail-open default that no longer exists.
+    """
+    status_monitor._buffer_changed_at[terminal_id] = time.monotonic()
+    status_monitor._apply_detection(terminal_id, detected)
+
+
 class TestNativeInputNeverOverlapsForSameTerminal:
     """send_input must never let two callers' tmux writes overlap for one terminal."""
 
@@ -337,7 +352,7 @@ class TestDispatchIdentityImmutableUnderConcurrentFollowUp:
             # dispatch's acceptance (a genuine PROCESSING transition) --
             # deliberately, only now, releasing the fence armed by the
             # ASSIGN call's own notify_input_sent.
-            status_monitor._apply_detection(terminal_id, TerminalStatus.PROCESSING)
+            _apply_detection_with_fresh_evidence(terminal_id, TerminalStatus.PROCESSING)
 
             terminal_service.send_input(
                 terminal_id, follow_up_text, orchestration_type=OrchestrationType.SEND_MESSAGE
@@ -419,7 +434,7 @@ class TestNativeAcceptanceFence:
                 )
 
                 # NOW deliberately deliver the controlled acceptance event.
-                status_monitor._apply_detection(terminal_id, TerminalStatus.PROCESSING)
+                _apply_detection_with_fresh_evidence(terminal_id, TerminalStatus.PROCESSING)
                 future.result(timeout=5)
 
             assert writes == [
@@ -482,7 +497,7 @@ class TestNativeAcceptanceFence:
                 )
 
                 # A genuine post-arm transition still releases it correctly.
-                status_monitor._apply_detection(terminal_id, TerminalStatus.PROCESSING)
+                _apply_detection_with_fresh_evidence(terminal_id, TerminalStatus.PROCESSING)
                 future.result(timeout=5)
 
             assert writes == [first_text, second_text]
@@ -547,6 +562,66 @@ class TestNativeAcceptanceFence:
                 # Genuinely fresh (post-arm) evidence still releases it.
                 status_monitor._buffer_changed_at[terminal_id] = time.monotonic()
                 status_monitor._apply_detection(terminal_id, TerminalStatus.COMPLETED)
+                future.result(timeout=5)
+
+            assert writes == [first_text, second_text]
+        finally:
+            status_monitor.clear_terminal(terminal_id)
+
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_missing_evidence_timestamp_never_releases_but_explicit_evidence_does(
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_pm,
+        mock_update,
+    ):
+        """Correction-1001 item 1: a non-IDLE detection with NO freshness
+        evidence at all (no _buffer_changed_at entry -- distinct from the
+        UNKNOWN case above, and from the deliberately-STALE-timestamped case
+        below) must fail CLOSED exactly like UNKNOWN, not fail open. Only an
+        explicit, fresh post-arm timestamp may release it.
+        """
+        terminal_id = "fence-terminal-missing-evidence"
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        provider = mock_pm.get_provider.return_value
+        provider.paste_enter_count = 1
+        provider.paste_submit_delay = 0.0
+
+        writes: list[str] = []
+        mock_tmux.send_keys.side_effect = lambda session, window, message, **kw: writes.append(
+            message
+        )
+
+        first_text = "initial assignment dispatch"
+        second_text = "message874 follow-up"
+
+        try:
+            terminal_service.send_input(terminal_id, first_text)
+            assert writes == [first_text]
+            # No _buffer_changed_at entry exists for this terminal_id at
+            # all -- this is the "missing", not merely "stale", case.
+            assert terminal_id not in status_monitor._buffer_changed_at
+
+            status_monitor._apply_detection(terminal_id, TerminalStatus.PROCESSING)
+
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(terminal_service.send_input, terminal_id, second_text)
+                with pytest.raises(TimeoutError):
+                    future.result(timeout=0.5)
+                assert writes == [first_text], (
+                    "follow-up pasted after a non-IDLE detection with NO freshness evidence -- "
+                    "missing evidence must fail closed, not fail open"
+                )
+
+                # Explicit, fresh post-arm evidence still releases it.
+                _apply_detection_with_fresh_evidence(terminal_id, TerminalStatus.COMPLETED)
                 future.result(timeout=5)
 
             assert writes == [first_text, second_text]
@@ -901,7 +976,7 @@ class TestCompletionCaptureRecheckedAfterAcceptanceWait:
                 # the acceptance fence (COMPLETED != IDLE) AND arms the
                 # capture barrier (announce_terminal_status, called
                 # synchronously from inside _apply_detection_locked).
-                status_monitor._apply_detection(terminal_id, TerminalStatus.COMPLETED)
+                _apply_detection_with_fresh_evidence(terminal_id, TerminalStatus.COMPLETED)
 
                 # Acceptance is now satisfied, but the capture barrier is
                 # STILL armed (nothing has released it yet) -- the

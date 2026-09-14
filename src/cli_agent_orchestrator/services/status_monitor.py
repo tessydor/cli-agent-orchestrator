@@ -367,22 +367,28 @@ class StatusMonitor:
             pending = self._acceptance_pending.get(terminal_id)
             if pending is not None:
                 event, armed_at = pending
-                # Correction-994: only release for evidence that is at least
-                # as recent as this fence's own arming. _buffer_changed_at is
-                # stamped by _process_chunk BEFORE it schedules the detection
-                # that leads here, so for any chunk-driven detection this
-                # closes the cross-thread race where a chunk already queued
-                # BEFORE notify_input_sent's arm has its actual processing
-                # (an independent thread/asyncio scheduling artifact, not
-                # reflecting this dispatch at all) delayed until after arm.
-                # No timestamp recorded at all (a detection reached this
-                # point some other way than the chunk pipeline, e.g. a
-                # direct/test-only _apply_detection call) fails OPEN here --
-                # this check can only ever narrow an otherwise-valid
-                # release, never manufacture one that would not already
-                # have fired.
+                # Correction-994/1001: only release for evidence that is
+                # PROVEN at least as recent as this fence's own arming.
+                # _buffer_changed_at is stamped by _process_chunk BEFORE it
+                # schedules the detection that leads here, so for any
+                # chunk-driven detection this closes the cross-thread race
+                # where a chunk already queued BEFORE notify_input_sent's
+                # arm has its actual processing (an independent thread/
+                # asyncio scheduling artifact, not reflecting this dispatch
+                # at all) delayed until after arm. Missing freshness evidence
+                # (no _buffer_changed_at entry at all -- a detection that
+                # reached this point some other way than the real chunk
+                # pipeline) fails CLOSED, exactly like UNKNOWN above: absence
+                # of proof is not proof of freshness, and this is the same
+                # fail-closed boundary that bars UNKNOWN from releasing.
+                # Direct/test-only callers that mean to simulate a genuine
+                # post-arm detection must supply real freshness evidence
+                # themselves (e.g. via a small, clearly-scoped test helper)
+                # rather than relying on this ever treating "no evidence" as
+                # "fresh enough" -- that would let an unproven repeated
+                # non-IDLE observation manufacture acceptance.
                 changed_at = self._buffer_changed_at.get(terminal_id)
-                if changed_at is None or changed_at >= armed_at:
+                if changed_at is not None and changed_at >= armed_at:
                     event.set()
 
         return True
