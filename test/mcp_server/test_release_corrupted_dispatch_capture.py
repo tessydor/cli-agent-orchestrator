@@ -237,3 +237,71 @@ class TestReleaseCorruptedDispatchCaptureLiveEntryPoint:
             assert len(delivered_948) == 1
         finally:
             assigned_worker_completion_service._release_capture_barrier(WORKER_ID)
+
+
+class TestReleaseCorruptedDispatchCaptureMachineBearer:
+    """Message 1024: evidence that the supported MCP call still works
+    through the EXISTING machine-bearer mechanism when auth is enabled --
+    not previously tested anywhere, since ``mcp_over_testclient`` (used
+    by every other test in this file) never enables auth and its
+    ``_dispatch`` wrapper does not forward request headers, so it cannot
+    see whether a bearer was attached at all.
+
+    Mocks only the true network boundary (``requests.post`` itself), so
+    the REAL identity derivation (``_own_terminal_id_or_error`` reading
+    ``CAO_TERMINAL_ID``) and the REAL request construction
+    (``mcp_utils.post_body_json`` -> ``_auth_headers`` ->
+    ``get_local_bearer``) both run completely unmodified -- the same
+    existing mechanism every other MCP tool already relies on, not
+    anything new invented for this route.
+    """
+
+    def test_attaches_the_existing_machine_bearer_and_environment_derived_caller(self, monkeypatch):
+        monkeypatch.setenv("CAO_TERMINAL_ID", CALLER_ID)
+        monkeypatch.setenv("CAO_AUTH_JWKS_URI", "https://idp.example/jwks")
+        monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", "synthetic-admin-machine-token")
+
+        captured: dict = {}
+
+        class _FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def raise_for_status() -> None:
+                pass
+
+            @staticmethod
+            def json() -> dict:
+                return {
+                    "success": True,
+                    "released_now": True,
+                    "record_key": "fake-record-key",
+                    "assignment_id": ASSIGNMENT_ID,
+                    "worker_terminal_id": WORKER_ID,
+                    "caller_acknowledgement": "synthetic ack",
+                    "capture_release_acknowledged_at": "2026-09-14T00:01:00+00:00",
+                }
+
+        def fake_post(url, json=None, headers=None, timeout=None):
+            captured["url"] = url
+            captured["json"] = json
+            captured["headers"] = headers
+            return _FakeResponse()
+
+        from cli_agent_orchestrator.mcp_server import server
+
+        monkeypatch.setattr(server.mcp_utils.requests, "post", fake_post)
+
+        result = _call()
+
+        # The existing machine-bearer mechanism -- used identically by
+        # EVERY other MCP tool, unmodified here -- attached the
+        # configured CAO_AUTH_LOCAL_TOKEN as a bearer.
+        assert captured["headers"] == {
+            "Authorization": "Bearer synthetic-admin-machine-token"
+        }, "the MCP->API internal call did not carry the existing machine bearer"
+        # The exact environment-derived caller claim -- never a
+        # client-settable tool argument -- reached the body.
+        assert captured["json"]["requesting_caller_id"] == CALLER_ID
+        assert captured["url"].endswith(f"/assigned-workers/{WORKER_ID}/corruption-recovery")
+        assert result["success"] is True

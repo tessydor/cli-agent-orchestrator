@@ -6691,12 +6691,37 @@ class CorruptionCaptureReleaseRequest(BaseModel):
     deletes any terminal outright for any ADMIN-scoped caller). This is
     the smallest existing, architecture-consistent boundary available --
     not a claim that admin scope cryptographically proves the supplied
-    ``requesting_caller_id``. ``check_recovery_guards``'
-    ``GUARD_CALLER_MISMATCH`` remains a real, load-bearing backstop even
-    for an admin caller: a ``requesting_caller_id`` that does not match
-    the assignment's actual immutable recorded caller is refused
-    regardless of scope, so a mistaken or dishonest admin assertion still
-    cannot acknowledge/release on behalf of a caller it does not match.
+    ``requesting_caller_id``, and not a claim that ``requesting_caller_id``
+    equality authenticates the HTTP requester at all (correction-1024:
+    documenting this truthfully, not merely narrowing the scope).
+
+    The truthful framing: ``cao:admin`` authorizes WHO may perform this
+    administrative recovery action at all. ``check_recovery_guards``'
+    ``GUARD_CALLER_MISMATCH`` is an entirely separate, real, load-bearing
+    guard that answers a different question -- WHICH incident/recorded
+    caller this specific administrative action targets. It is a
+    provenance/target guard, not authentication of the requester: an
+    admin-scoped caller can only ever act on the exact incident whose
+    immutable recorded caller matches the supplied ``requesting_caller_
+    id``, but nothing here proves that caller supplied that value
+    honestly rather than an admin performing the recovery ON BEHALF OF
+    (for) that recorded caller/incident -- which is exactly what this
+    operation is: an administrative recovery, performed for the exact
+    recorded caller and incident identified by the match, not a
+    self-service action authenticated as that caller.
+
+    One further honest limitation, inherent to ``require_any_scope``/
+    ``is_auth_enabled`` everywhere in this codebase (see docs/
+    configuration.md's own callout on this), not unique to this route:
+    when auth is DISABLED (the default), the ``cao:admin`` requirement
+    above is INERT -- ``require_any_scope`` grants the full scope set
+    unconditionally, so this route (like every other scope-gated route)
+    admits any caller who can reach the port at all. That default-off
+    posture is an operational limitation of running without auth
+    enabled, never a claim that a same-user local process (e.g. the MCP
+    server's own loopback hop) is thereby cryptographically authenticated
+    -- it is trusted only because it IS the same local deployment, the
+    same trust boundary every other MCP->API call already relies on.
     """
 
     assignment_id: str
@@ -6731,9 +6756,10 @@ async def reconcile_corrupted_dispatch_capture_release_endpoint(
     # Request's docstring for the full evidence trail.
     _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
 ) -> Dict:
-    """Acknowledge an immutable native-dispatch corruption archive and
-    idempotently release ONLY that exact dispatch's capture barrier
-    (correction-997/1001/1007/1020).
+    """Perform the administrative native-dispatch-corruption recovery
+    action for the exact recorded caller/incident identified by the
+    request, idempotently releasing ONLY that exact dispatch's capture
+    barrier (correction-997/1001/1007/1020/1024).
 
     The one supported live entry point for the guarded recovery
     transition already required by 997/1007 -- previously defined and
@@ -6750,6 +6776,13 @@ async def reconcile_corrupted_dispatch_capture_release_endpoint(
     delivering any existing pending follow-up, exactly once, through its
     own unrelated normal path -- this endpoint never sends or delivers
     anything itself.
+
+    ``cao:admin`` authorizes performing this administrative action at
+    all; ``GUARD_CALLER_MISMATCH`` (inside the call below) separately
+    targets it to the exact recorded caller/incident -- see
+    ``CorruptionCaptureReleaseRequest``'s docstring for why these are two
+    distinct guards, neither of which is cryptographic authentication of
+    the HTTP requester, and for the honest auth-disabled caveat.
     """
     try:
         result = await asyncio.to_thread(

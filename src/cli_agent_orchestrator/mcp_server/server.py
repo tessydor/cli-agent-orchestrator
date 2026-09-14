@@ -1074,17 +1074,23 @@ def release_corrupted_dispatch_capture(
     responsible for delivering it, exactly once, on its own normal
     schedule -- this tool never sends or delivers anything itself.
 
-    Authorization is bound to YOUR OWN CAO identity (``CAO_TERMINAL_ID``):
-    you can only recover an assignment you are the immutable recorded
-    caller of, verified server-side against the database record -- not
-    merely accepted from this call's arguments. The underlying REST route
-    additionally requires ``cao:admin`` scope when auth is enabled
+    Authorization here is bound to YOUR OWN CAO identity
+    (``CAO_TERMINAL_ID``): the ``requesting_caller_id`` this tool sends is
+    never a client-settable argument, so an MCP-mediated call cannot lie
+    about who is asking -- but the recorded-caller match this performs
+    server-side (``GUARD_CALLER_MISMATCH``) TARGETS the recovery to the
+    exact matching incident, it does not itself authenticate you as an
+    HTTP requester (correction-1024). The underlying REST route
+    separately requires ``cao:admin`` scope when auth is enabled
     (correction-1020: this codebase's auth layer has no per-terminal
-    identity binding, only flat scopes, so the route is deliberately
-    restricted to the same trusted-operator tier as other no-ownership-
-    check terminal operations) -- when auth is enabled, the MCP->API
-    internal credential (``CAO_AUTH_LOCAL_TOKEN``) must carry that scope
-    for this tool to succeed.
+    identity binding, only flat scopes, so the route is restricted to the
+    same trusted-operator tier as other no-ownership-check terminal
+    operations) -- when auth is enabled, the MCP->API internal credential
+    (``CAO_AUTH_LOCAL_TOKEN``) must carry that scope for this tool to
+    succeed; when auth is disabled (the default), that requirement is
+    inert like every other scope-gated route in this codebase, not a
+    claim that the local MCP->API hop is thereby authenticated -- it is
+    trusted only because it is the same local deployment.
     """
     own_terminal_id = _own_terminal_id_or_error("release corrupted dispatch capture")
     if isinstance(own_terminal_id, dict):
