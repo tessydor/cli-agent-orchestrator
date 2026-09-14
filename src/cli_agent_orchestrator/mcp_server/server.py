@@ -1054,7 +1054,7 @@ def release_corrupted_dispatch_capture(
 ) -> Dict[str, Any]:
     """Acknowledge an immutable native-dispatch corruption archive and
     idempotently release ONLY that exact dispatch's capture barrier
-    (correction-997/1001/1007).
+    (correction-997/1001/1007/1020).
 
     Use this ONLY for a worker whose native input was proven corrupted (an
     unrelated follow-up message physically concatenated into its dispatch
@@ -1077,7 +1077,14 @@ def release_corrupted_dispatch_capture(
     Authorization is bound to YOUR OWN CAO identity (``CAO_TERMINAL_ID``):
     you can only recover an assignment you are the immutable recorded
     caller of, verified server-side against the database record -- not
-    merely accepted from this call's arguments.
+    merely accepted from this call's arguments. The underlying REST route
+    additionally requires ``cao:admin`` scope when auth is enabled
+    (correction-1020: this codebase's auth layer has no per-terminal
+    identity binding, only flat scopes, so the route is deliberately
+    restricted to the same trusted-operator tier as other no-ownership-
+    check terminal operations) -- when auth is enabled, the MCP->API
+    internal credential (``CAO_AUTH_LOCAL_TOKEN``) must carry that scope
+    for this tool to succeed.
     """
     own_terminal_id = _own_terminal_id_or_error("release corrupted dispatch capture")
     if isinstance(own_terminal_id, dict):

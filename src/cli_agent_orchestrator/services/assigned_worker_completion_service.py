@@ -12,7 +12,7 @@ import logging
 import re
 import threading
 import time
-from typing import Any, Optional, Tuple
+from typing import Any, NamedTuple, Optional, Tuple
 
 from sqlalchemy.exc import OperationalError
 
@@ -66,6 +66,22 @@ _DELIVERY_TERMINAL_STATES = frozenset(
         CompletionDeliveryState.TERMINAL_ERROR,
     }
 )
+
+
+class CaptureWaitResult(NamedTuple):
+    """Result of ``_wait_for_capture_before_input_detailed`` (correction-
+    1017). ``ready`` is the same meaning as the public
+    ``wait_for_capture_before_input``'s bare bool. ``blocked`` is True only
+    when this call actually entered ``Condition.wait()`` -- i.e. genuinely
+    relinquished and reacquired ``terminal_input_lock`` -- and therefore
+    signals that a caller's earlier-cached validation (native-acceptance
+    check, ``current_status`` read) must be discarded and rechecked fresh
+    before any physical paste, since a concurrent holder could have run an
+    entire dispatch cycle during the gap.
+    """
+
+    ready: bool
+    blocked: bool
 
 
 class _CaptureBarrier:
@@ -180,19 +196,52 @@ class AssignedWorkerCompletionService:
         actually release it (``reconcile_corrupted_dispatch_capture_
         release``, which needs this identical lock for its own guarded
         read-then-CAS).
+
+        This bare-bool form is kept, unchanged, for ``InboxService`` and
+        every existing test: it is used there only as a cheap PRE-filter
+        (whether to even attempt a delivery at all), with the REAL safety
+        boundary living entirely inside ``send_input``'s own recheck
+        (994-B) -- so ``InboxService`` never needed the richer "was the
+        lock actually relinquished" signal below. ``send_input`` itself
+        calls ``_wait_for_capture_before_input_detailed`` directly, since
+        it DOES need that signal (correction-1017).
+        """
+        return self._wait_for_capture_before_input_detailed(worker_terminal_id, timeout).ready
+
+    def _wait_for_capture_before_input_detailed(
+        self, worker_terminal_id: str, timeout: float = 5.0
+    ) -> CaptureWaitResult:
+        """Same wait as ``wait_for_capture_before_input``, plus ``blocked``:
+        whether this call actually entered ``condition.wait()`` at least
+        once -- i.e. whether ``terminal_input_lock`` was genuinely
+        relinquished during this call (correction-1017).
+
+        ``blocked=False`` covers BOTH "no barrier exists at all" and "a
+        barrier exists but was already released before this call had to
+        wait" -- in neither case did this call give up the lock, so
+        nothing computed by the caller before or during this call can have
+        been invalidated by a concurrent lock holder. ``blocked=True``
+        means the lock WAS relinquished (via ``Condition.wait()``) and
+        reacquired before returning -- any state a caller cached before
+        this call (a native-acceptance check, a ``current_status`` read)
+        must be treated as stale and rechecked from scratch, since another
+        thread could have run an entire ``send_input`` cycle (including
+        arming a brand-new native-acceptance fence) during the gap.
         """
         with self._worker_locks_guard:
             barrier = self._capture_barriers.get(worker_terminal_id)
         if barrier is None:
-            return True
+            return CaptureWaitResult(ready=True, blocked=False)
         deadline = time.monotonic() + timeout
+        blocked = False
         with barrier.condition:
             while not barrier.released:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    return False
+                    return CaptureWaitResult(ready=False, blocked=blocked)
+                blocked = True
                 barrier.condition.wait(timeout=remaining)
-        return True
+        return CaptureWaitResult(ready=True, blocked=blocked)
 
     def _release_capture_barrier(self, worker_terminal_id: str) -> None:
         with self._worker_locks_guard:

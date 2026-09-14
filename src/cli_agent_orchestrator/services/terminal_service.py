@@ -2541,22 +2541,6 @@ def send_input(
     """
     with terminal_input_lock(terminal_id):
         try:
-            # Native acceptance/order fence (correction-984). The lock above
-            # only guarantees no OTHER send_input() call for this terminal_id
-            # is physically writing right now; it says nothing about whether
-            # a PRIOR dispatch (from before this call acquired the lock) has
-            # actually been accepted by the terminal's native process yet.
-            # Check this BEFORE touching anything of our own, so a still-
-            # pending prior turn can never be raced by this one's paste.
-            if not status_monitor.wait_for_native_acceptance(
-                terminal_id, timeout=NATIVE_ACCEPTANCE_TIMEOUT_S
-            ):
-                raise NativeAcceptanceTimeoutError(
-                    f"Terminal {terminal_id}: a prior dispatch was not confirmed "
-                    f"accepted within {NATIVE_ACCEPTANCE_TIMEOUT_S}s; refusing to "
-                    "paste to avoid landing inside an unconfirmed composer."
-                )
-
             metadata = get_terminal_metadata(terminal_id)
             if not metadata:
                 raise ValueError(f"Terminal '{terminal_id}' not found")
@@ -2574,7 +2558,50 @@ def send_input(
                 else str(orchestration_type or "")
             )
 
-            if provider:
+            # Acceptance/status/capture validation as one coherent,
+            # retryable guard sequence (correction-1017). The capture wait
+            # below (``_wait_for_capture_before_input_detailed``) can
+            # genuinely relinquish and reacquire ``terminal_input_lock``
+            # (correction-1007's Condition-based fix) to avoid starving the
+            # one path that releases it -- but that means a DIFFERENT
+            # send_input() call for this SAME terminal_id can run an entire
+            # dispatch cycle (including arming a brand-new native-
+            # acceptance fence) during the gap. Everything checked BEFORE
+            # or DURING that gap -- the acceptance check above it, and the
+            # ``current_status`` read below -- is then stale and must be
+            # discarded, not acted on. Looping back to the top re-derives
+            # both from scratch; only a pass that never had to relinquish
+            # the lock (``blocked=False``) is trustworthy enough to proceed
+            # past this point. This does not spin unconditionally: each
+            # iteration either raises (a bounded sub-timeout expired) or
+            # made real, bounded progress via a genuine wait -- a COMPLETED
+            # status with NO capture barrier at all reports
+            # ``blocked=False`` immediately (nothing to relinquish) and
+            # exits the loop right away, exactly like the non-COMPLETED
+            # case, rather than being mistaken for staleness.
+            while True:
+                # Native acceptance/order fence (correction-984). The lock
+                # above only guarantees no OTHER send_input() call for this
+                # terminal_id is physically writing right now; it says
+                # nothing about whether a PRIOR dispatch (from before this
+                # call acquired the lock, or armed during a relinquished
+                # capture wait below) has actually been accepted by the
+                # terminal's native process yet. Checked first every
+                # iteration, so a still-pending turn -- including one a
+                # concurrent contender just started -- can never be raced
+                # by this call's own paste.
+                if not status_monitor.wait_for_native_acceptance(
+                    terminal_id, timeout=NATIVE_ACCEPTANCE_TIMEOUT_S
+                ):
+                    raise NativeAcceptanceTimeoutError(
+                        f"Terminal {terminal_id}: a prior dispatch was not confirmed "
+                        f"accepted within {NATIVE_ACCEPTANCE_TIMEOUT_S}s; refusing to "
+                        "paste to avoid landing inside an unconfirmed composer."
+                    )
+
+                if not provider:
+                    break
+
                 current_status = status_monitor.get_status(terminal_id)
 
                 # Re-check completion-capture eligibility HERE, after the
@@ -2594,13 +2621,22 @@ def send_input(
                         assigned_worker_completion_service,
                     )
 
-                    if not assigned_worker_completion_service.wait_for_capture_before_input(
-                        terminal_id
-                    ):
+                    wait_result = (
+                        assigned_worker_completion_service._wait_for_capture_before_input_detailed(
+                            terminal_id
+                        )
+                    )
+                    if not wait_result.ready:
                         raise TerminalCaptureNotDurableError(
                             f"Terminal {terminal_id} is COMPLETED but its final report "
                             "is not yet durably captured; refusing to paste."
                         )
+                    if wait_result.blocked:
+                        # The lock was genuinely relinquished during this
+                        # wait -- everything above (including the
+                        # acceptance check) may now be stale. Discard it
+                        # and start this iteration over from the top.
+                        continue
 
                 # Guard: refuse to type into a terminal whose provider process has
                 # exited. Without this check, queued messages would be pasted into
@@ -2622,6 +2658,10 @@ def send_input(
                         "Use answer_user_prompt to submit a selection or approval before "
                         f"sending {orchestration_value} input."
                     )
+
+                # A clean pass: nothing above needed to relinquish the lock,
+                # so nothing checked in this iteration can be stale.
+                break
 
             # Inject memory context into the very first user message after init.
             # Phase 1 wires injection inline for every provider. The Kiro

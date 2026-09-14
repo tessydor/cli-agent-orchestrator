@@ -43,4 +43,5 @@ jobs:
             test/clients/test_native_dispatch_corruption_persistence.py \
             test/services/test_native_dispatch_recovery.py \
             test/services/test_native_dispatch_capture_release_e2e.py \
-            test/mcp_server/test_release_corrupted_dispatch_capture.py
+            test/mcp_server/test_release_corrupted_dispatch_capture.py \
+            test/api/test_corruption_recovery_route_auth.py

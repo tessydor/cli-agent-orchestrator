@@ -6665,20 +6665,38 @@ async def get_assigned_worker_completion_callback_endpoint(
 
 class CorruptionCaptureReleaseRequest(BaseModel):
     """Body for the guarded native-dispatch corruption capture-release
-    transition (correction-997/1001/1007) -- the one supported live entry
-    point for AssignedWorkerCompletionService.reconcile_corrupted_
+    transition (correction-997/1001/1007/1020) -- the one supported live
+    entry point for AssignedWorkerCompletionService.reconcile_corrupted_
     dispatch_capture_release.
 
-    ``requesting_caller_id`` is supplied here by the calling MCP tool
-    (derived from ITS OWN ``CAO_TERMINAL_ID``, never a client-settable
-    tool argument -- see ``mcp_server.server``'s
-    ``release_corrupted_dispatch_capture``, and the identical existing
-    pattern in ``get_worker_question``/``answer_worker_question``'s own
-    ``caller_id``). This is not itself the authorization boundary: the
-    guarded transition re-verifies it against the assignment's actual
-    immutable recorded caller_id (``check_recovery_guards``'
-    ``GUARD_CALLER_MISMATCH``) before anything is acknowledged or
-    released, so a spoofed value here is refused, never accepted.
+    ``requesting_caller_id`` is a plain body field. For the MCP tool
+    (``mcp_server.server.release_corrupted_dispatch_capture``) it is
+    populated from THAT PROCESS's own ``CAO_TERMINAL_ID`` -- never a
+    client-settable tool argument -- so an MCP-mediated call cannot lie
+    about who is asking. A direct REST caller has no equivalent
+    constraint: this codebase's auth layer (``security/auth.py``) grants
+    only flat scopes (``cao:read``/``cao:write``/``cao:admin``) from the
+    bearer token -- ``get_current_scopes``/``extract_scopes_from_token``
+    extract scope claims only, never a subject/terminal-identity claim --
+    so nothing at the transport layer ties a request to a specific
+    terminal. A body field can therefore never itself be "identity" for a
+    direct caller (message 1020's finding, verified against the real
+    ``get_current_scopes`` implementation, not assumed).
+
+    Because of that gap, this route is deliberately ADMIN-only (see the
+    route's own scope dependency) rather than WRITE-or-ADMIN: the SAME
+    already-established trust tier this codebase uses for other
+    consequential, no-ownership-check terminal operations
+    (``DELETE /terminals/{id}`` takes no caller parameter at all and
+    deletes any terminal outright for any ADMIN-scoped caller). This is
+    the smallest existing, architecture-consistent boundary available --
+    not a claim that admin scope cryptographically proves the supplied
+    ``requesting_caller_id``. ``check_recovery_guards``'
+    ``GUARD_CALLER_MISMATCH`` remains a real, load-bearing backstop even
+    for an admin caller: a ``requesting_caller_id`` that does not match
+    the assignment's actual immutable recorded caller is refused
+    regardless of scope, so a mistaken or dishonest admin assertion still
+    cannot acknowledge/release on behalf of a caller it does not match.
     """
 
     assignment_id: str
@@ -6701,11 +6719,21 @@ class CorruptionCaptureReleaseRequest(BaseModel):
 async def reconcile_corrupted_dispatch_capture_release_endpoint(
     worker_terminal_id: TerminalId,
     body: CorruptionCaptureReleaseRequest,
-    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+    # ADMIN-only, not WRITE-or-ADMIN (correction-1020): the auth layer has
+    # no per-terminal subject binding at all (verified against security/
+    # auth.py -- get_current_scopes returns flat scopes only), so a WRITE-
+    # scoped direct REST caller could otherwise supply ANY requesting_
+    # caller_id in the body and satisfy GUARD_CALLER_MISMATCH simply by
+    # knowing/guessing it. Narrowing to ADMIN matches this codebase's own
+    # existing precedent for consequential, no-ownership-check terminal
+    # operations (DELETE /terminals/{id} takes no caller parameter and
+    # authorizes purely on ADMIN scope) -- see CorruptionCaptureRelease
+    # Request's docstring for the full evidence trail.
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
 ) -> Dict:
     """Acknowledge an immutable native-dispatch corruption archive and
     idempotently release ONLY that exact dispatch's capture barrier
-    (correction-997/1001/1007).
+    (correction-997/1001/1007/1020).
 
     The one supported live entry point for the guarded recovery
     transition already required by 997/1007 -- previously defined and

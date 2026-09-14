@@ -1000,3 +1000,169 @@ class TestCompletionCaptureRecheckedAfterAcceptanceWait:
         finally:
             status_monitor.clear_terminal(terminal_id)
             assigned_worker_completion_service._release_capture_barrier(terminal_id)
+
+
+class TestTwoContendersGuardSequenceIsCoherentAcrossACaptureRelease:
+    """Correction-1017: the Condition-based capture wait (correction-1007)
+    genuinely relinquishes terminal_input_lock while blocked, so a SECOND
+    concurrent send_input() contender for the SAME terminal can run its
+    OWN acceptance/status checks -- and enter the SAME capture wait --
+    while the FIRST contender is still parked there. One capture release
+    wakes both; only ONE may physically submit before a fresh native-
+    acceptance event confirms that submission. The existing one-waiter
+    test above (TestCompletionCaptureRecheckedAfterAcceptanceWait) cannot
+    see this: it never has two contenders both actually block on the same
+    barrier. Uses only real threading.Event/Barrier synchronization and
+    bounded future.result() timeouts -- no sleeps as the proof.
+    """
+
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_two_contenders_one_release_one_submit_then_fresh_acceptance_then_the_other(
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_pm,
+        mock_status_pm,
+        mock_update,
+    ):
+        from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+            assigned_worker_completion_service,
+        )
+
+        # Same rationale as the sibling one-waiter test above: status_monitor.py
+        # imports provider_manager independently, so its own event-inbox branch
+        # must be forced off deterministically.
+        mock_status_pm.get_provider.return_value = None
+
+        terminal_id = "two-contender-terminal"
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        provider = mock_pm.get_provider.return_value
+        provider.paste_enter_count = 1
+        provider.paste_submit_delay = 0.0
+        provider.assume_processing_on_dispatch = False
+
+        writes: list[str] = []
+        mock_tmux.send_keys.side_effect = lambda session, window, message, **kw: writes.append(
+            message
+        )
+
+        first_text = "initial assignment dispatch"
+        contender_a_text = "contender A queued follow-up"
+        contender_b_text = "contender B queued follow-up"
+
+        # Instrument the REAL _wait_for_capture_before_input_detailed to signal
+        # when each of the first two callers is about to enter the real
+        # Condition.wait() -- the deterministic "both contenders are now
+        # genuinely parked on the same barrier" proof this test needs, without
+        # ever touching the underlying wait/notify logic itself.
+        real_detailed_wait = (
+            assigned_worker_completion_service._wait_for_capture_before_input_detailed
+        )
+        entered_wait = [threading.Event(), threading.Event()]
+        call_order: list[str] = []
+        call_order_lock = threading.Lock()
+
+        def instrumented_detailed_wait(worker_terminal_id, timeout=5.0):
+            with call_order_lock:
+                index = len(call_order)
+                call_order.append(worker_terminal_id)
+            if index < 2:
+                entered_wait[index].set()
+            return real_detailed_wait(worker_terminal_id, timeout)
+
+        try:
+            assigned_worker_completion_service.register_assignment(terminal_id)
+
+            terminal_service.send_input(terminal_id, first_text)
+            assert writes == [first_text]
+
+            # Complete the first turn: releases the acceptance fence AND
+            # arms the capture barrier (announce_terminal_status, called
+            # synchronously from inside _apply_detection_locked) for this
+            # known/registered worker.
+            _apply_detection_with_fresh_evidence(terminal_id, TerminalStatus.COMPLETED)
+
+            with patch.object(
+                assigned_worker_completion_service,
+                "_wait_for_capture_before_input_detailed",
+                instrumented_detailed_wait,
+            ):
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    future_a = pool.submit(
+                        terminal_service.send_input, terminal_id, contender_a_text
+                    )
+                    future_b = pool.submit(
+                        terminal_service.send_input, terminal_id, contender_b_text
+                    )
+
+                    # Both contenders must ACTUALLY enter the real capture
+                    # wait -- i.e. both genuinely relinquished
+                    # terminal_input_lock via Condition.wait() -- before
+                    # this test releases the barrier. This is the concrete
+                    # two-waiter interleaving 1017 requires; the lock
+                    # itself already serializes each contender's own
+                    # acceptance+status read strictly before it can reach
+                    # this point, so waiting for both signals is sufficient
+                    # (no sleep-based timing assumption).
+                    assert entered_wait[0].wait(
+                        timeout=5
+                    ), "contender 1 never reached the capture wait"
+                    assert entered_wait[1].wait(
+                        timeout=5
+                    ), "contender 2 never reached the capture wait"
+                    assert writes == [first_text], "no paste may occur while both are still waiting"
+
+                    # One capture release wakes both waiters.
+                    assigned_worker_completion_service._release_capture_barrier(terminal_id)
+
+                    # Exactly one physical submit occurs after the release
+                    # -- the other contender must still be blocked, now on
+                    # native acceptance for the winner's brand-new,
+                    # deliberately-unconfirmed dispatch fence.
+                    winner_future = None
+                    for candidate in (future_a, future_b):
+                        try:
+                            candidate.result(timeout=3)
+                            winner_future = candidate
+                        except TimeoutError:
+                            continue
+                    assert (
+                        winner_future is not None
+                    ), "neither contender submitted after the release"
+                    loser_future = future_b if winner_future is future_a else future_a
+                    assert len(writes) == 2, f"expected exactly one new submit, got {writes!r}"
+                    winner_text = writes[1]
+                    assert winner_text in (contender_a_text, contender_b_text)
+
+                    # The loser must still be blocked -- proving it did NOT
+                    # act on its stale pre-wait acceptance/status snapshot.
+                    with pytest.raises(TimeoutError):
+                        loser_future.result(timeout=0.5)
+                    assert writes == [first_text, winner_text], (
+                        "the second contender pasted before a fresh acceptance event for "
+                        "the winner's own new dispatch -- correction-1017's stale-guard race"
+                    )
+
+                    # A fresh native-acceptance event for the winner's own
+                    # dispatch (a real detection, standing in for the real
+                    # StatusMonitor loop) is the ONLY thing that may release
+                    # the loser now.
+                    _apply_detection_with_fresh_evidence(terminal_id, TerminalStatus.PROCESSING)
+                    loser_future.result(timeout=5)
+
+            loser_text = contender_b_text if winner_text == contender_a_text else contender_a_text
+            assert writes == [
+                first_text,
+                winner_text,
+                loser_text,
+            ], f"expected exactly one submit per contender, in order, got {writes!r}"
+        finally:
+            status_monitor.clear_terminal(terminal_id)
+            assigned_worker_completion_service._release_capture_barrier(terminal_id)
