@@ -54,6 +54,7 @@ from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.cli.commands.init import seed_default_skills
 from cli_agent_orchestrator.clients.database import (
+    NativeDispatchCorruptionGuardError,
     create_inbox_message,
     get_assigned_worker_callback,
     get_inbox_messages,
@@ -6660,6 +6661,108 @@ async def get_assigned_worker_completion_callback_endpoint(
             detail=f"Assigned-worker callback for '{worker_terminal_id}' not found",
         )
     return cast(Dict, jsonable_encoder(record.model_dump()))
+
+
+class CorruptionCaptureReleaseRequest(BaseModel):
+    """Body for the guarded native-dispatch corruption capture-release
+    transition (correction-997/1001/1007) -- the one supported live entry
+    point for AssignedWorkerCompletionService.reconcile_corrupted_
+    dispatch_capture_release.
+
+    ``requesting_caller_id`` is supplied here by the calling MCP tool
+    (derived from ITS OWN ``CAO_TERMINAL_ID``, never a client-settable
+    tool argument -- see ``mcp_server.server``'s
+    ``release_corrupted_dispatch_capture``, and the identical existing
+    pattern in ``get_worker_question``/``answer_worker_question``'s own
+    ``caller_id``). This is not itself the authorization boundary: the
+    guarded transition re-verifies it against the assignment's actual
+    immutable recorded caller_id (``check_recovery_guards``'
+    ``GUARD_CALLER_MISMATCH``) before anything is acknowledged or
+    released, so a spoofed value here is refused, never accepted.
+    """
+
+    assignment_id: str
+    requesting_caller_id: str
+    transcript_first_user_text: str
+    expected_transcript_sha256: str
+    admissible_dispatch_sha256: List[str]
+    concatenated_message_id: str
+    concatenated_message_sender_id: str
+    concatenated_message_receiver_id: str
+    concatenated_message_content: str
+    concatenated_message_delivery_state: str
+    concatenated_message_session_id: Optional[str] = None
+    recorded_at: str
+    acknowledgement: str
+    acknowledged_at: str
+
+
+@app.post("/assigned-workers/{worker_terminal_id}/corruption-recovery")
+async def reconcile_corrupted_dispatch_capture_release_endpoint(
+    worker_terminal_id: TerminalId,
+    body: CorruptionCaptureReleaseRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Acknowledge an immutable native-dispatch corruption archive and
+    idempotently release ONLY that exact dispatch's capture barrier
+    (correction-997/1001/1007).
+
+    The one supported live entry point for the guarded recovery
+    transition already required by 997/1007 -- previously defined and
+    tested but reachable only from an in-process test, never from a
+    running server. Every guard from ``check_recovery_guards`` (identity,
+    evidence integrity, hash/prefix match, lifecycle eligibility, live-
+    terminal activity, claimed-message content/direction) plus the
+    acknowledgement-specific guard is freshly rerun, at mutation time,
+    against the CURRENT database and CURRENT live terminal status -- never
+    trusted from any caller-supplied precomputed result. Never marks the
+    task successful, fabricates a final_result/completion, replays the
+    concatenated message, changes its historical delivery, or creates any
+    new inbox row. Ordinary InboxService remains solely responsible for
+    delivering any existing pending follow-up, exactly once, through its
+    own unrelated normal path -- this endpoint never sends or delivers
+    anything itself.
+    """
+    try:
+        result = await asyncio.to_thread(
+            assigned_worker_completion_service.reconcile_corrupted_dispatch_capture_release,
+            worker_terminal_id,
+            assignment_id=body.assignment_id,
+            requesting_caller_id=body.requesting_caller_id,
+            transcript_first_user_text=body.transcript_first_user_text,
+            expected_transcript_sha256=body.expected_transcript_sha256,
+            admissible_dispatch_sha256=body.admissible_dispatch_sha256,
+            concatenated_message_id=body.concatenated_message_id,
+            concatenated_message_sender_id=body.concatenated_message_sender_id,
+            concatenated_message_receiver_id=body.concatenated_message_receiver_id,
+            concatenated_message_content=body.concatenated_message_content,
+            concatenated_message_delivery_state=body.concatenated_message_delivery_state,
+            concatenated_message_session_id=body.concatenated_message_session_id,
+            recorded_at=body.recorded_at,
+            acknowledgement=body.acknowledgement,
+            acknowledged_at=body.acknowledged_at,
+        )
+    except NativeDispatchCorruptionGuardError as exc:
+        # Fail closed: every guard refusal (wrong caller, wrong assignment/
+        # message/archive/acknowledgement binding, live/ineligible state,
+        # tampered evidence) surfaces as a 409 naming the exact reason code
+        # -- never a silent 200, never a 500 that could be mistaken for a
+        # transient/retryable failure.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except ValueError as exc:
+        # A genuine, different existing record already occupies this exact
+        # (assignment, concatenated message) identity, or a concurrent
+        # transaction won first -- also a conflict, never a 500.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    return {
+        "success": True,
+        "released_now": result.released_now,
+        "record_key": result.record.record_key(),
+        "assignment_id": result.record.assignment_id,
+        "worker_terminal_id": result.record.worker_terminal_id,
+        "caller_acknowledgement": result.record.caller_acknowledgement,
+        "capture_release_acknowledged_at": result.record.capture_release_acknowledged_at,
+    }
 
 
 @app.post("/terminals/{receiver_id}/inbox/messages")

@@ -1036,6 +1036,88 @@ def answer_worker_question(terminal_id: str, prompt_sha256: str, index: int) -> 
 
 
 @mcp.tool()
+def release_corrupted_dispatch_capture(
+    worker_terminal_id: str,
+    assignment_id: str,
+    transcript_first_user_text: str,
+    expected_transcript_sha256: str,
+    admissible_dispatch_sha256: List[str],
+    concatenated_message_id: str,
+    concatenated_message_sender_id: str,
+    concatenated_message_receiver_id: str,
+    concatenated_message_content: str,
+    concatenated_message_delivery_state: str,
+    recorded_at: str,
+    acknowledgement: str,
+    acknowledged_at: str,
+    concatenated_message_session_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Acknowledge an immutable native-dispatch corruption archive and
+    idempotently release ONLY that exact dispatch's capture barrier
+    (correction-997/1001/1007).
+
+    Use this ONLY for a worker whose native input was proven corrupted (an
+    unrelated follow-up message physically concatenated into its dispatch
+    transcript with no turn boundary) -- never to force-complete, retry,
+    or replace an assignment that simply failed or is still running. Every
+    identity/evidence/lifecycle/liveness guard is freshly rerun server-side
+    against the current database and current live terminal status; a
+    mismatched caller, assignment, archive digest, claimed message, or
+    live/ineligible state is refused, not silently accepted.
+
+    This NEVER marks the task successful, fabricates a completion result,
+    replays the concatenated message, or makes the assignment retirement-
+    eligible -- it only records the incident as reconciled/abandoned and
+    releases the input-capture barrier so the terminal can accept new
+    input again. Any already-pending follow-up for this worker is left
+    completely untouched; ordinary inbox delivery remains solely
+    responsible for delivering it, exactly once, on its own normal
+    schedule -- this tool never sends or delivers anything itself.
+
+    Authorization is bound to YOUR OWN CAO identity (``CAO_TERMINAL_ID``):
+    you can only recover an assignment you are the immutable recorded
+    caller of, verified server-side against the database record -- not
+    merely accepted from this call's arguments.
+    """
+    own_terminal_id = _own_terminal_id_or_error("release corrupted dispatch capture")
+    if isinstance(own_terminal_id, dict):
+        return own_terminal_id
+
+    try:
+        return mcp_utils.post_body_json(
+            f"/assigned-workers/{worker_terminal_id}/corruption-recovery",
+            {
+                "assignment_id": assignment_id,
+                "requesting_caller_id": own_terminal_id,
+                "transcript_first_user_text": transcript_first_user_text,
+                "expected_transcript_sha256": expected_transcript_sha256,
+                "admissible_dispatch_sha256": admissible_dispatch_sha256,
+                "concatenated_message_id": concatenated_message_id,
+                "concatenated_message_sender_id": concatenated_message_sender_id,
+                "concatenated_message_receiver_id": concatenated_message_receiver_id,
+                "concatenated_message_content": concatenated_message_content,
+                "concatenated_message_delivery_state": concatenated_message_delivery_state,
+                "concatenated_message_session_id": concatenated_message_session_id,
+                "recorded_at": recorded_at,
+                "acknowledgement": acknowledgement,
+                "acknowledged_at": acknowledged_at,
+            },
+            timeout=_mcp_timeout(),
+        )
+    except requests.HTTPError as e:
+        detail = _extract_error_detail(e.response, str(e)) if e.response is not None else str(e)
+        return {
+            "success": False,
+            "error": f"Failed to release corrupted dispatch capture: {detail}",
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Failed to release corrupted dispatch capture: {str(e)}",
+        }
+
+
+@mcp.tool()
 def get_terminal_context() -> Dict[str, Any]:
     """Read this MCP process's CAO identity and recorded supervisor from CAO.
 
