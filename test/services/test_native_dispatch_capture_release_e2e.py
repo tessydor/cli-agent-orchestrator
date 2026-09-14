@@ -31,6 +31,7 @@ from cli_agent_orchestrator.clients import database as db
 from cli_agent_orchestrator.models.assigned_worker import (
     AssignmentLifecycle,
     CompletionDeliveryState,
+    CompletionReceiverState,
 )
 from cli_agent_orchestrator.models.inbox import InboxMessageOrigin, MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -582,3 +583,309 @@ class TestGuardedCaptureReleaseSurvivesACrashBetweenCommitAndRelease:
             if r.message == MESSAGE_948_CONTENT
         ]
         assert len(delivered_948) == 1
+
+
+RESTART_CALLER_ID = "restart-caller-e2e"
+RESTART_WORKER_ID = "restart-worker-e2e"
+RESTART_ASSIGNMENT_ID = "assignment-restart-e2e-0001"
+RESTART_COMPLETION_ID = "completion-restart-e2e-0001"
+RESTART_MESSAGE_948_CONTENT = "synthetic later follow-up (948 analogue) queued before a restart"
+
+
+class TestRestartReconstructsTheCaptureHoldBeforeConsumersStart:
+    """Correction-1033: register_persisted_assignments()'s OWN docstring
+    already promised "Prime restart barriers before status/inbox
+    consumers can observe readiness" -- but its actual body only calls
+    register_assignment() (marks the worker KNOWN), never anything that
+    arms a capture barrier. The ONLY other path that arms one
+    (announce_terminal_status) is called exclusively from StatusMonitor's
+    live, chunk-driven detection pipeline, which never fires for a worker
+    whose pane has been quiet since before the restart (the corrupted/
+    uncaptured turn's own output already fully arrived). Meanwhile
+    status_monitor.get_status()'s OWN restart-status derivation (its
+    "cached == UNKNOWN -> probe the full history" branch, deliberately
+    left UNCACHED) can independently report this SAME worker as COMPLETED
+    to InboxService's separate, unrelated readiness gate -- without ever
+    updating _last_status or triggering announce_terminal_status. The two
+    paths disagreeing is exactly the race: InboxService believes the
+    worker is ready to receive its next queued message, while nothing
+    ever told AssignedWorkerCompletionService a barrier was needed.
+
+    This reproduces the full shape through the REAL singleton
+    (register_persisted_assignments and the capture-barrier check are
+    both keyed off it in production code, not an injectable instance) and
+    the REAL InboxService.deliver_pending -> terminal_service.send_input
+    path -- deliberately never calling announce_terminal_status directly,
+    unlike the pre-existing (and, per this finding, misleadingly named)
+    test_restart_primes_all_unfinished_capture_barriers, which papers over
+    this exact gap by calling announce_terminal_status itself right after
+    register_persisted_assignments().
+    """
+
+    @staticmethod
+    def _seed(worker_id, caller_id, assignment_id, completion_id, pending_content):
+        db.create_terminal(caller_id, "cao-session", f"developer-{caller_id}", "mock_cli")
+        db.create_terminal(
+            worker_id,
+            "cao-session",
+            f"developer-{worker_id}",
+            "mock_cli",
+            caller_id=caller_id,
+            assignment_id=assignment_id,
+            completion_id=completion_id,
+        )
+        dispatched = db.mark_assigned_worker_dispatched(worker_id)
+        assert dispatched is not None
+        assert dispatched.lifecycle == AssignmentLifecycle.DISPATCHED
+        # The existing pending 948 analogue -- queued before the simulated
+        # restart, exactly as it would be in the real incident.
+        db.create_inbox_message(
+            caller_id, worker_id, pending_content, origin=InboxMessageOrigin.EXPLICIT
+        )
+
+    @staticmethod
+    def _restart_alone(monkeypatch, assigned_worker_completion_service):
+        # Simulate a fresh process: reset the REAL singleton's in-memory
+        # state (mirrors test/conftest.py's own _reset_status_monitor_state
+        # pattern for the sibling singleton) -- nothing is "known" yet, no
+        # barrier exists, exactly like a just-started cao-server.
+        assigned_worker_completion_service.__init__()
+        # The ONE synchronous startup step, run alone -- deliberately NEVER
+        # calling announce_terminal_status directly, since a real restart
+        # has no guarantee a live detection chunk will ever arrive for a
+        # quiet, already-finished pane.
+        assigned_worker_completion_service.register_persisted_assignments()
+        # InboxService's OWN restart-status derivation reports COMPLETED --
+        # exactly what status_monitor.get_status()'s real "cached ==
+        # UNKNOWN -> probe full history" branch can do, independent of
+        # announce_terminal_status.
+        monkeypatch.setattr(
+            status_monitor_mod.status_monitor,
+            "get_status",
+            lambda _id: TerminalStatus.COMPLETED,
+        )
+
+    @staticmethod
+    def _deliver(worker_id) -> list[str]:
+        writes: list[str] = []
+
+        def send_keys_side_effect(session, window, message, **kwargs):
+            writes.append(message)
+
+        provider = MagicMock()
+        provider.paste_enter_count = 1
+        provider.paste_submit_delay = 0.0
+        provider.accepts_input_while_processing = False
+        provider.assume_processing_on_dispatch = False
+        provider.blocks_orchestrated_input_while_waiting_user_answer = False
+        provider.force_bracketed_paste = True
+        provider.encode_terminal_input = lambda message, orchestration_value: message
+
+        with (
+            patch("cli_agent_orchestrator.backends.registry._backend") as mock_backend,
+            patch.object(
+                real_terminal_service.provider_manager,
+                "get_provider",
+                return_value=provider,
+            ),
+        ):
+            mock_backend.send_keys.side_effect = send_keys_side_effect
+            mock_backend.supports_event_inbox.return_value = False
+            mock_backend.session_exists.return_value = True
+            mock_backend.get_history.return_value = ""
+            InboxService().deliver_pending(worker_id)
+        return writes
+
+    def test_restart_alone_does_not_let_inbox_deliver_before_the_ack(
+        self, capture_release_db, monkeypatch
+    ):
+        from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+            assigned_worker_completion_service,
+        )
+
+        try:
+            self._seed(
+                RESTART_WORKER_ID,
+                RESTART_CALLER_ID,
+                RESTART_ASSIGNMENT_ID,
+                RESTART_COMPLETION_ID,
+                RESTART_MESSAGE_948_CONTENT,
+            )
+            self._restart_alone(monkeypatch, assigned_worker_completion_service)
+
+            writes = self._deliver(RESTART_WORKER_ID)
+
+            assert writes == [], (
+                "InboxService delivered the pending 948 analogue to a worker whose "
+                "corrupted/unresolved persisted assignment was never reconciled after "
+                "a simulated restart -- correction-1033's exact race reproduced"
+            )
+            pending_after = db.get_pending_messages(RESTART_WORKER_ID, limit=10)
+            assert len(pending_after) == 1, "the message must remain PENDING, not lost"
+
+            # The barrier IS armed (this is the actual fix): a direct
+            # capture-wait call proves it, independent of InboxService's
+            # own eager-return-on-no-barrier fast path.
+            assert (
+                assigned_worker_completion_service.wait_for_capture_before_input(
+                    RESTART_WORKER_ID, timeout=0.2
+                )
+                is False
+            ), "register_persisted_assignments() did not reconstruct the capture hold"
+        finally:
+            assigned_worker_completion_service._release_capture_barrier(RESTART_WORKER_ID)
+            assigned_worker_completion_service.__init__()
+            status_monitor_mod.status_monitor.clear_terminal(RESTART_WORKER_ID)
+
+    def test_post_ack_ordinary_delivery_exactly_once(self, capture_release_db, monkeypatch):
+        """After the restart-reconstructed hold blocks delivery, the
+        existing guarded recovery acknowledgement (unchanged, correction-
+        997/1001/1007) releases it, and ordinary InboxService delivery
+        then delivers the existing pending 948 analogue exactly once --
+        proving the fix does not strand the hold forever, only until the
+        real, already-tested release path runs.
+        """
+        from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+            assigned_worker_completion_service,
+        )
+
+        bound_prefix = "synthetic restart-scenario dispatch (1033)"
+        message_874_content = "synthetic already-delivered follow-up (874 analogue), restart case"
+        corrupted_transcript = bound_prefix + message_874_content
+
+        try:
+            self._seed(
+                RESTART_WORKER_ID,
+                RESTART_CALLER_ID,
+                RESTART_ASSIGNMENT_ID,
+                RESTART_COMPLETION_ID,
+                RESTART_MESSAGE_948_CONTENT,
+            )
+            self._restart_alone(monkeypatch, assigned_worker_completion_service)
+
+            # Blocked pre-ack (same proof as the sibling test above).
+            assert self._deliver(RESTART_WORKER_ID) == []
+
+            result = assigned_worker_completion_service.reconcile_corrupted_dispatch_capture_release(
+                RESTART_WORKER_ID,
+                assignment_id=RESTART_ASSIGNMENT_ID,
+                requesting_caller_id=RESTART_CALLER_ID,
+                transcript_first_user_text=corrupted_transcript,
+                expected_transcript_sha256=utf8_sha256(corrupted_transcript),
+                admissible_dispatch_sha256=[utf8_sha256(bound_prefix)],
+                concatenated_message_id="874-restart",
+                concatenated_message_sender_id=RESTART_CALLER_ID,
+                concatenated_message_receiver_id=RESTART_WORKER_ID,
+                concatenated_message_content=message_874_content,
+                concatenated_message_delivery_state="delivered",
+                concatenated_message_session_id="synthetic-restart-session",
+                recorded_at="2026-09-14T00:00:00+00:00",
+                acknowledgement=f"{RESTART_CALLER_ID} acknowledges the corrupted dispatch is abandoned",
+                acknowledged_at="2026-09-14T00:01:00+00:00",
+            )
+            assert result.released_now is True
+
+            after = db.get_assigned_worker_callback(RESTART_WORKER_ID)
+            assert after.lifecycle == AssignmentLifecycle.DISPATCHED
+            assert after.final_result is None
+
+            writes = self._deliver(RESTART_WORKER_ID)
+            assert writes == [RESTART_MESSAGE_948_CONTENT]
+            delivered = [
+                r
+                for r in db.get_inbox_messages(
+                    RESTART_WORKER_ID, limit=10, status=MessageStatus.DELIVERED
+                )
+                if r.message == RESTART_MESSAGE_948_CONTENT
+            ]
+            assert len(delivered) == 1
+
+            # A repeat delivery attempt is a genuine no-op (nothing left pending).
+            assert self._deliver(RESTART_WORKER_ID) == []
+        finally:
+            assigned_worker_completion_service._release_capture_barrier(RESTART_WORKER_ID)
+            assigned_worker_completion_service.__init__()
+            status_monitor_mod.status_monitor.clear_terminal(RESTART_WORKER_ID)
+
+    def test_unrelated_resolved_worker_is_unaffected(self, capture_release_db, monkeypatch):
+        """A worker whose assignment is ALREADY fully resolved (lifecycle
+        outside ASSIGNED/DISPATCHED/UNRESOLVED, so excluded from
+        list_protected_assigned_worker_callbacks entirely) never gets a
+        hold reconstructed for it, and its own delivery proceeds exactly
+        as before this fix -- the change is scoped to unresolved
+        assignments only, never a global weakening or strengthening of
+        the "no barrier -> proceed" fast path.
+        """
+        from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+            assigned_worker_completion_service,
+        )
+
+        resolved_worker = "resolved-worker-e2e"
+        resolved_caller = "resolved-caller-e2e"
+        resolved_content = "synthetic follow-up for an already-resolved worker"
+        try:
+            db.create_terminal(
+                resolved_caller, "cao-session", "developer-resolved-caller", "mock_cli"
+            )
+            db.create_terminal(
+                resolved_worker,
+                "cao-session",
+                "developer-resolved-worker",
+                "mock_cli",
+                caller_id=resolved_caller,
+                assignment_id="assignment-resolved-e2e",
+                completion_id="completion-resolved-e2e",
+            )
+            dispatched = db.mark_assigned_worker_dispatched(resolved_worker)
+            assert dispatched is not None
+            report = "already delivered final report"
+            captured = db.capture_assigned_worker_completion(
+                resolved_worker,
+                report,
+                utf8_sha256(report),
+                f"assigned-worker-callback:{dispatched.assignment_id}",
+            )
+            assert captured is not None
+            assert captured.lifecycle == AssignmentLifecycle.COMPLETED
+            inbox_msg = db.create_inbox_message(
+                resolved_worker,
+                resolved_caller,
+                AssignedWorkerCompletionService._format_callback_message(captured),
+                origin=InboxMessageOrigin.SERVER_COMPLETION,
+                assignment_id=captured.assignment_id,
+                idempotency_key=f"assigned-worker-completion:{captured.completion_id}",
+            )
+            db.mark_completion_enqueued(
+                captured.assignment_id, inbox_msg.id, CompletionReceiverState.ACTIVE
+            )
+            db.acknowledge_completion_enqueued(captured.assignment_id, inbox_msg.id)
+
+            db.create_inbox_message(
+                resolved_caller,
+                resolved_worker,
+                resolved_content,
+                origin=InboxMessageOrigin.EXPLICIT,
+            )
+
+            self._restart_alone(monkeypatch, assigned_worker_completion_service)
+
+            # Not "known" at all -- register_persisted_assignments never
+            # touched it, since its lifecycle is COMPLETED, not in
+            # (ASSIGNED, DISPATCHED, UNRESOLVED).
+            assert (
+                assigned_worker_completion_service.wait_for_capture_before_input(
+                    resolved_worker, timeout=0.2
+                )
+                is True
+            )
+
+            writes = self._deliver(resolved_worker)
+            assert writes == [resolved_content], (
+                "an unrelated, already-resolved worker's delivery must proceed exactly "
+                "as before this fix -- the reconstruction is scoped to unresolved "
+                "assignments only"
+            )
+        finally:
+            assigned_worker_completion_service._release_capture_barrier(resolved_worker)
+            assigned_worker_completion_service.__init__()
+            status_monitor_mod.status_monitor.clear_terminal(resolved_worker)

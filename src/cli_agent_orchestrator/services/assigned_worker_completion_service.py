@@ -155,15 +155,18 @@ class AssignedWorkerCompletionService:
         with self._worker_locks_guard:
             self._known_workers.add(worker_terminal_id)
 
-    def announce_terminal_status(self, worker_terminal_id: str, status: TerminalStatus) -> None:
-        """Install a capture barrier before a COMPLETED event is published.
+    def _arm_capture_barrier_if_known(self, worker_terminal_id: str) -> None:
+        """Shared arm logic for a KNOWN worker's capture barrier.
 
-        StatusMonitor calls this synchronously before EventBus publication.  The
-        regular InboxService can therefore never win the scheduling race and
-        paste a queued next turn over an as-yet-uncaptured final response.
+        Used by ``announce_terminal_status`` (a genuine live COMPLETED
+        detection) and by ``register_persisted_assignments`` (correction-
+        1033: proactively reconstructing the hold for an unresolved
+        persisted assignment at startup, before either can rely on a live
+        detection ever happening). Idempotent via ``setdefault``-style
+        presence check: calling this when a barrier already exists for
+        ``worker_terminal_id`` is a safe no-op, so the two callers can
+        never conflict or double-arm.
         """
-        if status != TerminalStatus.COMPLETED:
-            return
         with self._worker_locks_guard:
             if worker_terminal_id not in self._known_workers:
                 return
@@ -178,6 +181,17 @@ class AssignedWorkerCompletionService:
                 self._capture_barriers[worker_terminal_id] = _CaptureBarrier(
                     terminal_input_lock(worker_terminal_id)
                 )
+
+    def announce_terminal_status(self, worker_terminal_id: str, status: TerminalStatus) -> None:
+        """Install a capture barrier before a COMPLETED event is published.
+
+        StatusMonitor calls this synchronously before EventBus publication.  The
+        regular InboxService can therefore never win the scheduling race and
+        paste a queued next turn over an as-yet-uncaptured final response.
+        """
+        if status != TerminalStatus.COMPLETED:
+            return
+        self._arm_capture_barrier_if_known(worker_terminal_id)
 
     def wait_for_capture_before_input(self, worker_terminal_id: str, timeout: float = 5.0) -> bool:
         """Return only when a known completed worker's report is safely durable.
@@ -1149,10 +1163,46 @@ class AssignedWorkerCompletionService:
     def register_persisted_assignments(self) -> None:
         """Prime restart barriers before status/inbox consumers can observe readiness.
 
-        This deliberately performs only the bounded callback-row read and
-        in-memory registration.  Full provider/status reconciliation remains a
-        background operation, but every unfinished assignment is protected before
-        the server starts accepting or delivering terminal input.
+        This performs the bounded callback-row read, in-memory registration,
+        AND reconstruction of each unresolved assignment's capture hold
+        (correction-1033) -- all synchronously, before the server starts
+        accepting or delivering terminal input. Full provider/status
+        reconciliation remains a separate, later, background operation
+        (``reconcile_pending``); this method's own job is narrower and more
+        urgent: make sure a hold EXISTS for every unresolved assignment
+        before anything else can act on this worker's readiness.
+
+        Why this is needed, not merely "in-memory registration": the ONLY
+        other path that arms a capture barrier (``announce_terminal_
+        status``) is called exclusively from StatusMonitor's live, chunk-
+        driven detection pipeline (``_apply_detection_locked``), which fires
+        only on a genuine NEW output chunk. A worker whose pane has been
+        quiet since before a restart (the corrupted/uncaptured turn's own
+        output already fully arrived, nothing new since) never produces
+        one, so that pipeline never runs for it post-restart. Meanwhile
+        ``status_monitor.get_status()``'s OWN restart-status derivation
+        (its "cached == UNKNOWN -> probe the full live history" branch,
+        deliberately left UNCACHED) can independently report this SAME
+        worker as COMPLETED to InboxService's separate, unrelated
+        readiness gate -- without ever updating ``_last_status`` or
+        triggering ``announce_terminal_status``. The two paths disagreeing
+        is exactly the race: InboxService believes the worker is ready to
+        receive its next queued message, while nothing ever told this
+        service a hold was needed.
+
+        Reconstructing the hold here, unconditionally, for every
+        unresolved persisted assignment closes that gap completely,
+        regardless of whether the worker happens to be genuinely COMPLETED
+        right now: a hold armed for a worker that is still actually
+        PROCESSING is simply never consulted (InboxService's OWN, separate
+        status gate already blocks delivery for any non-ready status,
+        barrier or not) until a real COMPLETED transition is observed --
+        at which point the normal, already-armed-or-idempotently-re-armed
+        (``_arm_capture_barrier_if_known``'s own presence check) barrier
+        behaves exactly as if this reconstruction had never run. This
+        method never itself RELEASES anything; only the existing,
+        already-tested paths (a real capture success, or the explicit
+        guarded corruption-recovery operation) do that.
         """
         try:
             records = list_protected_assigned_worker_callbacks()
@@ -1170,6 +1220,7 @@ class AssignedWorkerCompletionService:
             return
         for record in records:
             self.register_assignment(record.worker_terminal_id)
+            self._arm_capture_barrier_if_known(record.worker_terminal_id)
 
     @staticmethod
     def _detect_live_status(record: AssignedWorkerCallback) -> TerminalStatus:
