@@ -4,6 +4,7 @@ import click
 import requests
 
 from cli_agent_orchestrator.constants import API_BASE_URL
+from cli_agent_orchestrator.utils.orchestration import _extract_error_detail
 
 
 def _list_sessions():
@@ -15,6 +16,23 @@ def _list_sessions():
         raise click.ClickException(f"Failed to connect to cao-server: {e}")
 
 
+def _errors_summary(errors) -> str:
+    """Render a session-delete ``errors`` list as one real, distinguishable reason.
+
+    Each entry already carries the actual reason for that terminal/step (see
+    ``session_service.delete_session``, e.g. "completion capture pending" or
+    "cleanup deferred; retry delete_session") -- joined verbatim rather than
+    replaced with one fixed guess, so two different deferrals read differently.
+    """
+    if not errors:
+        return "cleanup deferred"
+    return "; ".join(
+        f"{e.get('terminal_id') or e.get('session') or '?'}: {e.get('error', 'unknown reason')}"
+        for e in errors
+        if isinstance(e, dict)
+    )
+
+
 def _delete_session(name):
     try:
         response = requests.delete(f"{API_BASE_URL}/sessions/{name}")
@@ -22,19 +40,19 @@ def _delete_session(name):
             click.echo(f"Session '{name}' already removed", err=True)
             return False
         if response.status_code == 409:
-            raise click.ClickException(
-                f"Session '{name}' cleanup is pending; retry shutdown after residual "
-                "Grok processes exit"
+            detail = _extract_error_detail(
+                response, f"cleanup deferred for session '{name}'"
             )
+            raise click.ClickException(f"Session '{name}' cleanup is pending: {detail}")
         response.raise_for_status()
         try:
             payload = response.json()
         except ValueError:
             payload = {}
         if isinstance(payload, dict) and (payload.get("success") is False or payload.get("errors")):
+            reasons = _errors_summary(payload.get("errors"))
             raise click.ClickException(
-                f"Session '{name}' cleanup is pending; retry shutdown after residual "
-                "Grok processes exit"
+                f"Session '{name}' cleanup is pending: {reasons}"
             )
         return True
     except requests.exceptions.RequestException as e:

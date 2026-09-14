@@ -23,18 +23,33 @@ async def fake_opencode_daemon(registry) -> None:
 def _consumer_patches():
     """Patch the event-bus consumer coroutines and the OpenCode poller.
 
-    The merged lifespan starts ``status_monitor.run()``, ``log_writer.run()``
-    and ``inbox_service.run()`` as background tasks (each an endless event-bus
-    consumer loop) and the OpenCode inbox delivery daemon. These must be
-    stubbed so the lifespan enters and exits cleanly without spinning real
-    consumer loops or leaving un-awaited coroutines. ``run`` is an async
-    method on each singleton, so an ``AsyncMock`` yields an awaitable that
-    ``asyncio.create_task`` can schedule and complete immediately.
+    The merged lifespan starts ``status_monitor.run()``, ``log_writer.run()``,
+    ``inbox_service.run()`` and ``assigned_worker_completion_service.run()`` as
+    background tasks (each an endless event-bus consumer loop) and the
+    OpenCode inbox delivery daemon. These must be stubbed so the lifespan
+    enters and exits cleanly without spinning real consumer loops or leaving
+    un-awaited coroutines. ``run`` is an async method on each singleton, so an
+    ``AsyncMock`` yields an awaitable that ``asyncio.create_task`` can
+    schedule and complete immediately.
+
+    ``register_persisted_assignments()`` is also stubbed here even though it
+    is a synchronous *startup* call, not a background consumer: it queries
+    the real, shared ``assigned_worker_callbacks`` table exactly like the
+    consumer loops above, so these lifespan-wiring tests must not depend on
+    that table's on-disk schema being current for whatever this test process
+    happens to be pointed at.
     """
     return (
         patch("cli_agent_orchestrator.api.main.status_monitor.run", new_callable=AsyncMock),
         patch("cli_agent_orchestrator.api.main.log_writer.run", new_callable=AsyncMock),
         patch("cli_agent_orchestrator.api.main.inbox_service.run", new_callable=AsyncMock),
+        patch(
+            "cli_agent_orchestrator.api.main.assigned_worker_completion_service.run",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "cli_agent_orchestrator.api.main.assigned_worker_completion_service.register_persisted_assignments"
+        ),
         patch(
             "cli_agent_orchestrator.api.main.opencode_inbox_delivery_daemon",
             fake_opencode_daemon,
@@ -56,7 +71,14 @@ class TestPluginRegistryLifespan:
 
         request_scope = {"type": "http", "app": app, "headers": []}
 
-        status_run, log_run, inbox_run, opencode_daemon = _consumer_patches()
+        (
+            status_run,
+            log_run,
+            inbox_run,
+            assigned_completion_run,
+            assigned_completion_register,
+            opencode_daemon,
+        ) = _consumer_patches()
 
         with (
             patch("cli_agent_orchestrator.api.main.setup_logging"),
@@ -74,6 +96,8 @@ class TestPluginRegistryLifespan:
             status_run,
             log_run,
             inbox_run,
+            assigned_completion_run,
+            assigned_completion_register,
             opencode_daemon,
             patch.object(PluginRegistry, "load", mock_load),
             patch.object(PluginRegistry, "teardown", mock_teardown),
@@ -96,7 +120,14 @@ class TestPluginRegistryLifespan:
     ) -> None:
         """The lifespan should surface the empty-plugin INFO log from the registry."""
 
-        status_run, log_run, inbox_run, opencode_daemon = _consumer_patches()
+        (
+            status_run,
+            log_run,
+            inbox_run,
+            assigned_completion_run,
+            assigned_completion_register,
+            opencode_daemon,
+        ) = _consumer_patches()
 
         with (
             patch("cli_agent_orchestrator.api.main.setup_logging"),
@@ -114,6 +145,8 @@ class TestPluginRegistryLifespan:
             status_run,
             log_run,
             inbox_run,
+            assigned_completion_run,
+            assigned_completion_register,
             opencode_daemon,
             patch("importlib.metadata.entry_points", return_value=[]),
         ):
@@ -136,7 +169,14 @@ class TestPluginRegistryLifespan:
             async def on_message(self, event: PostSendMessageEvent) -> None:
                 del event
 
-        status_run, log_run, inbox_run, opencode_daemon = _consumer_patches()
+        (
+            status_run,
+            log_run,
+            inbox_run,
+            assigned_completion_run,
+            assigned_completion_register,
+            opencode_daemon,
+        ) = _consumer_patches()
 
         with (
             patch("cli_agent_orchestrator.api.main.setup_logging"),
@@ -154,6 +194,8 @@ class TestPluginRegistryLifespan:
             status_run,
             log_run,
             inbox_run,
+            assigned_completion_run,
+            assigned_completion_register,
             opencode_daemon,
             patch(
                 "importlib.metadata.entry_points",

@@ -1,16 +1,20 @@
 """Tests for terminal-related API endpoints including working directory and exit."""
 
 import hashlib
+from datetime import datetime, timedelta, timezone
 from typing import Dict
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
+import jwt
 import pytest
+from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.api.main import app
 from cli_agent_orchestrator.clients import database as db
+from cli_agent_orchestrator.security import auth as auth_module
 from cli_agent_orchestrator.constants import (
     TERMINAL_GROUP_ELEMENT_MAX_LEN,
     TERMINAL_GROUP_MAX_ELEMENTS,
@@ -606,6 +610,10 @@ class TestAssignedWorkerCompletionCallbackEndpoint:
     """Manual recovery view for retained completion reports."""
 
     def test_returns_report_after_terminal_retirement(self, client):
+        from cli_agent_orchestrator.models.assigned_worker import (
+            compute_reconciliation_state_token,
+        )
+
         record = MagicMock()
         record.model_dump.return_value = {
             "assignment_id": "assignment-one",
@@ -617,7 +625,18 @@ class TestAssignedWorkerCompletionCallbackEndpoint:
             "receiver_state": "deleted",
             "final_result": "retained final report",
             "final_result_sha256": "abc123",
+            "last_error": None,
         }
+        # compute_reconciliation_state_token reads these attributes directly
+        # off the record (not through model_dump); a manual mock needs both
+        # kept consistent with each other, same as a real model instance.
+        record.assignment_id = "assignment-one"
+        record.worker_terminal_id = "abcd1234"
+        record.caller_id = "feedbeef"
+        record.lifecycle.value = "completed"
+        record.delivery_state.value = "terminal_error"
+        record.final_result = "retained final report"
+        record.last_error = None
         with patch(
             "cli_agent_orchestrator.api.main.get_assigned_worker_callback",
             return_value=record,
@@ -625,7 +644,10 @@ class TestAssignedWorkerCompletionCallbackEndpoint:
             response = client.get("/assigned-workers/abcd1234/completion-callback")
 
         assert response.status_code == 200
-        assert response.json()["final_result"] == "retained final report"
+        payload = response.json()
+        assert payload["final_result"] == "retained final report"
+        # The optimistic-concurrency token a reconciliation call must echo back.
+        assert payload["state_token"] == compute_reconciliation_state_token(record)
         get_callback.assert_called_once_with("abcd1234")
 
     def test_missing_assignment_returns_404(self, client):
@@ -684,6 +706,128 @@ class TestAssignedWorkerCompletionCallbackEndpoint:
         assert "integrity failure" in response.json()["detail"]
         assert "tampered API report" not in response.text
         engine.dispose()
+
+
+class _FakeJwksClient:
+    def __init__(self, public_key):
+        self._public_key = public_key
+
+    def get_signing_key_from_jwt(self, token):
+        class _Key:
+            key = self._public_key
+
+        return _Key()
+
+
+def _mint_admin_jwt(rsa_key, *, subject: str = "generic-admin-caller") -> str:
+    """A real, validly-signed, admin-scoped JWT -- a generic admin caller
+    (human operator session, dashboard, unrelated service), not this
+    deployment's own local MCP infrastructure."""
+    now = datetime.now(timezone.utc)
+    claims = {
+        "aud": "cao-api",
+        "iss": "https://example.auth0.com/",
+        "scope": "cao:admin",
+        "sub": subject,
+        "iat": now,
+        "exp": now + timedelta(hours=1),
+    }
+    return jwt.encode(claims, rsa_key, algorithm="RS256", headers={"kid": "test"})
+
+
+class TestRetirementReconciliationRouteRemoved:
+    """correction-842: the generic REST mutation is gone entirely.
+
+    A caller-identity check reachable only over HTTP cannot hold in every
+    auth configuration (the actual target deployment runs with auth
+    disabled, where require_any_scope/require_local_service_token-style
+    checks are no-ops) -- so no HTTP route exists for this action in ANY
+    configuration. Reconciliation now only happens in-process, from within
+    the trusted MCP server (see test/mcp_server/test_reconciliation_direct.py).
+    """
+
+    _BODY = {
+        "caller_id": "feedbeef",
+        "assignment_id": "assignment-one",
+        "expected_state_token": "a" * 64,
+        "reason": "Independently verified via merged PR",
+        "archive_reference": "archive-sha-abc123",
+        "archive_sha256": "b" * 64,
+        "accepted_evidence": "PR44 merge 5c673ce11e8226ed23d2566f7f780d7d9471354c",
+    }
+
+    def test_route_is_gone_with_auth_disabled(self, client):
+        """Regression 1 (correction-842): auth disabled, exact recorded
+        caller_id, generic REST request -- still cannot reconcile."""
+        with patch(
+            "cli_agent_orchestrator.api.main.assigned_worker_completion_service"
+        ) as mock_svc:
+            response = client.post(
+                "/assigned-workers/abcd1234/retirement-reconciliation", json=self._BODY
+            )
+
+        assert response.status_code in (404, 405)
+        mock_svc.reconcile_caller_accepted_result.assert_not_called()
+
+    def test_route_is_gone_with_auth_enabled_and_generic_admin_bearer(
+        self, client, monkeypatch
+    ):
+        """Regression 2 (correction-842): auth enabled, generic ADMIN bearer,
+        exact recorded caller_id -- still cannot reconcile. No route exists
+        for require_any_scope to even gate."""
+        for var in (
+            "AUTH0_DOMAIN",
+            "CAO_AUTH_JWKS_URI",
+            "CAO_AUTH_AUDIENCE",
+            "AUTH0_AUDIENCE",
+            "CAO_AUTH_LOCAL_TOKEN",
+            "CAO_AUTH_ISSUER",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        auth_module.get_jwks_cache().clear()
+        rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        monkeypatch.setenv("AUTH0_DOMAIN", "example.auth0.com")
+        monkeypatch.setenv("CAO_AUTH_AUDIENCE", "cao-api")
+        admin_token = _mint_admin_jwt(rsa_key)
+        fake = _FakeJwksClient(rsa_key.public_key())
+        monkeypatch.setattr(auth_module.get_jwks_cache(), "get_client", lambda uri: fake)
+
+        with patch(
+            "cli_agent_orchestrator.api.main.assigned_worker_completion_service"
+        ) as mock_svc:
+            response = client.post(
+                "/assigned-workers/abcd1234/retirement-reconciliation",
+                json=self._BODY,
+                headers={"Authorization": f"Bearer {admin_token}"},
+            )
+
+        assert response.status_code in (404, 405)
+        mock_svc.reconcile_caller_accepted_result.assert_not_called()
+
+    def test_get_completion_callback_still_exists_unchanged(self, client):
+        """Only the mutation was removed -- the read-only endpoint that backs
+        inspect_terminal_retirement_state is untouched. A 404 here carries
+        OUR own detail message (the route was reached, the row wasn't found),
+        distinguishing it from FastAPI's generic "no matching route" 404."""
+        with patch(
+            "cli_agent_orchestrator.api.main.get_assigned_worker_callback",
+            return_value=None,
+        ):
+            response = client.get("/assigned-workers/abcd1234/completion-callback")
+
+        assert response.status_code == 404
+        assert "not found" in response.json()["detail"]
+
+    def test_mutation_route_no_longer_registered_in_the_app(self):
+        """Structural guard: the route table itself has no POST route for this
+        path at all -- not merely one that happens to refuse every caller."""
+        matches = [
+            r
+            for r in app.routes
+            if getattr(r, "path", None) == "/assigned-workers/{worker_terminal_id}/retirement-reconciliation"
+            and "POST" in (getattr(r, "methods", None) or set())
+        ]
+        assert matches == []
 
 
 class TestCreateInboxMessageEndpoint:

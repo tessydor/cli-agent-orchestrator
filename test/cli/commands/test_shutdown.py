@@ -157,6 +157,54 @@ class TestShutdownCommand:
         assert "cleanup is pending" in result.output
 
     @patch("cli_agent_orchestrator.cli.commands.shutdown.requests.delete")
+    def test_shutdown_session_two_distinct_real_409_details_are_surfaced(
+        self, mock_delete, runner
+    ):
+        """Two different real server 409 bodies produce two different outputs --
+        proves the actual detail propagates, not merely absence of 'Grok'."""
+        for detail_text in (
+            "cleanup deferred for session 'cao-test': t1: completion capture pending",
+            "cleanup deferred for session 'cao-test': t2: stale_evidence: state token mismatch",
+        ):
+            mock_delete.return_value = MagicMock(
+                status_code=409, json=lambda dt=detail_text: {"detail": dt}
+            )
+
+            result = runner.invoke(shutdown, ["--session", "cao-test"])
+
+            assert result.exit_code != 0
+            assert detail_text in result.output
+            assert "Grok" not in result.output
+
+    @patch("cli_agent_orchestrator.cli.commands.shutdown.requests.delete")
+    def test_shutdown_session_payload_errors_surface_distinct_real_reasons(
+        self, mock_delete, runner
+    ):
+        """The 200-with-errors branch also surfaces the real per-terminal
+        reasons rather than one fixed 'Grok' guess."""
+        mock_delete.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {
+                "success": True,
+                "deleted": [],
+                "errors": [
+                    {"terminal_id": "t1", "error": "completion capture pending"},
+                    {
+                        "terminal_id": "t2",
+                        "error": "cleanup deferred; retry delete_session",
+                    },
+                ],
+            },
+        )
+
+        result = runner.invoke(shutdown, ["--session", "cao-test"])
+
+        assert result.exit_code != 0
+        assert "t1: completion capture pending" in result.output
+        assert "t2: cleanup deferred; retry delete_session" in result.output
+        assert "Grok" not in result.output
+
+    @patch("cli_agent_orchestrator.cli.commands.shutdown.requests.delete")
     def test_shutdown_session_http_error(self, mock_delete, runner):
         """Test delete returns 500 — raises ClickException."""
         mock_response = MagicMock(status_code=500)

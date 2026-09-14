@@ -441,3 +441,17 @@ def require_any_scope(*required: str) -> Callable[..., Any]:
         return scopes
 
     return _dep
+
+
+# NOTE (correction-842): an earlier revision of this module defined
+# ``require_local_service_token()`` here -- a dependency requiring the
+# presented bearer to exactly equal ``CAO_AUTH_LOCAL_TOKEN`` -- as a narrower
+# alternative to ``require_any_scope(SCOPE_ADMIN)`` for the
+# retirement-reconciliation mutation. It was removed: it (like every
+# dependency in this module) is a no-op when ``is_auth_enabled()`` is False,
+# and the actual target deployment runs with auth disabled. A
+# security-sensitive mutation that must never be reachable by a generic HTTP
+# client, in EVERY configuration including auth-disabled, cannot be solved by
+# any check gated on the auth toggle -- see
+# ``mcp_server/reconciliation_direct.py`` for the fix that removed the
+# generic REST mutation entirely instead.

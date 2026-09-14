@@ -1719,22 +1719,26 @@ def _delete_terminal_impl(terminal_id: str, target_host: Optional[str] = None) -
             timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()) if target_host else _mcp_timeout(),
         )
         if response.status_code == 409:
+            # Surface the server's own reason (e.g. "cleanup deferred ... retry
+            # after the retained completion report or provider cleanup can be
+            # confirmed") rather than a hard-coded guess about *why* it is
+            # deferred. The deferral is not Grok-specific -- this text was
+            # previously shown verbatim even for native Claude workers stuck
+            # because their provider completion report is permanently
+            # unavailable, which has nothing to do with a Grok process.
+            detail = _extract_error_detail(
+                response, f"cleanup deferred for terminal {terminal_id}; retry later"
+            )
             return {
                 "success": False,
-                "message": (
-                    f"Terminal {terminal_id}{location} cleanup is pending; retry "
-                    "delete_terminal after the Grok process exits."
-                ),
+                "message": f"Terminal {terminal_id}{location} cleanup is pending: {detail}",
             }
         response.raise_for_status()
         payload = response.json()
         if not payload.get("success", False):
             return {
                 "success": False,
-                "message": (
-                    f"Terminal {terminal_id}{location} cleanup is pending; retry "
-                    "delete_terminal after the Grok process exits."
-                ),
+                "message": f"Terminal {terminal_id}{location} cleanup is pending; retry later.",
             }
         return {
             "success": True,
@@ -1744,12 +1748,12 @@ def _delete_terminal_impl(terminal_id: str, target_host: Optional[str] = None) -
         if e.response is not None and e.response.status_code == 404:
             return {"success": False, "message": f"Terminal {terminal_id}{location} not found"}
         if e.response is not None and e.response.status_code == 409:
+            detail = _extract_error_detail(
+                e.response, f"cleanup deferred for terminal {terminal_id}; retry later"
+            )
             return {
                 "success": False,
-                "message": (
-                    f"Terminal {terminal_id}{location} cleanup is pending; retry "
-                    "delete_terminal after the Grok process exits."
-                ),
+                "message": f"Terminal {terminal_id}{location} cleanup is pending: {detail}",
             }
         return {"success": False, "message": f"Failed to delete terminal: {str(e)}"}
     except Exception as e:

@@ -18,8 +18,14 @@ from cli_agent_orchestrator.models.assigned_worker import (
     AssignmentLifecycle,
     CompletionDeliveryState,
     CompletionReceiverState,
+    TerminalRetirementReconciliationError,
+    compute_reconciliation_state_token,
 )
-from cli_agent_orchestrator.models.inbox import InboxMessageOrigin, MessageStatus, OrchestrationType
+from cli_agent_orchestrator.models.inbox import (
+    InboxMessageOrigin,
+    MessageStatus,
+    OrchestrationType,
+)
 from cli_agent_orchestrator.models.provider_completion import (
     ProviderCompletionReport,
     ProviderCompletionUnavailableError,
@@ -27,7 +33,9 @@ from cli_agent_orchestrator.models.provider_completion import (
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.mock_cli import MockCliProvider
-from cli_agent_orchestrator.services import assigned_worker_completion_service as completion_mod
+from cli_agent_orchestrator.services import (
+    assigned_worker_completion_service as completion_mod,
+)
 from cli_agent_orchestrator.services import cleanup_service as cleanup_mod
 from cli_agent_orchestrator.services import provider_completion_report as report_mod
 from cli_agent_orchestrator.services import terminal_service as terminal_mod
@@ -125,7 +133,9 @@ def _authoritative_assignment(
         assignment_id=f"authoritative-assignment-{sequence:04d}",
         completion_id=completion_id,
     )
-    monkeypatch.setattr(report_mod, "PROVIDER_COMPLETION_REPORT_DIR", tmp_path / "reports")
+    monkeypatch.setattr(
+        report_mod, "PROVIDER_COMPLETION_REPORT_DIR", tmp_path / "reports"
+    )
     report_mod.bind_completion_dispatch("mock_cli", worker_id, completion_id, task)
     report_mod._ingest_test_completion(
         provider="mock_cli",
@@ -148,15 +158,63 @@ def _authoritative_assignment(
     return record
 
 
-def _configure_real_terminal_retirement(monkeypatch, tmp_path, *, cleanup_succeeds: bool):
+def _stuck_missing_report_worker(
+    worker_id, caller_id, monkeypatch, tmp_path, sequence=1
+):
+    """Reproduce the exact incident shape: DISPATCHED + RETRYABLE, final_result=None.
+
+    Mirrors ``test_missing_authoritative_completion_is_retryable_not_a_prompt_callback``:
+    the provider never produces a completion report for this terminal (e.g. an old/
+    restarted native session), so ``ProviderCompletionUnavailableError`` is raised on
+    every capture attempt and the callback is durably stuck retryable forever.
+    """
+    completion_id = f"{sequence:032x}"
+    db.create_terminal(
+        worker_id,
+        "cao-test",
+        f"window-{worker_id}",
+        "mock_cli",
+        caller_id=caller_id,
+        assignment_id=f"stuck-missing-report-{sequence:04d}",
+        completion_id=completion_id,
+    )
+    monkeypatch.setattr(
+        report_mod, "PROVIDER_COMPLETION_REPORT_DIR", tmp_path / "reports"
+    )
+    report_mod.bind_completion_dispatch(
+        "mock_cli", worker_id, completion_id, "prompt text"
+    )
+    db.mark_assigned_worker_dispatched(worker_id)
+    monkeypatch.setitem(
+        completion_mod.provider_manager._providers,
+        worker_id,
+        MockCliProvider(worker_id, "cao-test", f"window-{worker_id}"),
+    )
+    service = AssignedWorkerCompletionService()
+    service.handle_status_event(worker_id, TerminalStatus.COMPLETED)
+    record = db.get_assigned_worker_callback(worker_id)
+    assert record is not None
+    assert record.lifecycle == AssignmentLifecycle.DISPATCHED
+    assert record.delivery_state == CompletionDeliveryState.RETRYABLE
+    assert record.final_result is None
+    return service, record
+
+
+def _configure_real_terminal_retirement(
+    monkeypatch, tmp_path, *, cleanup_succeeds: bool
+):
     """Keep the real callback-aware delete path while isolating backend effects."""
     backend = MagicMock()
     backend.get_pane_working_directory.return_value = None
     backend.get_history.return_value = "synthetic pre-dispatch transcript"
     monkeypatch.setattr(terminal_mod, "get_backend", lambda: backend)
     monkeypatch.setattr(terminal_mod, "get_herdr_inbox_service", lambda: None)
-    monkeypatch.setattr(terminal_mod.fifo_manager, "stop_reader", lambda _terminal: None)
-    monkeypatch.setattr(terminal_mod.status_monitor, "clear_terminal", lambda _terminal: None)
+    monkeypatch.setattr(
+        terminal_mod.fifo_manager, "stop_reader", lambda _terminal: None
+    )
+    monkeypatch.setattr(
+        terminal_mod.status_monitor, "clear_terminal", lambda _terminal: None
+    )
     monkeypatch.setattr(
         terminal_mod.provider_manager,
         "cleanup_provider",
@@ -166,7 +224,9 @@ def _configure_real_terminal_retirement(monkeypatch, tmp_path, *, cleanup_succee
     return backend
 
 
-def _service(monkeypatch, report: str = "final report") -> AssignedWorkerCompletionService:
+def _service(
+    monkeypatch, report: str = "final report"
+) -> AssignedWorkerCompletionService:
     """Build a service with deterministic output/receiver and no tmux delivery."""
     service = AssignedWorkerCompletionService()
     monkeypatch.setattr(service, "_capture_final_result", lambda _worker: report)
@@ -175,7 +235,9 @@ def _service(monkeypatch, report: str = "final report") -> AssignedWorkerComplet
         "_classify_receiver",
         lambda _record: (CompletionReceiverState.ACTIVE, None),
     )
-    monkeypatch.setattr(service, "_attempt_immediate_inbox_delivery", lambda _caller: None)
+    monkeypatch.setattr(
+        service, "_attempt_immediate_inbox_delivery", lambda _caller: None
+    )
     return service
 
 
@@ -183,7 +245,9 @@ def _messages(receiver_id: str):
     return db.get_inbox_messages(receiver_id, limit=100)
 
 
-def test_success_without_send_message_generates_exactly_one_callback(callback_db, ids, monkeypatch):
+def test_success_without_send_message_generates_exactly_one_callback(
+    callback_db, ids, monkeypatch
+):
     """Observed regression: final output exists but the model never invokes send_message."""
     caller, worker = ids(), ids()
     _terminal(caller)
@@ -206,7 +270,8 @@ def test_success_without_send_message_generates_exactly_one_callback(callback_db
     assert record.receiver_state == CompletionReceiverState.ACTIVE
     assert record.final_result == "self-contained final response"
     assert (
-        record.final_result_sha256 == hashlib.sha256(b"self-contained final response").hexdigest()
+        record.final_result_sha256
+        == hashlib.sha256(b"self-contained final response").hexdigest()
     )
     assert record.result_reference == f"assigned-worker-callback:{record.assignment_id}"
     assert record.attempt_count == 1
@@ -230,7 +295,9 @@ def test_authoritative_no_send_result_ignores_prompt_and_terminal_history(
         "_classify_receiver",
         lambda _record: (CompletionReceiverState.ACTIVE, None),
     )
-    monkeypatch.setattr(service, "_attempt_immediate_inbox_delivery", lambda _caller: None)
+    monkeypatch.setattr(
+        service, "_attempt_immediate_inbox_delivery", lambda _caller: None
+    )
     # This is deliberately attractive but false display history. Any return to
     # get_output/LAST or arbitrary pane scraping makes the regression fail.
     monkeypatch.setattr(
@@ -247,7 +314,10 @@ def test_authoritative_no_send_result_ignores_prompt_and_terminal_history(
     assert record is not None
     assert record.final_result == "SYNTHETIC_CALLBACK_SMOKE_OK"
     assert record.final_result != task
-    assert record.final_result_sha256 == hashlib.sha256(b"SYNTHETIC_CALLBACK_SMOKE_OK").hexdigest()
+    assert (
+        record.final_result_sha256
+        == hashlib.sha256(b"SYNTHETIC_CALLBACK_SMOKE_OK").hexdigest()
+    )
     assert len(_messages(caller)) == 1
 
 
@@ -277,14 +347,19 @@ def test_authoritative_multiline_and_unicode_result_is_persisted_verbatim(
         "_classify_receiver",
         lambda _record: (CompletionReceiverState.ACTIVE, None),
     )
-    monkeypatch.setattr(service, "_attempt_immediate_inbox_delivery", lambda _caller: None)
+    monkeypatch.setattr(
+        service, "_attempt_immediate_inbox_delivery", lambda _caller: None
+    )
 
     service.handle_status_event(worker, TerminalStatus.COMPLETED)
 
     record = db.get_assigned_worker_callback(worker)
     assert record is not None
     assert record.final_result == response
-    assert record.final_result_sha256 == hashlib.sha256(response.encode("utf-8")).hexdigest()
+    assert (
+        record.final_result_sha256
+        == hashlib.sha256(response.encode("utf-8")).hexdigest()
+    )
 
 
 def test_missing_authoritative_completion_is_retryable_not_a_prompt_callback(
@@ -302,8 +377,12 @@ def test_missing_authoritative_completion_is_retryable_not_a_prompt_callback(
         assignment_id="authoritative-missing",
         completion_id=completion_id,
     )
-    monkeypatch.setattr(report_mod, "PROVIDER_COMPLETION_REPORT_DIR", tmp_path / "reports")
-    report_mod.bind_completion_dispatch("mock_cli", worker, completion_id, "prompt text")
+    monkeypatch.setattr(
+        report_mod, "PROVIDER_COMPLETION_REPORT_DIR", tmp_path / "reports"
+    )
+    report_mod.bind_completion_dispatch(
+        "mock_cli", worker, completion_id, "prompt text"
+    )
     db.mark_assigned_worker_dispatched(worker)
     monkeypatch.setitem(
         completion_mod.provider_manager._providers,
@@ -322,7 +401,9 @@ def test_missing_authoritative_completion_is_retryable_not_a_prompt_callback(
     assert _messages(caller) == []
 
 
-def test_wrong_authoritative_turn_enters_manual_recovery(callback_db, ids, monkeypatch, tmp_path):
+def test_wrong_authoritative_turn_enters_manual_recovery(
+    callback_db, ids, monkeypatch, tmp_path
+):
     caller, worker = ids(), ids()
     _terminal(caller)
     _authoritative_assignment(
@@ -346,7 +427,9 @@ def test_wrong_authoritative_turn_enters_manual_recovery(callback_db, ids, monke
     assert _messages(caller) == []
 
 
-def test_malformed_retained_report_enters_manual_recovery(callback_db, ids, monkeypatch, tmp_path):
+def test_malformed_retained_report_enters_manual_recovery(
+    callback_db, ids, monkeypatch, tmp_path
+):
     caller, worker = ids(), ids()
     _terminal(caller)
     completion_id = "e" * 32
@@ -359,7 +442,9 @@ def test_malformed_retained_report_enters_manual_recovery(callback_db, ids, monk
         assignment_id="authoritative-malformed",
         completion_id=completion_id,
     )
-    monkeypatch.setattr(report_mod, "PROVIDER_COMPLETION_REPORT_DIR", tmp_path / "reports")
+    monkeypatch.setattr(
+        report_mod, "PROVIDER_COMPLETION_REPORT_DIR", tmp_path / "reports"
+    )
     report_mod.bind_completion_dispatch("mock_cli", worker, completion_id, "exact task")
     _, report_path, _ = report_mod._paths("mock_cli", worker, completion_id)
     report_path.write_bytes(b"{malformed")
@@ -448,7 +533,9 @@ def test_restart_reconciliation_recovers_retained_provider_report_without_pane_s
         "_classify_receiver",
         lambda _record: (CompletionReceiverState.ACTIVE, None),
     )
-    monkeypatch.setattr(restarted, "_attempt_immediate_inbox_delivery", lambda _caller: None)
+    monkeypatch.setattr(
+        restarted, "_attempt_immediate_inbox_delivery", lambda _caller: None
+    )
     monkeypatch.setattr(
         restarted,
         "_detect_live_status",
@@ -543,9 +630,17 @@ def test_unrelated_intermediate_message_is_preserved_and_does_not_suppress(
 
     messages = _messages(caller)
     assert [
-        message.id for message in messages if message.origin == InboxMessageOrigin.EXPLICIT
+        message.id
+        for message in messages
+        if message.origin == InboxMessageOrigin.EXPLICIT
     ] == [intermediate.id]
-    assert sum(message.origin == InboxMessageOrigin.SERVER_COMPLETION for message in messages) == 1
+    assert (
+        sum(
+            message.origin == InboxMessageOrigin.SERVER_COMPLETION
+            for message in messages
+        )
+        == 1
+    )
 
 
 def test_duplicate_completed_events_do_not_duplicate(callback_db, ids, monkeypatch):
@@ -563,7 +658,9 @@ def test_duplicate_completed_events_do_not_duplicate(callback_db, ids, monkeypat
     assert record.attempt_count == 1
 
 
-def test_concurrent_completed_events_serialize_to_one_callback(callback_db, ids, monkeypatch):
+def test_concurrent_completed_events_serialize_to_one_callback(
+    callback_db, ids, monkeypatch
+):
     caller, worker = ids(), ids()
     _terminal(caller)
     _assignment(worker, caller)
@@ -571,7 +668,9 @@ def test_concurrent_completed_events_serialize_to_one_callback(callback_db, ids,
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [
-            executor.submit(service.handle_status_event, worker, TerminalStatus.COMPLETED)
+            executor.submit(
+                service.handle_status_event, worker, TerminalStatus.COMPLETED
+            )
             for _ in range(2)
         ]
         for future in futures:
@@ -648,8 +747,12 @@ def test_restart_primes_all_unfinished_capture_barriers(callback_db, ids):
     restarted.announce_terminal_status(unfinished_worker, TerminalStatus.COMPLETED)
     restarted.announce_terminal_status(acknowledged_worker, TerminalStatus.COMPLETED)
 
-    assert restarted.wait_for_capture_before_input(unfinished_worker, timeout=0) is False
-    assert restarted.wait_for_capture_before_input(acknowledged_worker, timeout=0) is True
+    assert (
+        restarted.wait_for_capture_before_input(unfinished_worker, timeout=0) is False
+    )
+    assert (
+        restarted.wait_for_capture_before_input(acknowledged_worker, timeout=0) is True
+    )
 
 
 def test_completed_status_before_dispatch_gate_is_not_task_completion(
@@ -693,7 +796,9 @@ def test_restart_never_promotes_unproven_assignment_from_live_completed_status(
         completion_id="completion-unproven-restart",
     )
     service = _service(monkeypatch, "startup chrome, not proven task output")
-    monkeypatch.setattr(service, "_detect_live_status", lambda _record: TerminalStatus.COMPLETED)
+    monkeypatch.setattr(
+        service, "_detect_live_status", lambda _record: TerminalStatus.COMPLETED
+    )
 
     service.reconcile_worker(worker)
 
@@ -706,12 +811,16 @@ def test_restart_never_promotes_unproven_assignment_from_live_completed_status(
     assert "without durable dispatch proof" in (record.last_error or "")
 
 
-def test_restart_recovers_genuinely_persisted_dispatched_completion(callback_db, ids, monkeypatch):
+def test_restart_recovers_genuinely_persisted_dispatched_completion(
+    callback_db, ids, monkeypatch
+):
     caller, worker = ids(), ids()
     _terminal(caller)
     _assignment(worker, caller)
     service = _service(monkeypatch, "proven dispatched final result")
-    monkeypatch.setattr(service, "_detect_live_status", lambda _record: TerminalStatus.COMPLETED)
+    monkeypatch.setattr(
+        service, "_detect_live_status", lambda _record: TerminalStatus.COMPLETED
+    )
 
     service.reconcile_worker(worker)
 
@@ -722,7 +831,9 @@ def test_restart_recovers_genuinely_persisted_dispatched_completion(callback_db,
     assert record.final_result == "proven dispatched final result"
 
 
-def test_restart_before_enqueue_reconciles_captured_report(callback_db, ids, monkeypatch):
+def test_restart_before_enqueue_reconciles_captured_report(
+    callback_db, ids, monkeypatch
+):
     caller, worker = ids(), ids()
     _terminal(caller)
     assignment = _assignment(worker, caller)
@@ -760,7 +871,9 @@ def test_restart_after_enqueue_before_ack_reuses_exact_inbox_row(
         f"assigned-worker-callback:{assignment.assignment_id}",
     )
     assert captured is not None
-    db.record_completion_delivery_attempt(assignment.assignment_id, CompletionReceiverState.ACTIVE)
+    db.record_completion_delivery_attempt(
+        assignment.assignment_id, CompletionReceiverState.ACTIVE
+    )
     # Reproduce the two durable crash boundaries from the earlier phased
     # implementation. New writes commit insert+link+ack atomically, but restart
     # compatibility must adopt either historical shape without duplicating.
@@ -794,7 +907,9 @@ def test_restart_after_enqueue_before_ack_reuses_exact_inbox_row(
     assert record.inbox_message_id == inbox_id
 
 
-def test_deleted_receiver_is_terminal_error_but_report_is_retained(callback_db, ids, monkeypatch):
+def test_deleted_receiver_is_terminal_error_but_report_is_retained(
+    callback_db, ids, monkeypatch
+):
     caller, worker = ids(), ids()
     _terminal(caller)
     _assignment(worker, caller)
@@ -827,7 +942,9 @@ def test_permanently_invalid_receiver_is_not_rerouted(callback_db, ids, monkeypa
     )
     db.mark_assigned_worker_dispatched(worker)
     service = AssignedWorkerCompletionService()
-    monkeypatch.setattr(service, "_capture_final_result", lambda _worker: "retained report")
+    monkeypatch.setattr(
+        service, "_capture_final_result", lambda _worker: "retained report"
+    )
 
     service.handle_status_event(worker, TerminalStatus.COMPLETED)
 
@@ -839,7 +956,9 @@ def test_permanently_invalid_receiver_is_not_rerouted(callback_db, ids, monkeypa
     assert record.final_result == "retained report"
 
 
-def test_retained_unreachable_receiver_keeps_one_pending_callback(callback_db, ids, monkeypatch):
+def test_retained_unreachable_receiver_keeps_one_pending_callback(
+    callback_db, ids, monkeypatch
+):
     caller, worker = ids(), ids()
     _terminal(caller)
     _assignment(worker, caller)
@@ -975,7 +1094,9 @@ def test_retention_preserves_uncaptured_dispatched_worker_report_handle(
     monkeypatch.setattr(
         global_service,
         "_capture_final_result",
-        lambda _worker: (_ for _ in ()).throw(RuntimeError("transcript capture unavailable")),
+        lambda _worker: (_ for _ in ()).throw(
+            RuntimeError("transcript capture unavailable")
+        ),
     )
     monkeypatch.setattr(cleanup_mod, "SessionLocal", db.SessionLocal)
     monkeypatch.setattr(cleanup_mod, "RETENTION_DAYS", 7)
@@ -1014,8 +1135,12 @@ def test_missing_backend_provider_deferral_still_classifies_worker_failure(
     _terminal(caller)
     _assignment(worker, caller)
     monkeypatch.setattr(terminal_mod, "get_herdr_inbox_service", lambda: None)
-    monkeypatch.setattr(terminal_mod.fifo_manager, "stop_reader", lambda _terminal: None)
-    monkeypatch.setattr(terminal_mod.status_monitor, "clear_terminal", lambda _terminal: None)
+    monkeypatch.setattr(
+        terminal_mod.fifo_manager, "stop_reader", lambda _terminal: None
+    )
+    monkeypatch.setattr(
+        terminal_mod.status_monitor, "clear_terminal", lambda _terminal: None
+    )
     monkeypatch.setattr(
         terminal_mod.provider_manager,
         "cleanup_provider",
@@ -1036,7 +1161,9 @@ def test_missing_backend_provider_deferral_still_classifies_worker_failure(
     assert record.lifecycle == AssignmentLifecycle.FAILED
     assert record.delivery_state == CompletionDeliveryState.TERMINAL_ERROR
     assert record.final_result is None
-    assert record.last_error == "synthetic positive proof that the backend pane is absent"
+    assert (
+        record.last_error == "synthetic positive proof that the backend pane is absent"
+    )
 
 
 @pytest.mark.asyncio
@@ -1204,7 +1331,9 @@ def test_deferred_failure_delete_deferral_retains_failed_worker_and_reports_trut
     assert "has been deleted" not in messages[0].message
 
 
-def test_retryable_enqueue_failure_retries_once_without_duplicate(callback_db, ids, monkeypatch):
+def test_retryable_enqueue_failure_retries_once_without_duplicate(
+    callback_db, ids, monkeypatch
+):
     caller, worker = ids(), ids()
     _terminal(caller)
     _assignment(worker, caller)
@@ -1249,7 +1378,9 @@ def test_retryable_receiver_classification_recovers_without_enqueueing_early(
             (CompletionReceiverState.ACTIVE, None),
         )
     )
-    monkeypatch.setattr(service, "_classify_receiver", lambda _record: next(classifications))
+    monkeypatch.setattr(
+        service, "_classify_receiver", lambda _record: next(classifications)
+    )
 
     service.handle_status_event(worker, TerminalStatus.COMPLETED)
     retryable = db.get_assigned_worker_callback(worker)
@@ -1281,13 +1412,17 @@ async def test_enqueue_failure_recovers_automatically_without_reconcile_poll_or_
         retry_initial_delay=0.01,
         retry_max_delay=0.02,
     )
-    monkeypatch.setattr(service, "_capture_final_result", lambda _worker: "automatic report")
+    monkeypatch.setattr(
+        service, "_capture_final_result", lambda _worker: "automatic report"
+    )
     monkeypatch.setattr(
         service,
         "_classify_receiver",
         lambda _record: (CompletionReceiverState.ACTIVE, None),
     )
-    monkeypatch.setattr(service, "_attempt_immediate_inbox_delivery", lambda _caller: None)
+    monkeypatch.setattr(
+        service, "_attempt_immediate_inbox_delivery", lambda _caller: None
+    )
     real_create = db.create_inbox_message
     loop = asyncio.get_running_loop()
     delivered = asyncio.Event()
@@ -1305,7 +1440,9 @@ async def test_enqueue_failure_recovers_automatically_without_reconcile_poll_or_
     monkeypatch.setattr(completion_mod, "create_inbox_message", flaky_create)
     service.start_retry_scheduler()
     try:
-        await asyncio.to_thread(service.handle_status_event, worker, TerminalStatus.COMPLETED)
+        await asyncio.to_thread(
+            service.handle_status_event, worker, TerminalStatus.COMPLETED
+        )
         first = db.get_assigned_worker_callback(worker)
         assert first is not None
         assert first.delivery_state == CompletionDeliveryState.RETRYABLE
@@ -1337,8 +1474,12 @@ async def test_receiver_classification_failure_recovers_automatically_without_po
         retry_initial_delay=0.01,
         retry_max_delay=0.02,
     )
-    monkeypatch.setattr(service, "_capture_final_result", lambda _worker: "classified report")
-    monkeypatch.setattr(service, "_attempt_immediate_inbox_delivery", lambda _caller: None)
+    monkeypatch.setattr(
+        service, "_capture_final_result", lambda _worker: "classified report"
+    )
+    monkeypatch.setattr(
+        service, "_attempt_immediate_inbox_delivery", lambda _caller: None
+    )
     classifications = iter(
         (
             (
@@ -1348,7 +1489,9 @@ async def test_receiver_classification_failure_recovers_automatically_without_po
             (CompletionReceiverState.ACTIVE, None),
         )
     )
-    monkeypatch.setattr(service, "_classify_receiver", lambda _record: next(classifications))
+    monkeypatch.setattr(
+        service, "_classify_receiver", lambda _record: next(classifications)
+    )
     real_create = db.create_inbox_message
     loop = asyncio.get_running_loop()
     delivered = asyncio.Event()
@@ -1361,7 +1504,9 @@ async def test_receiver_classification_failure_recovers_automatically_without_po
     monkeypatch.setattr(completion_mod, "create_inbox_message", signal_create)
     service.start_retry_scheduler()
     try:
-        await asyncio.to_thread(service.handle_status_event, worker, TerminalStatus.COMPLETED)
+        await asyncio.to_thread(
+            service.handle_status_event, worker, TerminalStatus.COMPLETED
+        )
         assert _messages(caller) == []
         await asyncio.wait_for(delivered.wait(), timeout=1)
     finally:
@@ -1387,8 +1532,12 @@ async def test_retry_scheduler_shutdown_cancels_deadlines_and_bounds_backoff(
         retry_initial_delay=0.01,
         retry_max_delay=0.02,
     )
-    monkeypatch.setattr(service, "_capture_final_result", lambda _worker: "retained report")
-    monkeypatch.setattr(service, "_attempt_immediate_inbox_delivery", lambda _caller: None)
+    monkeypatch.setattr(
+        service, "_capture_final_result", lambda _worker: "retained report"
+    )
+    monkeypatch.setattr(
+        service, "_attempt_immediate_inbox_delivery", lambda _caller: None
+    )
     loop = asyncio.get_running_loop()
     second_failure = asyncio.Event()
     second_retry_requested = asyncio.Event()
@@ -1416,7 +1565,9 @@ async def test_retry_scheduler_shutdown_cancels_deadlines_and_bounds_backoff(
     service.start_retry_scheduler()
     scheduler = service._retry_scheduler_task
     try:
-        await asyncio.to_thread(service.handle_status_event, worker, TerminalStatus.COMPLETED)
+        await asyncio.to_thread(
+            service.handle_status_event, worker, TerminalStatus.COMPLETED
+        )
         await asyncio.wait_for(second_failure.wait(), timeout=1)
         await asyncio.wait_for(second_retry_requested.wait(), timeout=1)
         # The deadline callback was queued before the test signal above.
@@ -1447,11 +1598,15 @@ async def test_run_owns_startup_reconciliation_and_cleans_retry_scheduler(
     monkeypatch.setattr(
         before_restart,
         "_classify_receiver",
-        lambda _record: (CompletionReceiverState.RETRYABLE_FAILURE, "pre-restart outage"),
+        lambda _record: (
+            CompletionReceiverState.RETRYABLE_FAILURE,
+            "pre-restart outage",
+        ),
     )
     before_restart.handle_status_event(worker, TerminalStatus.COMPLETED)
     assert (
-        db.get_assigned_worker_callback(worker).delivery_state == CompletionDeliveryState.RETRYABLE
+        db.get_assigned_worker_callback(worker).delivery_state
+        == CompletionDeliveryState.RETRYABLE
     )
 
     restarted = AssignedWorkerCompletionService(
@@ -1463,7 +1618,9 @@ async def test_run_owns_startup_reconciliation_and_cleans_retry_scheduler(
         "_classify_receiver",
         lambda _record: (CompletionReceiverState.ACTIVE, None),
     )
-    monkeypatch.setattr(restarted, "_attempt_immediate_inbox_delivery", lambda _caller: None)
+    monkeypatch.setattr(
+        restarted, "_attempt_immediate_inbox_delivery", lambda _caller: None
+    )
     real_create = db.create_inbox_message
     loop = asyncio.get_running_loop()
     delivered = asyncio.Event()
@@ -1519,7 +1676,9 @@ def test_two_callers_never_cross_routes(callback_db, ids, monkeypatch):
     assert [message.sender_id for message in _messages(caller_two)] == [worker_two]
 
 
-def test_failure_and_cancellation_never_emit_success_callback(callback_db, ids, monkeypatch):
+def test_failure_and_cancellation_never_emit_success_callback(
+    callback_db, ids, monkeypatch
+):
     caller, failed_worker, cancelled_worker = ids(), ids(), ids()
     _terminal(caller)
     _assignment(failed_worker, caller, sequence=1)
@@ -1532,7 +1691,9 @@ def test_failure_and_cancellation_never_emit_success_callback(callback_db, ids, 
         raise ProviderCompletionUnavailableError("cancelled worker emitted no report")
 
     monkeypatch.setattr(service, "_capture_final_result", no_completion_report)
-    monkeypatch.setattr(service, "_detect_live_status", lambda _record: TerminalStatus.IDLE)
+    monkeypatch.setattr(
+        service, "_detect_live_status", lambda _record: TerminalStatus.IDLE
+    )
     assert service.prepare_terminal_retirement(cancelled_worker) is True
 
     assert len(_messages(caller)) == 1
@@ -1561,13 +1722,17 @@ def test_retirement_recovers_retained_report_before_idle_cancellation(
         response=response,
     )
     service = AssignedWorkerCompletionService()
-    monkeypatch.setattr(service, "_detect_live_status", lambda _record: TerminalStatus.IDLE)
+    monkeypatch.setattr(
+        service, "_detect_live_status", lambda _record: TerminalStatus.IDLE
+    )
     monkeypatch.setattr(
         service,
         "_classify_receiver",
         lambda _record: (CompletionReceiverState.ACTIVE, None),
     )
-    monkeypatch.setattr(service, "_attempt_immediate_inbox_delivery", lambda _caller: None)
+    monkeypatch.setattr(
+        service, "_attempt_immediate_inbox_delivery", lambda _caller: None
+    )
 
     assert service.prepare_terminal_retirement(worker) is True
 
@@ -1575,11 +1740,418 @@ def test_retirement_recovers_retained_report_before_idle_cancellation(
     assert retained is not None
     assert retained.lifecycle == AssignmentLifecycle.COMPLETED
     assert retained.final_result == response
-    assert retained.final_result_sha256 == hashlib.sha256(response.encode("utf-8")).hexdigest()
+    assert (
+        retained.final_result_sha256
+        == hashlib.sha256(response.encode("utf-8")).hexdigest()
+    )
     assert len(_messages(caller)) == 1
 
 
-def test_report_integrity_and_manual_recovery_outlive_both_terminals(callback_db, ids, monkeypatch):
+_VALID_SHA256 = "5" * 64
+_OTHER_VALID_SHA256 = "6" * 64
+
+
+def _reconcile(
+    service, worker, caller, record, *, reason="reason", evidence=None, token=None
+):
+    """Call reconcile_caller_accepted_result with a well-formed default payload."""
+    default_evidence = {
+        "archive_reference": "archive-ref",
+        "archive_sha256": _VALID_SHA256,
+        "accepted_evidence": "PR44 merge 5c673ce11e8226ed23d2566f7f780d7d9471354c",
+    }
+    if evidence:
+        default_evidence.update(evidence)
+    return service.reconcile_caller_accepted_result(
+        worker,
+        caller,
+        record.assignment_id,
+        token if token is not None else compute_reconciliation_state_token(record),
+        reason,
+        default_evidence,
+    )
+
+
+def test_permanently_stuck_missing_report_blocks_retirement_without_reconciliation(
+    callback_db, ids, monkeypatch, tmp_path
+):
+    """Without caller-evidence reconciliation, the incident state stays refused."""
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    service, _record = _stuck_missing_report_worker(
+        worker, caller, monkeypatch, tmp_path
+    )
+    monkeypatch.setattr(
+        service, "_detect_live_status", lambda _record: TerminalStatus.UNKNOWN
+    )
+
+    assert service.prepare_terminal_retirement(worker) is False
+
+    still_stuck = db.get_assigned_worker_callback(worker)
+    assert still_stuck.lifecycle == AssignmentLifecycle.DISPATCHED
+    assert still_stuck.delivery_state == CompletionDeliveryState.RETRYABLE
+    assert still_stuck.caller_reconciled_at is None
+
+
+def test_reconcile_caller_accepted_result_unblocks_retirement_without_forging_completion(
+    callback_db, ids, monkeypatch, tmp_path
+):
+    """Caller-evidence reconciliation is additive audit, never forged completion."""
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    service, record = _stuck_missing_report_worker(
+        worker, caller, monkeypatch, tmp_path
+    )
+
+    reconciled = _reconcile(
+        service,
+        worker,
+        caller,
+        record,
+        reason="Independently verified: associated PR was reviewed and merged",
+        evidence={
+            "accepted_evidence": "PR44 merge 5c673ce11e8226ed23d2566f7f780d7d9471354c"
+        },
+    )
+
+    # Never forged: the truthful missing-provider-report state is untouched.
+    assert reconciled.lifecycle == AssignmentLifecycle.DISPATCHED
+    assert reconciled.delivery_state == CompletionDeliveryState.RETRYABLE
+    assert reconciled.final_result is None
+    assert reconciled.assignment_id == record.assignment_id
+    # The additive audit fact is durable and complete, canonicalized+hashed,
+    # and binds the exact assignment_id/state_token that were accepted.
+    assert reconciled.caller_reconciled_at is not None
+    assert reconciled.reconciliation_reason == (
+        "Independently verified: associated PR was reviewed and merged"
+    )
+    assert "5c673ce11e8226ed23d2566f7f780d7d9471354c" in (
+        reconciled.reconciliation_evidence or ""
+    )
+    assert record.assignment_id in (reconciled.reconciliation_evidence or "")
+    assert (
+        hashlib.sha256(reconciled.reconciliation_evidence.encode("utf-8")).hexdigest()
+        == reconciled.reconciliation_evidence_sha256
+    )
+
+    # Retirement is now unblocked purely by that additive evidence, but ONLY
+    # while genuinely idle at the moment of retirement (see the dedicated
+    # live-state-race test below for the negative case).
+    monkeypatch.setattr(
+        service, "_detect_live_status", lambda _record: TerminalStatus.UNKNOWN
+    )
+    assert service.prepare_terminal_retirement(worker) is True
+
+    # Post-retirement, the callback row (retained forever) still shows the
+    # truthful provider state alongside the caller-acceptance evidence.
+    after = db.get_assigned_worker_callback(worker)
+    assert after.lifecycle == AssignmentLifecycle.DISPATCHED
+    assert after.final_result is None
+    assert after.caller_reconciled_at is not None
+
+
+def test_reconciled_retirement_is_blocked_while_terminal_is_live_again(
+    callback_db, ids, monkeypatch, tmp_path
+):
+    """Reconciliation is necessary but not sufficient: liveness is re-checked at teardown time."""
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    service, record = _stuck_missing_report_worker(
+        worker, caller, monkeypatch, tmp_path
+    )
+    monkeypatch.setattr(
+        service, "_detect_live_status", lambda _record: TerminalStatus.IDLE
+    )
+
+    reconciled = _reconcile(service, worker, caller, record)
+    assert reconciled.caller_reconciled_at is not None
+
+    # The terminal transitions active again after reconciliation but before
+    # actual retirement (e.g. a restart, or some other trigger) -- retirement
+    # must remain blocked; caller_reconciled_at is NOT an unconditional bypass.
+    monkeypatch.setattr(
+        service, "_detect_live_status", lambda _record: TerminalStatus.PROCESSING
+    )
+    assert service.prepare_terminal_retirement(worker) is False
+
+    # Once it genuinely returns to idle, the SAME accepted reconciliation
+    # (no new reconcile call) is sufficient to retire it.
+    monkeypatch.setattr(
+        service, "_detect_live_status", lambda _record: TerminalStatus.IDLE
+    )
+    assert service.prepare_terminal_retirement(worker) is True
+
+
+def test_reconcile_caller_accepted_result_rejects_wrong_caller(
+    callback_db, ids, monkeypatch, tmp_path
+):
+    caller, impostor, worker = ids(), ids(), ids()
+    _terminal(caller)
+    _terminal(impostor)
+    service, record = _stuck_missing_report_worker(
+        worker, caller, monkeypatch, tmp_path
+    )
+
+    with pytest.raises(TerminalRetirementReconciliationError) as exc_info:
+        _reconcile(
+            service, worker, impostor, record, reason="not my assignment to reconcile"
+        )
+    assert exc_info.value.code == "wrong_caller"
+
+    untouched = db.get_assigned_worker_callback(worker)
+    assert untouched.caller_reconciled_at is None
+
+
+def test_reconcile_caller_accepted_result_rejects_unknown_worker(callback_db, ids):
+    caller = ids()
+    _terminal(caller)
+
+    with pytest.raises(TerminalRetirementReconciliationError) as exc_info:
+        AssignedWorkerCompletionService().reconcile_caller_accepted_result(
+            "deadbeef",
+            caller,
+            "assignment-x",
+            "token-x",
+            "reason",
+            {
+                "archive_reference": "x",
+                "archive_sha256": _VALID_SHA256,
+                "accepted_evidence": "y",
+            },
+        )
+    assert exc_info.value.code == "not_found"
+
+
+def test_reconcile_caller_accepted_result_rejects_wrong_assignment(
+    callback_db, ids, monkeypatch, tmp_path
+):
+    """A caller-supplied assignment_id that doesn't match the record is refused."""
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    service, record = _stuck_missing_report_worker(
+        worker, caller, monkeypatch, tmp_path
+    )
+
+    with pytest.raises(TerminalRetirementReconciliationError) as exc_info:
+        service.reconcile_caller_accepted_result(
+            worker,
+            caller,
+            "some-other-assignment-id",
+            compute_reconciliation_state_token(record),
+            "reason",
+            {
+                "archive_reference": "x",
+                "archive_sha256": _VALID_SHA256,
+                "accepted_evidence": "y",
+            },
+        )
+    assert exc_info.value.code == "wrong_assignment"
+
+    untouched = db.get_assigned_worker_callback(worker)
+    assert untouched.caller_reconciled_at is None
+
+
+def test_reconcile_caller_accepted_result_rejects_stale_evidence(
+    callback_db, ids, monkeypatch, tmp_path
+):
+    """A caller-supplied state token that no longer matches the record is refused."""
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    service, record = _stuck_missing_report_worker(
+        worker, caller, monkeypatch, tmp_path
+    )
+
+    with pytest.raises(TerminalRetirementReconciliationError) as exc_info:
+        _reconcile(
+            service, worker, caller, record, token="stale-token-from-an-earlier-look"
+        )
+    assert exc_info.value.code == "stale_evidence"
+    # The refusal names the fresh token so a caller can re-inspect and retry.
+    assert compute_reconciliation_state_token(record) in str(exc_info.value)
+
+    untouched = db.get_assigned_worker_callback(worker)
+    assert untouched.caller_reconciled_at is None
+
+
+def test_reconcile_caller_accepted_result_rejects_live_terminal(
+    callback_db, ids, monkeypatch, tmp_path
+):
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    service, record = _stuck_missing_report_worker(
+        worker, caller, monkeypatch, tmp_path
+    )
+    monkeypatch.setattr(
+        service, "_detect_live_status", lambda _record: TerminalStatus.PROCESSING
+    )
+
+    with pytest.raises(TerminalRetirementReconciliationError) as exc_info:
+        _reconcile(service, worker, caller, record)
+    assert exc_info.value.code == "terminal_live"
+
+
+def test_reconcile_caller_accepted_result_rejects_genuine_completion(
+    callback_db, ids, monkeypatch, tmp_path
+):
+    """A record with a genuine provider report is already retirable; refuse it here."""
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    _authoritative_assignment(worker, caller, monkeypatch, tmp_path)
+    service = AssignedWorkerCompletionService()
+    service.handle_status_event(worker, TerminalStatus.COMPLETED)
+    record = db.get_assigned_worker_callback(worker)
+    assert record.lifecycle == AssignmentLifecycle.COMPLETED
+
+    with pytest.raises(TerminalRetirementReconciliationError) as exc_info:
+        _reconcile(service, worker, caller, record)
+    assert exc_info.value.code == "not_eligible"
+
+
+def test_reconcile_caller_accepted_result_rejects_invalid_evidence(
+    callback_db, ids, monkeypatch, tmp_path
+):
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    service, record = _stuck_missing_report_worker(
+        worker, caller, monkeypatch, tmp_path
+    )
+
+    for reason, evidence in (
+        ("", {}),
+        ("reason", {"archive_reference": ""}),
+        ("reason", {"accepted_evidence": "   "}),
+        ("reason", {"archive_sha256": ""}),
+        ("reason", {"archive_sha256": "not-a-real-sha256"}),
+        ("reason", {"archive_sha256": "a" * 63}),  # one char short
+        ("reason", {"archive_sha256": "G" * 64}),  # not hex
+    ):
+        with pytest.raises(TerminalRetirementReconciliationError) as exc_info:
+            _reconcile(
+                service, worker, caller, record, reason=reason, evidence=evidence
+            )
+        assert exc_info.value.code == "invalid_evidence"
+
+    assert db.get_assigned_worker_callback(worker).caller_reconciled_at is None  # type: ignore[union-attr]
+
+
+def test_reconcile_caller_accepted_result_allows_unresolved_manual_recovery(
+    callback_db, ids, monkeypatch, tmp_path
+):
+    """The other genuinely-stuck missing-report shape (manual recovery) is also eligible."""
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    _authoritative_assignment(
+        worker,
+        caller,
+        monkeypatch,
+        tmp_path,
+        task="the dispatched task",
+        reported_input="a different provider turn",
+    )
+    service = AssignedWorkerCompletionService()
+    service.handle_status_event(worker, TerminalStatus.COMPLETED)
+    stuck = db.get_assigned_worker_callback(worker)
+    assert stuck.lifecycle == AssignmentLifecycle.UNRESOLVED
+    assert stuck.delivery_state == CompletionDeliveryState.MANUAL_RECOVERY
+
+    reconciled = _reconcile(
+        service,
+        worker,
+        caller,
+        stuck,
+        reason="Reviewed retained transcript manually; work was accepted",
+        evidence={"archive_reference": "archive-1", "accepted_evidence": "merge-sha-1"},
+    )
+    assert reconciled.caller_reconciled_at is not None
+    assert reconciled.lifecycle == AssignmentLifecycle.UNRESOLVED
+
+    monkeypatch.setattr(
+        service, "_detect_live_status", lambda _record: TerminalStatus.IDLE
+    )
+    assert service.prepare_terminal_retirement(worker) is True
+
+
+def test_reconcile_caller_accepted_result_exact_replay_is_idempotent(
+    callback_db, ids, monkeypatch, tmp_path
+):
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    service, record = _stuck_missing_report_worker(
+        worker, caller, monkeypatch, tmp_path
+    )
+
+    first = _reconcile(service, worker, caller, record, reason="first reason")
+    # An EXACT replay (same assignment_id/state_token/reason/evidence -- e.g. a
+    # retried MCP/API request) is a safe no-op that returns the same record.
+    again = _reconcile(service, worker, caller, record, reason="first reason")
+
+    assert again.caller_reconciled_at == first.caller_reconciled_at
+    assert again.reconciliation_evidence == first.reconciliation_evidence
+
+
+def test_reconcile_caller_accepted_result_conflicting_duplicate_is_refused(
+    callback_db, ids, monkeypatch, tmp_path
+):
+    """A second request differing in reason/evidence against an already-reconciled
+    record is a conflict, never a silent overwrite."""
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    service, record = _stuck_missing_report_worker(
+        worker, caller, monkeypatch, tmp_path
+    )
+
+    first = _reconcile(service, worker, caller, record, reason="first reason")
+
+    with pytest.raises(TerminalRetirementReconciliationError) as exc_info:
+        _reconcile(
+            service,
+            worker,
+            caller,
+            record,
+            reason="a completely different later reason",
+            evidence={"accepted_evidence": "a different acceptance reference entirely"},
+        )
+    assert exc_info.value.code == "already_reconciled"
+
+    untouched = db.get_assigned_worker_callback(worker)
+    assert untouched.reconciliation_reason == first.reconciliation_reason
+    assert untouched.reconciliation_evidence == first.reconciliation_evidence
+
+
+def test_reconciliation_evidence_survives_terminal_deletion(
+    callback_db, ids, monkeypatch, tmp_path
+):
+    """The retirement audit remains accessible after the worker terminal row is gone.
+
+    Also proves ``prepare_terminal_retirement() is True`` actually translates
+    into a real, completable ``db.delete_terminal`` -- the low-level
+    "unclassified assigned-worker terminal must be retained" guard has to know
+    about ``caller_reconciled_at`` too, or this reconciliation would unblock
+    the service-layer check while the DB itself still refuses the delete.
+    """
+    caller, worker = ids(), ids()
+    _terminal(caller)
+    service, record = _stuck_missing_report_worker(
+        worker, caller, monkeypatch, tmp_path
+    )
+    reconciled = _reconcile(service, worker, caller, record)
+    monkeypatch.setattr(
+        service, "_detect_live_status", lambda _record: TerminalStatus.IDLE
+    )
+    assert service.prepare_terminal_retirement(worker) is True
+
+    assert db.delete_terminal(worker) is True
+
+    retained = db.get_assigned_worker_callback(worker)
+    assert retained is not None
+    assert retained.caller_reconciled_at is not None
+    assert retained.reconciliation_reason == reconciled.reconciliation_reason
+    assert retained.reconciliation_evidence == reconciled.reconciliation_evidence
+
+
+def test_report_integrity_and_manual_recovery_outlive_both_terminals(
+    callback_db, ids, monkeypatch
+):
     caller, worker = ids(), ids()
     report = "line one\nline two\nverbatim terminal result"
     _terminal(caller)
@@ -1591,7 +2163,9 @@ def test_report_integrity_and_manual_recovery_outlive_both_terminals(callback_db
     assert delivered is not None and delivered.inbox_message_id is not None
     claim_token = "genuinely-delivered-before-delete"
     assert db.claim_inbox_message(delivered.inbox_message_id, claim_token) is not None
-    assert db.resolve_inbox_claim(delivered.inbox_message_id, claim_token, MessageStatus.DELIVERED)
+    assert db.resolve_inbox_claim(
+        delivered.inbox_message_id, claim_token, MessageStatus.DELIVERED
+    )
 
     db.delete_terminal(worker)
     db.delete_terminal(caller)
@@ -1599,13 +2173,21 @@ def test_report_integrity_and_manual_recovery_outlive_both_terminals(callback_db
     retained = db.get_assigned_worker_callback(worker)
     assert retained is not None
     assert retained.final_result == report
-    assert retained.final_result_sha256 == hashlib.sha256(report.encode("utf-8")).hexdigest()
-    assert retained.result_reference == f"assigned-worker-callback:{retained.assignment_id}"
+    assert (
+        retained.final_result_sha256
+        == hashlib.sha256(report.encode("utf-8")).hexdigest()
+    )
+    assert (
+        retained.result_reference
+        == f"assigned-worker-callback:{retained.assignment_id}"
+    )
     assert retained.delivery_state == CompletionDeliveryState.ACKNOWLEDGED
     assert retained.receiver_state == CompletionReceiverState.DELETED
 
 
-def test_queued_callback_becomes_deleted_receiver_manual_recovery(callback_db, ids, monkeypatch):
+def test_queued_callback_becomes_deleted_receiver_manual_recovery(
+    callback_db, ids, monkeypatch
+):
     caller, worker = ids(), ids()
     _terminal(caller)
     _assignment(worker, caller)
@@ -1698,7 +2280,9 @@ def test_concurrent_explicit_final_and_server_insert_commit_one_callback(
     assert linked is not None and linked.inbox_message_id == explicit_row.id
 
 
-def test_concurrent_non_equivalent_explicit_message_is_never_suppressed(callback_db, ids):
+def test_concurrent_non_equivalent_explicit_message_is_never_suppressed(
+    callback_db, ids
+):
     caller, worker = ids(), ids()
     _terminal(caller)
     assignment = _assignment(worker, caller)
@@ -1739,7 +2323,9 @@ def test_concurrent_non_equivalent_explicit_message_is_never_suppressed(callback
 
 
 @pytest.mark.asyncio
-async def test_status_event_delivers_without_supervisor_polling(callback_db, ids, monkeypatch):
+async def test_status_event_delivers_without_supervisor_polling(
+    callback_db, ids, monkeypatch
+):
     caller, worker = ids(), ids()
     _terminal(caller)
     _assignment(worker, caller)
@@ -1770,7 +2356,9 @@ async def test_status_event_delivers_without_supervisor_polling(callback_db, ids
     assert messages[0].origin == InboxMessageOrigin.SERVER_COMPLETION
 
 
-def test_followup_failure_notifies_caller_once_and_preserves_success(callback_db, ids, monkeypatch):
+def test_followup_failure_notifies_caller_once_and_preserves_success(
+    callback_db, ids, monkeypatch
+):
     caller, worker = ids(), ids()
     _terminal(caller)
     _assignment(worker, caller)
@@ -1786,7 +2374,10 @@ def test_followup_failure_notifies_caller_once_and_preserves_success(callback_db
     assert len(notices) == 1
     assert notices[0].message.startswith("CAO_WORKER_FAILED:")
     assert notices[0].receiver_id == caller
-    assert len([m for m in messages if m.origin == InboxMessageOrigin.SERVER_COMPLETION]) == 1
+    assert (
+        len([m for m in messages if m.origin == InboxMessageOrigin.SERVER_COMPLETION])
+        == 1
+    )
 
 
 def test_failure_notice_recovers_after_restart(callback_db, ids, monkeypatch):
@@ -1796,11 +2387,19 @@ def test_failure_notice_recovers_after_restart(callback_db, ids, monkeypatch):
     service = _service(monkeypatch)
     service.handle_status_event(worker, TerminalStatus.COMPLETED)
     restarted = _service(monkeypatch)
-    monkeypatch.setattr(restarted, "_detect_live_status", lambda record: TerminalStatus.ERROR)
+    monkeypatch.setattr(
+        restarted, "_detect_live_status", lambda record: TerminalStatus.ERROR
+    )
     restarted.reconcile_pending()
     restarted.reconcile_pending()
-    assert len([m for m in _messages(caller) if m.origin == InboxMessageOrigin.SYSTEM]) == 1
-    assert db.get_assigned_worker_callback(worker).lifecycle == AssignmentLifecycle.COMPLETED
+    assert (
+        len([m for m in _messages(caller) if m.origin == InboxMessageOrigin.SYSTEM])
+        == 1
+    )
+    assert (
+        db.get_assigned_worker_callback(worker).lifecycle
+        == AssignmentLifecycle.COMPLETED
+    )
 
 
 def test_failure_notice_retries_database_enqueue_without_restarting_worker(
@@ -1823,10 +2422,15 @@ def test_failure_notice_retries_database_enqueue_without_restarting_worker(
     retry.assert_called_once_with(worker)
     monkeypatch.setattr(completion_mod, "create_inbox_message", original)
     service.reconcile_worker(worker)
-    assert len([m for m in _messages(caller) if m.origin == InboxMessageOrigin.SYSTEM]) == 1
+    assert (
+        len([m for m in _messages(caller) if m.origin == InboxMessageOrigin.SYSTEM])
+        == 1
+    )
 
 
-def test_native_refusal_hook_reaches_caller_once(callback_db, ids, monkeypatch, tmp_path):
+def test_native_refusal_hook_reaches_caller_once(
+    callback_db, ids, monkeypatch, tmp_path
+):
     from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
     from cli_agent_orchestrator.services import claude_native_completion as native
 
@@ -1843,7 +2447,9 @@ def test_native_refusal_hook_reaches_caller_once(callback_db, ids, monkeypatch, 
         completion_id=completion_id,
     )
     db.mark_assigned_worker_dispatched(worker)
-    monkeypatch.setattr(report_mod, "PROVIDER_COMPLETION_REPORT_DIR", tmp_path / "reports")
+    monkeypatch.setattr(
+        report_mod, "PROVIDER_COMPLETION_REPORT_DIR", tmp_path / "reports"
+    )
     native.configure_native(worker, completion_id)
     report_mod.bind_completion_dispatch("claude_code", worker, completion_id, "Task")
     common = {
@@ -1851,15 +2457,23 @@ def test_native_refusal_hook_reaches_caller_once(callback_db, ids, monkeypatch, 
         "prompt_id": "12345678-1234-4234-8234-123456789012",
     }
     native.ingest(
-        worker, completion_id, dict(common, hook_event_name="UserPromptSubmit", prompt="Task")
+        worker,
+        completion_id,
+        dict(common, hook_event_name="UserPromptSubmit", prompt="Task"),
     )
     native.ingest(
         worker,
         completion_id,
-        dict(common, hook_event_name="Stop", last_assistant_message="I refuse this task."),
+        dict(
+            common, hook_event_name="Stop", last_assistant_message="I refuse this task."
+        ),
     )
-    provider = ClaudeCodeProvider(worker, "cao-test", "worker", completion_id=completion_id)
-    monkeypatch.setattr(completion_mod.provider_manager, "get_provider", lambda _: provider)
+    provider = ClaudeCodeProvider(
+        worker, "cao-test", "worker", completion_id=completion_id
+    )
+    monkeypatch.setattr(
+        completion_mod.provider_manager, "get_provider", lambda _: provider
+    )
     service = AssignedWorkerCompletionService()
     monkeypatch.setattr(
         service, "_classify_receiver", lambda _: (CompletionReceiverState.ACTIVE, None)
@@ -1871,7 +2485,9 @@ def test_native_refusal_hook_reaches_caller_once(callback_db, ids, monkeypatch, 
     assert _messages(caller)[0].message.startswith("I refuse this task.")
 
 
-def test_native_question_wakes_brain_once_without_answering(callback_db, ids, monkeypatch):
+def test_native_question_wakes_brain_once_without_answering(
+    callback_db, ids, monkeypatch
+):
     from cli_agent_orchestrator.services import claude_question
 
     caller, worker = ids(), ids()
@@ -1898,4 +2514,7 @@ def test_native_question_wakes_brain_once_without_answering(callback_db, ids, mo
     assert len(_messages(caller)) == 1
     assert _messages(caller)[0].origin == InboxMessageOrigin.SYSTEM
     assert "waiting for an answer" in _messages(caller)[0].message
-    assert db.get_assigned_worker_callback(worker).lifecycle == AssignmentLifecycle.DISPATCHED
+    assert (
+        db.get_assigned_worker_callback(worker).lifecycle
+        == AssignmentLifecycle.DISPATCHED
+    )
