@@ -21,6 +21,14 @@ class MessageStatus(str, Enum):
     DELIVERING = "delivering"
     DELIVERED = "delivered"
     FAILED = "failed"
+    # correction-1038: a PENDING row explicitly, durably superseded by a
+    # later PENDING row from the SAME (sender_id, receiver_id) pair, via
+    # ``clients.database.supersede_inbox_messages``. The original row/
+    # content/id/sender/receiver are never altered or deleted -- only this
+    # status and ``superseded_by_message_id`` change. Excluded from
+    # ``get_pending_messages``/delivery exactly because it is no longer
+    # PENDING; never claimed, never DELIVERED, never fabricated.
+    SUPERSEDED = "superseded"
 
 
 class InboxMessageOrigin(str, Enum):
@@ -55,4 +63,11 @@ class InboxMessage(BaseModel):
     )
     claimed_at: datetime | None = Field(
         None, description="Timestamp of the current or most recent delivery claim"
+    )
+    superseded_by_message_id: int | None = Field(
+        None,
+        description=(
+            "id of the exact PENDING row (from the same sender/receiver pair) that "
+            "durably superseded this one, if any (correction-1038)."
+        ),
     )

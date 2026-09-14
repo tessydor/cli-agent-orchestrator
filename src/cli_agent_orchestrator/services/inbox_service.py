@@ -158,23 +158,33 @@ class InboxService:
             if not eager_eligible:
                 return
 
-        if status == TerminalStatus.COMPLETED:
-            # Assigned workers must retain their just-finished output until the
-            # completion service has copied it into durable callback storage.
-            # Unknown/non-assigned terminals have no barrier and return
-            # immediately.  A timeout deliberately leaves every row PENDING for
-            # the next reconciliation pass instead of risking transcript loss.
-            from cli_agent_orchestrator.services.assigned_worker_completion_service import (
-                assigned_worker_completion_service,
-            )
+        # Consult the capture hold regardless of which eligible status got us
+        # here (correction-1038). This used to be gated on
+        # ``status == TerminalStatus.COMPLETED``, on the assumption that a
+        # hold can only matter while a worker is COMPLETED -- true for a
+        # live just-finished capture, but not for a hold reconstructed at
+        # startup (correction-1033) for an unresolved persisted assignment:
+        # its provider can legitimately report IDLE for an already-quiet
+        # composer, which used to skip this check entirely. Unknown/non-
+        # assigned/never-held terminals have no barrier and return
+        # immediately (the overwhelming majority of calls); a timeout
+        # deliberately leaves every row PENDING for the next reconciliation
+        # pass instead of risking transcript loss or racing an unresolved
+        # incident. ``send_input``'s own recheck below remains the true
+        # authoritative boundary (994/1038) -- this is only the pre-claim
+        # optimization that avoids claiming rows we already know aren't
+        # deliverable yet.
+        from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+            assigned_worker_completion_service,
+        )
 
-            if not assigned_worker_completion_service.wait_for_capture_before_input(terminal_id):
-                logger.warning(
-                    "Deferred inbox delivery to completed assigned worker %s until its final "
-                    "report is durably captured",
-                    terminal_id,
-                )
-                return
+        if not assigned_worker_completion_service.wait_for_capture_before_input(terminal_id):
+            logger.warning(
+                "Deferred inbox delivery to worker %s until its unresolved capture "
+                "hold is durably captured or explicitly acknowledged",
+                terminal_id,
+            )
+            return
 
         # A stale read is harmless: every candidate must win a durable
         # PENDING -> DELIVERING compare-and-set before it may touch the pane.
@@ -242,19 +252,21 @@ class InboxService:
                     f"leaving {len(batch)} message(s) pending for retry: {e}"
                 )
             except TerminalCaptureNotDurableError as e:
-                # This terminal completed its turn WHILE send_input was
-                # blocked inside the acceptance wait above (correction-994) --
-                # this read's own earlier IDLE/COMPLETED check could not have
-                # seen that. Transient for the same reason as
-                # NativeAcceptanceTimeoutError: the next status event
-                # re-triggers delivery, and by then the capture will either
-                # be durable or the terminal has moved on again.
+                # send_input's own authoritative recheck (994/1038) found an
+                # unresolved capture hold -- either this terminal completed
+                # its turn WHILE send_input was blocked inside the acceptance
+                # wait (correction-994, this read's own earlier IDLE/COMPLETED
+                # check could not have seen that), or a hold reconstructed at
+                # startup (correction-1033) for an unresolved persisted
+                # assignment is still armed despite a live IDLE read
+                # (correction-1038). Transient either way: the next status
+                # event re-triggers delivery, and by then the hold will
+                # either be durable/released or the terminal has moved on.
                 for message in batch:
                     resolve_inbox_claim(message.id, claim_token, MessageStatus.PENDING)
                 logger.warning(
-                    f"Terminal {terminal_id} completed during the acceptance wait and its "
-                    f"report is not yet durably captured; leaving {len(batch)} message(s) "
-                    f"pending for retry: {e}"
+                    f"Terminal {terminal_id} has an unresolved capture hold; leaving "
+                    f"{len(batch)} message(s) pending for retry: {e}"
                 )
             except Exception as e:
                 for message in batch:

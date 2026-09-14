@@ -162,6 +162,11 @@ class InboxModel(Base):
     claim_token = Column(String, nullable=True)
     claimed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.now)
+    # correction-1038: id of the exact PENDING row (same sender/receiver
+    # pair) that durably superseded this one, via supersede_inbox_messages.
+    # NULL for every row never superseded. Never a foreign key to allow the
+    # superseding row itself to be deleted/retained independently.
+    superseded_by_message_id = Column(Integer, nullable=True)
 
     __table_args__ = (Index("uq_inbox_idempotency_key", "idempotency_key", unique=True),)
 
@@ -1669,6 +1674,8 @@ def _migrate_inbox_callback_schema() -> None:
                 conn.execute("ALTER TABLE inbox ADD COLUMN claim_token TEXT")
             if "claimed_at" not in columns:
                 conn.execute("ALTER TABLE inbox ADD COLUMN claimed_at DATETIME")
+            if "superseded_by_message_id" not in columns:
+                conn.execute("ALTER TABLE inbox ADD COLUMN superseded_by_message_id INTEGER")
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_inbox_idempotency_key "
                 "ON inbox (idempotency_key)"
@@ -2474,6 +2481,7 @@ def _inbox_message_from_row(row: InboxModel) -> InboxMessage:
         idempotency_key=getattr(row, "idempotency_key", None),
         claim_token=getattr(row, "claim_token", None),
         claimed_at=getattr(row, "claimed_at", None),
+        superseded_by_message_id=getattr(row, "superseded_by_message_id", None),
     )
 
 
@@ -2789,6 +2797,110 @@ def resolve_inbox_claim(
             _validate_inbox_callback_evidence(db, row)
         db.commit()
         return updated == 1
+
+
+def supersede_inbox_messages(
+    sender_id: str,
+    receiver_id: str,
+    target_message_ids: List[int],
+    superseding_message_id: int,
+) -> List[InboxMessage]:
+    """Durably mark exact PENDING rows superseded by one exact PENDING row.
+
+    The one supported prerequisite for message-1038's Part B: a sender-
+    scoped, audited supersession so an exact-order oldest-first delivery
+    query does not send an obsolete target message ahead of the message
+    that was meant to replace it. Searched first for an existing supported
+    sender-scoped supersession/cancellation/reconciliation operation --
+    none exists (the only other "supersedes" string in this module names an
+    unrelated memory-contradiction edge type).
+
+    Every identity/state check is fresh, inside one ``BEGIN IMMEDIATE``
+    write transaction covering both the superseding row and every target
+    row -- all succeed or none do; no partial application. Refuses
+    (raises ``ValueError``, no partial effect):
+
+    - an empty ``target_message_ids``, or ``superseding_message_id`` naming
+      one of its own targets;
+    - a ``superseding_message_id`` row that does not exist, does not match
+      EXACTLY ``(sender_id, receiver_id)``, or is not itself PENDING;
+    - any target row that does not exist, does not match EXACTLY
+      ``(sender_id, receiver_id)``, is CLAIMED/DELIVERING/DELIVERED/FAILED,
+      or is already SUPERSEDED by a *different* superseding_message_id.
+
+    An exact replay -- the identical ``target_message_ids`` and identical
+    ``superseding_message_id``, already fully applied by a prior call -- is
+    idempotent: already-superseded-by-this-exact-superseder rows are
+    returned unchanged rather than erroring, so a retried guarded
+    reconciliation (correction-1038's own recovery transition) can safely
+    repeat this call.
+
+    Never deletes a row, never fabricates DELIVERED, never touches any row
+    outside ``target_message_ids``, and never invents a fourth status:
+    ``message``/``sender_id``/``receiver_id``/``id``/``created_at`` on every
+    affected row are unchanged -- only ``status`` and
+    ``superseded_by_message_id`` change. ``get_pending_messages`` filters on
+    ``status == PENDING`` alone, so a superseded row is automatically
+    excluded from delivery with no separate query change required.
+    """
+    if not target_message_ids:
+        raise ValueError("target_message_ids must be non-empty")
+    if superseding_message_id in target_message_ids:
+        raise ValueError(
+            f"superseding_message_id {superseding_message_id} must not be one of "
+            "its own target_message_ids"
+        )
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        try:
+            superseder = (
+                db.query(InboxModel).filter(InboxModel.id == superseding_message_id).first()
+            )
+            if (
+                superseder is None
+                or superseder.sender_id != sender_id
+                or superseder.receiver_id != receiver_id
+            ):
+                raise ValueError(
+                    f"superseding message {superseding_message_id} does not exist for "
+                    f"sender_id={sender_id!r} receiver_id={receiver_id!r}"
+                )
+            if superseder.status != MessageStatus.PENDING.value:
+                raise ValueError(
+                    f"superseding message {superseding_message_id} is not pending "
+                    f"(status={superseder.status!r})"
+                )
+
+            results: List[InboxMessage] = []
+            for target_id in target_message_ids:
+                row = db.query(InboxModel).filter(InboxModel.id == target_id).first()
+                if row is None or row.sender_id != sender_id or row.receiver_id != receiver_id:
+                    raise ValueError(
+                        f"target message {target_id} does not exist for "
+                        f"sender_id={sender_id!r} receiver_id={receiver_id!r}"
+                    )
+                if row.status == MessageStatus.SUPERSEDED.value:
+                    if row.superseded_by_message_id == superseding_message_id:
+                        results.append(_inbox_message_from_row(row))
+                        continue
+                    raise ValueError(
+                        f"target message {target_id} is already superseded by a "
+                        f"different message ({row.superseded_by_message_id})"
+                    )
+                if row.status != MessageStatus.PENDING.value:
+                    raise ValueError(
+                        f"target message {target_id} is not pending "
+                        f"(status={row.status!r}); refusing to supersede a claimed/"
+                        "delivering/delivered/failed row"
+                    )
+                row.status = MessageStatus.SUPERSEDED.value
+                row.superseded_by_message_id = superseding_message_id
+                results.append(_inbox_message_from_row(row))
+            db.commit()
+            return results
+        except Exception:
+            db.rollback()
+            raise
 
 
 def is_assigned_worker_callback_inbox_message(message_id: int) -> bool:

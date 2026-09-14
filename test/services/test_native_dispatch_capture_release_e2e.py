@@ -591,6 +591,14 @@ RESTART_ASSIGNMENT_ID = "assignment-restart-e2e-0001"
 RESTART_COMPLETION_ID = "completion-restart-e2e-0001"
 RESTART_MESSAGE_948_CONTENT = "synthetic later follow-up (948 analogue) queued before a restart"
 
+IDLE_HOLD_CALLER_ID = "idle-hold-caller-e2e"
+IDLE_HOLD_WORKER_ID = "idle-hold-worker-e2e"
+IDLE_HOLD_ASSIGNMENT_ID = "assignment-idle-hold-e2e-0001"
+IDLE_HOLD_COMPLETION_ID = "completion-idle-hold-e2e-0001"
+IDLE_HOLD_MESSAGE_948_CONTENT = (
+    "synthetic later follow-up (948 analogue) queued before a restart into IDLE"
+)
+
 
 class TestRestartReconstructsTheCaptureHoldBeforeConsumersStart:
     """Correction-1033: register_persisted_assignments()'s OWN docstring
@@ -889,3 +897,453 @@ class TestRestartReconstructsTheCaptureHoldBeforeConsumersStart:
             assigned_worker_completion_service._release_capture_barrier(resolved_worker)
             assigned_worker_completion_service.__init__()
             status_monitor_mod.status_monitor.clear_terminal(resolved_worker)
+
+
+class TestRestartHoldGovernsIdleToo:
+    """Correction-1038: correction-1033's restart-reconstructed hold only
+    ever got consulted by ``InboxService._deliver_pending_locked`` and
+    ``terminal_service.send_input`` on the ``COMPLETED`` branch of each
+    function -- both gated the capture-hold wait behind
+    ``status == TerminalStatus.COMPLETED``. A worker whose native provider
+    legitimately reports IDLE after a restart (a ready, boxed composer,
+    with nothing new to detect) skipped that check ENTIRELY: the
+    reconstructed hold existed in memory but nothing ever asked it whether
+    it was safe to proceed. This reproduces that exact gap -- deliberately
+    the IDLE branch, never COMPLETED -- through the same REAL
+    register_persisted_assignments -> InboxService.deliver_pending ->
+    terminal_service.send_input path as the sibling class above, and
+    proves the fix (moving the capture-hold check outside any
+    status-specific gate, in both functions) closes it without requiring
+    ANY particular status label.
+    """
+
+    @staticmethod
+    def _restart_alone_idle(monkeypatch, assigned_worker_completion_service):
+        """Same restart simulation as the COMPLETED sibling, except the
+        restart-status derivation reports IDLE -- a ready, boxed composer,
+        not a fresh completion. This is the exact status label message
+        1038 identifies as the one the pre-fix code never checked a hold
+        against.
+        """
+        assigned_worker_completion_service.__init__()
+        assigned_worker_completion_service.register_persisted_assignments()
+        monkeypatch.setattr(
+            status_monitor_mod.status_monitor,
+            "get_status",
+            lambda _id: TerminalStatus.IDLE,
+        )
+
+    def test_restart_into_idle_does_not_let_inbox_deliver_before_the_ack(
+        self, capture_release_db, monkeypatch
+    ):
+        from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+            assigned_worker_completion_service,
+        )
+
+        try:
+            TestRestartReconstructsTheCaptureHoldBeforeConsumersStart._seed(
+                IDLE_HOLD_WORKER_ID,
+                IDLE_HOLD_CALLER_ID,
+                IDLE_HOLD_ASSIGNMENT_ID,
+                IDLE_HOLD_COMPLETION_ID,
+                IDLE_HOLD_MESSAGE_948_CONTENT,
+            )
+            self._restart_alone_idle(monkeypatch, assigned_worker_completion_service)
+
+            writes = TestRestartReconstructsTheCaptureHoldBeforeConsumersStart._deliver(
+                IDLE_HOLD_WORKER_ID
+            )
+
+            assert writes == [], (
+                "InboxService delivered the pending 948 analogue to a worker reporting "
+                "IDLE whose corrupted/unresolved persisted assignment was never "
+                "reconciled after a simulated restart -- correction-1038's exact gap "
+                "reproduced (the hold existed but was never consulted on the IDLE "
+                "branch)"
+            )
+            pending_after = db.get_pending_messages(IDLE_HOLD_WORKER_ID, limit=10)
+            assert len(pending_after) == 1, "the message must remain PENDING, not lost"
+
+            assert (
+                assigned_worker_completion_service.wait_for_capture_before_input(
+                    IDLE_HOLD_WORKER_ID, timeout=0.2
+                )
+                is False
+            ), "the reconstructed hold must still be armed, independent of status"
+        finally:
+            assigned_worker_completion_service._release_capture_barrier(IDLE_HOLD_WORKER_ID)
+            assigned_worker_completion_service.__init__()
+            status_monitor_mod.status_monitor.clear_terminal(IDLE_HOLD_WORKER_ID)
+
+    def test_post_ack_ordinary_delivery_exactly_once_from_idle(
+        self, capture_release_db, monkeypatch
+    ):
+        """After the restart-reconstructed hold blocks delivery to an
+        IDLE-reporting worker, the existing guarded recovery
+        acknowledgement (unchanged, correction-997/1001/1007) releases it,
+        and ordinary InboxService delivery then delivers the existing
+        pending 948 analogue exactly once -- proving the IDLE-branch fix
+        does not strand the hold forever, only until the real,
+        already-tested release path runs.
+        """
+        from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+            assigned_worker_completion_service,
+        )
+
+        bound_prefix = "synthetic idle-restart-scenario dispatch (1038)"
+        message_874_content = (
+            "synthetic already-delivered follow-up (874 analogue), idle-restart case"
+        )
+        corrupted_transcript = bound_prefix + message_874_content
+
+        try:
+            TestRestartReconstructsTheCaptureHoldBeforeConsumersStart._seed(
+                IDLE_HOLD_WORKER_ID,
+                IDLE_HOLD_CALLER_ID,
+                IDLE_HOLD_ASSIGNMENT_ID,
+                IDLE_HOLD_COMPLETION_ID,
+                IDLE_HOLD_MESSAGE_948_CONTENT,
+            )
+            self._restart_alone_idle(monkeypatch, assigned_worker_completion_service)
+
+            # Blocked pre-ack (same proof as the test above), still on IDLE.
+            assert (
+                TestRestartReconstructsTheCaptureHoldBeforeConsumersStart._deliver(
+                    IDLE_HOLD_WORKER_ID
+                )
+                == []
+            )
+
+            result = (
+                assigned_worker_completion_service.reconcile_corrupted_dispatch_capture_release(
+                    IDLE_HOLD_WORKER_ID,
+                    assignment_id=IDLE_HOLD_ASSIGNMENT_ID,
+                    requesting_caller_id=IDLE_HOLD_CALLER_ID,
+                    transcript_first_user_text=corrupted_transcript,
+                    expected_transcript_sha256=utf8_sha256(corrupted_transcript),
+                    admissible_dispatch_sha256=[utf8_sha256(bound_prefix)],
+                    concatenated_message_id="874-idle-restart",
+                    concatenated_message_sender_id=IDLE_HOLD_CALLER_ID,
+                    concatenated_message_receiver_id=IDLE_HOLD_WORKER_ID,
+                    concatenated_message_content=message_874_content,
+                    concatenated_message_delivery_state="delivered",
+                    concatenated_message_session_id="synthetic-idle-restart-session",
+                    recorded_at="2026-09-14T00:00:00+00:00",
+                    acknowledgement=(
+                        f"{IDLE_HOLD_CALLER_ID} acknowledges the corrupted dispatch is abandoned"
+                    ),
+                    acknowledged_at="2026-09-14T00:01:00+00:00",
+                )
+            )
+            assert result.released_now is True
+
+            after = db.get_assigned_worker_callback(IDLE_HOLD_WORKER_ID)
+            assert after.lifecycle == AssignmentLifecycle.DISPATCHED
+            assert after.final_result is None
+
+            # Status is STILL IDLE (never flipped to COMPLETED) -- the release
+            # must be honored on the IDLE branch too, not only COMPLETED.
+            writes = TestRestartReconstructsTheCaptureHoldBeforeConsumersStart._deliver(
+                IDLE_HOLD_WORKER_ID
+            )
+            assert writes == [IDLE_HOLD_MESSAGE_948_CONTENT]
+            delivered = [
+                r
+                for r in db.get_inbox_messages(
+                    IDLE_HOLD_WORKER_ID, limit=10, status=MessageStatus.DELIVERED
+                )
+                if r.message == IDLE_HOLD_MESSAGE_948_CONTENT
+            ]
+            assert len(delivered) == 1
+
+            assert (
+                TestRestartReconstructsTheCaptureHoldBeforeConsumersStart._deliver(
+                    IDLE_HOLD_WORKER_ID
+                )
+                == []
+            )
+        finally:
+            assigned_worker_completion_service._release_capture_barrier(IDLE_HOLD_WORKER_ID)
+            assigned_worker_completion_service.__init__()
+            status_monitor_mod.status_monitor.clear_terminal(IDLE_HOLD_WORKER_ID)
+
+    def test_genuine_first_assigned_dispatch_is_unaffected(self, capture_release_db, monkeypatch):
+        """A brand-new worker -- ``register_assignment`` has marked it
+        "known" (as ``create_terminal`` does immediately for every
+        assignment, real code, correction-1033's own report section 1),
+        but no barrier has ever been armed for it, since neither a live
+        COMPLETED detection nor a restart reconstruction has ever run for
+        this fresh assignment. The now-unconditional capture-hold check
+        must be a true no-op here: ``_wait_for_capture_before_input_
+        detailed`` fast-paths on "no barrier exists" regardless of status,
+        so a genuine first dispatch proceeds exactly as before this fix.
+        """
+        from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+            assigned_worker_completion_service,
+        )
+
+        fresh_worker = "fresh-dispatch-worker-e2e"
+        fresh_caller = "fresh-dispatch-caller-e2e"
+        try:
+            db.create_terminal(fresh_caller, "cao-session", "developer-fresh-caller", "mock_cli")
+            db.create_terminal(
+                fresh_worker,
+                "cao-session",
+                "developer-fresh-worker",
+                "mock_cli",
+                caller_id=fresh_caller,
+                assignment_id="assignment-fresh-e2e-0001",
+                completion_id="completion-fresh-e2e-0001",
+            )
+            assigned_worker_completion_service.register_assignment(fresh_worker)
+            monkeypatch.setattr(
+                status_monitor_mod.status_monitor,
+                "get_status",
+                lambda _id: TerminalStatus.IDLE,
+            )
+
+            assert (
+                assigned_worker_completion_service.wait_for_capture_before_input(
+                    fresh_worker, timeout=0.2
+                )
+                is True
+            ), "a brand-new worker must never have a barrier armed against it"
+
+            writes = TestRestartReconstructsTheCaptureHoldBeforeConsumersStart._deliver(
+                fresh_worker
+            )
+            # No pending message was ever queued for this worker; the point of
+            # this test is solely that reaching this far raises nothing and
+            # blocks nothing -- deliver_pending is simply a no-op on an empty
+            # inbox, exactly as it always was.
+            assert writes == []
+        finally:
+            assigned_worker_completion_service._release_capture_barrier(fresh_worker)
+            assigned_worker_completion_service.__init__()
+            status_monitor_mod.status_monitor.clear_terminal(fresh_worker)
+
+
+QUEUE_CALLER_ID = "queue-caller-e2e"
+QUEUE_WORKER_ID = "queue-worker-e2e"
+QUEUE_ASSIGNMENT_ID = "assignment-queue-e2e-0001"
+QUEUE_COMPLETION_ID = "completion-queue-e2e-0001"
+
+
+class TestGuardedReconciliationSupersedesTheObsoleteQueue:
+    """Correction-1038 Part B: the real B queue prerequisite. The live
+    pending order is (877, 880, 885, 948) analogues -- oldest-first
+    selection means an unguarded release would send 877 first, even
+    though 948 is what actually supersedes them. Proves the guarded
+    recovery transition durably supersedes the exact obsolete rows
+    BEFORE releasing the barrier, so ordinary InboxService delivery then
+    selects the ORIGINAL 948 row, physically, exactly once -- never a
+    fabricated/duplicate/requeued row, never touching 874's own already-
+    delivered record.
+    """
+
+    def test_supersession_prerequisite_then_exactly_once_948_delivery(
+        self, capture_release_db, monkeypatch
+    ):
+        from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+            assigned_worker_completion_service,
+        )
+
+        bound_prefix = "synthetic queue-scenario dispatch (1038 part B)"
+        message_874_content = "synthetic already-delivered follow-up (874 analogue), queue case"
+        corrupted_transcript = bound_prefix + message_874_content
+
+        try:
+            db.create_terminal(
+                QUEUE_CALLER_ID, "cao-session", f"developer-{QUEUE_CALLER_ID}", "mock_cli"
+            )
+            db.create_terminal(
+                QUEUE_WORKER_ID,
+                "cao-session",
+                f"developer-{QUEUE_WORKER_ID}",
+                "mock_cli",
+                caller_id=QUEUE_CALLER_ID,
+                assignment_id=QUEUE_ASSIGNMENT_ID,
+                completion_id=QUEUE_COMPLETION_ID,
+            )
+            dispatched = db.mark_assigned_worker_dispatched(QUEUE_WORKER_ID)
+            assert dispatched is not None
+
+            # The real live pending order: three obsolete follow-ups (877/880/
+            # 885 analogues), then the one that actually supersedes them (948
+            # analogue) -- created in that exact order, oldest first.
+            m877 = db.create_inbox_message(
+                QUEUE_CALLER_ID, QUEUE_WORKER_ID, "877 analogue", origin=InboxMessageOrigin.EXPLICIT
+            )
+            m880 = db.create_inbox_message(
+                QUEUE_CALLER_ID, QUEUE_WORKER_ID, "880 analogue", origin=InboxMessageOrigin.EXPLICIT
+            )
+            m885 = db.create_inbox_message(
+                QUEUE_CALLER_ID, QUEUE_WORKER_ID, "885 analogue", origin=InboxMessageOrigin.EXPLICIT
+            )
+            m948 = db.create_inbox_message(
+                QUEUE_CALLER_ID, QUEUE_WORKER_ID, "948 analogue", origin=InboxMessageOrigin.EXPLICIT
+            )
+
+            # Restart into IDLE, exactly like correction-1038's Part A fix --
+            # both gaps are the same live incident.
+            assigned_worker_completion_service.__init__()
+            assigned_worker_completion_service.register_persisted_assignments()
+            monkeypatch.setattr(
+                status_monitor_mod.status_monitor,
+                "get_status",
+                lambda _id: TerminalStatus.IDLE,
+            )
+
+            # Pre-ack: nothing at all is deliverable (877 would otherwise be
+            # selected first, oldest-first).
+            assert (
+                TestRestartReconstructsTheCaptureHoldBeforeConsumersStart._deliver(QUEUE_WORKER_ID)
+                == []
+            )
+
+            result = assigned_worker_completion_service.reconcile_corrupted_dispatch_capture_release(
+                QUEUE_WORKER_ID,
+                assignment_id=QUEUE_ASSIGNMENT_ID,
+                requesting_caller_id=QUEUE_CALLER_ID,
+                transcript_first_user_text=corrupted_transcript,
+                expected_transcript_sha256=utf8_sha256(corrupted_transcript),
+                admissible_dispatch_sha256=[utf8_sha256(bound_prefix)],
+                concatenated_message_id="874-queue",
+                concatenated_message_sender_id=QUEUE_CALLER_ID,
+                concatenated_message_receiver_id=QUEUE_WORKER_ID,
+                concatenated_message_content=message_874_content,
+                concatenated_message_delivery_state="delivered",
+                concatenated_message_session_id="synthetic-queue-session",
+                recorded_at="2026-09-14T00:00:00+00:00",
+                acknowledgement=f"{QUEUE_CALLER_ID} acknowledges the corrupted dispatch is abandoned",
+                acknowledged_at="2026-09-14T00:01:00+00:00",
+                supersede_message_ids=[m877.id, m880.id, m885.id],
+                superseding_message_id=m948.id,
+            )
+            assert result.released_now is True
+
+            # 877/880/885 are durably SUPERSEDED -- preserved, not deleted,
+            # not fabricated DELIVERED, not requeued/duplicated.
+            all_rows = {m.id: m for m in db.get_inbox_messages(QUEUE_WORKER_ID, limit=10)}
+            for obsolete_id, expected_content in (
+                (m877.id, "877 analogue"),
+                (m880.id, "880 analogue"),
+                (m885.id, "885 analogue"),
+            ):
+                row = all_rows[obsolete_id]
+                assert row.status == MessageStatus.SUPERSEDED
+                assert row.superseded_by_message_id == m948.id
+                assert row.message == expected_content
+                assert row.sender_id == QUEUE_CALLER_ID
+                assert row.receiver_id == QUEUE_WORKER_ID
+            assert all_rows[m948.id].status == MessageStatus.PENDING
+
+            # 874 itself was never touched -- no inbox row for it exists in
+            # this scenario at all (it is bound purely by transcript/hash
+            # evidence, exactly like the sibling restart tests).
+
+            # Ordinary InboxService delivery now selects the ORIGINAL 948 row
+            # -- physically, exactly once -- never 877 (the oldest-first
+            # candidate an unguarded release would have sent).
+            writes = TestRestartReconstructsTheCaptureHoldBeforeConsumersStart._deliver(
+                QUEUE_WORKER_ID
+            )
+            assert writes == ["948 analogue"]
+            delivered = [
+                r
+                for r in db.get_inbox_messages(
+                    QUEUE_WORKER_ID, limit=10, status=MessageStatus.DELIVERED
+                )
+                if r.id == m948.id
+            ]
+            assert len(delivered) == 1
+
+            # A repeat delivery attempt is a genuine no-op.
+            assert (
+                TestRestartReconstructsTheCaptureHoldBeforeConsumersStart._deliver(QUEUE_WORKER_ID)
+                == []
+            )
+        finally:
+            assigned_worker_completion_service._release_capture_barrier(QUEUE_WORKER_ID)
+            assigned_worker_completion_service.__init__()
+            status_monitor_mod.status_monitor.clear_terminal(QUEUE_WORKER_ID)
+
+    def test_wrong_supersession_target_fails_closed_and_barrier_stays_armed(
+        self, capture_release_db, monkeypatch
+    ):
+        """If the supersession prerequisite fails after the acknowledgement
+        already committed, the barrier must stay armed -- no partial
+        release, no stranded incomplete state presented as resolved.
+        """
+        from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+            assigned_worker_completion_service,
+        )
+
+        bound_prefix = "synthetic queue-scenario dispatch (1038 part B, wrong target)"
+        message_874_content = "synthetic already-delivered follow-up (874 analogue), wrong target"
+        corrupted_transcript = bound_prefix + message_874_content
+        worker_id = "queue-worker-wrong-target-e2e"
+        caller_id = "queue-caller-wrong-target-e2e"
+
+        try:
+            db.create_terminal(caller_id, "cao-session", f"developer-{caller_id}", "mock_cli")
+            db.create_terminal(
+                worker_id,
+                "cao-session",
+                f"developer-{worker_id}",
+                "mock_cli",
+                caller_id=caller_id,
+                assignment_id="assignment-wrong-target-e2e-0001",
+                completion_id="completion-wrong-target-e2e-0001",
+            )
+            db.mark_assigned_worker_dispatched(worker_id)
+            m948 = db.create_inbox_message(
+                caller_id, worker_id, "948 analogue", origin=InboxMessageOrigin.EXPLICIT
+            )
+
+            assigned_worker_completion_service.__init__()
+            assigned_worker_completion_service.register_persisted_assignments()
+            monkeypatch.setattr(
+                status_monitor_mod.status_monitor,
+                "get_status",
+                lambda _id: TerminalStatus.IDLE,
+            )
+
+            with pytest.raises(ValueError, match="does not exist"):
+                assigned_worker_completion_service.reconcile_corrupted_dispatch_capture_release(
+                    worker_id,
+                    assignment_id="assignment-wrong-target-e2e-0001",
+                    requesting_caller_id=caller_id,
+                    transcript_first_user_text=corrupted_transcript,
+                    expected_transcript_sha256=utf8_sha256(corrupted_transcript),
+                    admissible_dispatch_sha256=[utf8_sha256(bound_prefix)],
+                    concatenated_message_id="874-wrong-target",
+                    concatenated_message_sender_id=caller_id,
+                    concatenated_message_receiver_id=worker_id,
+                    concatenated_message_content=message_874_content,
+                    concatenated_message_delivery_state="delivered",
+                    concatenated_message_session_id="synthetic-wrong-target-session",
+                    recorded_at="2026-09-14T00:00:00+00:00",
+                    acknowledgement=f"{caller_id} acknowledges the corrupted dispatch is abandoned",
+                    acknowledged_at="2026-09-14T00:01:00+00:00",
+                    # Nonexistent target id -- supersede_inbox_messages must
+                    # refuse this, and that refusal must propagate here.
+                    supersede_message_ids=[999999],
+                    superseding_message_id=m948.id,
+                )
+
+            # The barrier must still be armed: release never happened.
+            assert (
+                assigned_worker_completion_service.wait_for_capture_before_input(
+                    worker_id, timeout=0.2
+                )
+                is False
+            )
+            # 948 itself was never touched by the failed supersession attempt.
+            row = db.get_inbox_messages(worker_id, limit=10)[0]
+            assert row.status == MessageStatus.PENDING
+            assert row.superseded_by_message_id is None
+        finally:
+            assigned_worker_completion_service._release_capture_barrier(worker_id)
+            assigned_worker_completion_service.__init__()
+            status_monitor_mod.status_monitor.clear_terminal(worker_id)

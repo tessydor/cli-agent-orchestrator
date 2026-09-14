@@ -1166,3 +1166,86 @@ class TestTwoContendersGuardSequenceIsCoherentAcrossACaptureRelease:
         finally:
             status_monitor.clear_terminal(terminal_id)
             assigned_worker_completion_service._release_capture_barrier(terminal_id)
+
+
+class TestDrainAllTerminalInputLocks:
+    """Correction-1038 Part C.3: shutdown must be able to prove no physical
+    native-input write is currently in flight for ANY known terminal,
+    before the process is replaced. Deliberately reuses the exact
+    ``terminal_input_lock`` every ``send_input`` entry point already
+    serializes through -- proven here directly with real threads holding
+    (and later releasing) that real lock, no mocking of the lock itself.
+    """
+
+    def test_a_free_lock_drains_immediately(self):
+        terminal_id = "drain-free-terminal"
+        # Merely calling terminal_input_lock() registers it in the module's
+        # dict; this test never acquires it, so it must read as free.
+        terminal_service.terminal_input_lock(terminal_id)
+        try:
+            still_busy = terminal_service.drain_all_terminal_input_locks(timeout=1.0)
+            assert terminal_id not in still_busy
+        finally:
+            with terminal_service._terminal_input_locks_guard:
+                terminal_service._terminal_input_locks.pop(terminal_id, None)
+
+    def test_a_held_lock_is_reported_busy_then_drains_after_release(self):
+        terminal_id = "drain-held-terminal"
+        lock = terminal_service.terminal_input_lock(terminal_id)
+        released = threading.Event()
+        holder_acquired = threading.Event()
+
+        def hold_then_release():
+            with lock:
+                holder_acquired.set()
+                released.wait(timeout=5)
+
+        holder = threading.Thread(target=hold_then_release)
+        holder.start()
+        try:
+            assert holder_acquired.wait(timeout=5), "holder thread never acquired the lock"
+
+            # Bounded and short: must report busy, not hang until the holder
+            # releases on its own.
+            still_busy = terminal_service.drain_all_terminal_input_locks(timeout=0.2)
+            assert terminal_id in still_busy
+
+            released.set()
+            holder.join(timeout=5)
+            assert not holder.is_alive()
+
+            # Now genuinely free -- the same check must confirm it.
+            still_busy_after = terminal_service.drain_all_terminal_input_locks(timeout=1.0)
+            assert terminal_id not in still_busy_after
+        finally:
+            released.set()
+            holder.join(timeout=5)
+            with terminal_service._terminal_input_locks_guard:
+                terminal_service._terminal_input_locks.pop(terminal_id, None)
+
+    def test_one_stuck_terminal_does_not_starve_the_check_for_others(self):
+        stuck_id = "drain-stuck-terminal"
+        free_id = "drain-other-free-terminal"
+        stuck_lock = terminal_service.terminal_input_lock(stuck_id)
+        terminal_service.terminal_input_lock(free_id)
+        released = threading.Event()
+        holder_acquired = threading.Event()
+
+        def hold_forever_ish():
+            with stuck_lock:
+                holder_acquired.set()
+                released.wait(timeout=5)
+
+        holder = threading.Thread(target=hold_forever_ish)
+        holder.start()
+        try:
+            assert holder_acquired.wait(timeout=5)
+            still_busy = terminal_service.drain_all_terminal_input_locks(timeout=0.3)
+            assert stuck_id in still_busy
+            assert free_id not in still_busy
+        finally:
+            released.set()
+            holder.join(timeout=5)
+            with terminal_service._terminal_input_locks_guard:
+                terminal_service._terminal_input_locks.pop(stuck_id, None)
+                terminal_service._terminal_input_locks.pop(free_id, None)

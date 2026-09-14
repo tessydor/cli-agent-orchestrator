@@ -288,6 +288,77 @@ def terminal_input_lock(terminal_id: str) -> threading.RLock:
         return lock
 
 
+def drain_all_terminal_input_locks(timeout: float = 5.0) -> list[str]:
+    """Prove no physical native-input write is currently in flight for any
+    known terminal, within a bounded overall timeout (correction-1038 Part
+    C.3).
+
+    Message-1038's finding: neither ``WAITING_USER_ANSWER`` nor any
+    completion-callback flag proves a physical tmux write is not mid-flight
+    right now, and this codebase's shutdown sequence only ever cancels
+    async tasks -- it never verifies the ONE thing that actually matters
+    before replacing the running process: whether ``send_input`` (from ANY
+    of its four entry points -- InboxService, the raw POST /terminals/{id}/
+    input route, agent_step's initial dispatch, or agui's handoff-approval
+    send -- this function does not need to know or care which) is
+    currently between acquiring ``terminal_input_lock`` and releasing it
+    after its physical write. Searched first for an existing supported
+    drain/graceful-shutdown path -- none exists; ``lifespan()`` only ever
+    ``.cancel()``s its own async tasks, which does not stop (and, for a
+    task already running inside ``asyncio.to_thread``, cannot stop) a
+    synchronous physical write already under way in a worker thread, and
+    says nothing at all about the raw HTTP/agui entry points, which are not
+    tasks this module tracks.
+
+    Deliberately reuses the EXISTING per-terminal ``terminal_input_lock``
+    rather than inventing new tracking state: every native-input entry
+    point already serializes through this exact lock for its physical
+    write (see ``send_input``'s own module docstring), so a lock this
+    function can acquire-and-immediately-release is, by construction, not
+    currently held by any in-flight write -- covering all four entry
+    points uniformly, with no new counter to keep consistent. A capture-
+    barrier waiter parked in ``Condition.wait()`` (correction-1007) is
+    NOT mistaken for an in-flight write: ``Condition.wait()`` atomically
+    releases this same lock while blocked, exactly per its own docstring.
+
+    Bounded and non-blocking-forever by design (a systemd stop has its own
+    timeout): tries every known terminal's lock in turn, each capped so one
+    genuinely stuck terminal cannot starve the check for the rest, and
+    returns the list of terminal_ids that could NOT be confirmed free
+    within ``timeout`` -- an empty list means every one was. Never invents
+    an assertion: a non-empty return is reported truthfully by the caller
+    (logged, not silently treated as drained) rather than asserted safe.
+    """
+    with _terminal_input_locks_guard:
+        terminal_ids = list(_terminal_input_locks.keys())
+    if not terminal_ids:
+        return []
+    # An even per-terminal slice of the overall budget: one genuinely stuck
+    # terminal's acquire() attempt is capped at its own share, so it cannot
+    # exhaust the shared deadline before every OTHER terminal has had its
+    # fair chance to be checked. The overall deadline is still enforced too
+    # (never exceeded in total), so the bound promised by ``timeout``
+    # remains an upper bound either way.
+    per_lock_timeout = timeout / len(terminal_ids)
+    deadline = time.monotonic() + timeout
+    still_busy: list[str] = []
+    for terminal_id in terminal_ids:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            still_busy.append(terminal_id)
+            continue
+        lock = terminal_input_lock(terminal_id)
+        acquired = lock.acquire(timeout=min(per_lock_timeout, remaining))
+        if not acquired:
+            still_busy.append(terminal_id)
+            continue
+        try:
+            pass  # Acquired and released immediately: proven free right now.
+        finally:
+            lock.release()
+    return still_busy
+
+
 def inject_memory_context(
     first_message: str, terminal_id: str, frozen_memory: str | None = None
 ) -> str:
@@ -2604,48 +2675,75 @@ def send_input(
 
                 current_status = status_monitor.get_status(terminal_id)
 
-                # Re-check completion-capture eligibility HERE, after the
-                # acceptance-fence wait above, not just wherever a caller
-                # happened to check status before calling send_input()
-                # (correction-994): a fresh COMPLETED can be observed for
-                # the first time in the gap between an earlier IDLE read and
-                # this point, since the same detection event that just
-                # released the acceptance fence also arms the capture
-                # barrier below. This is the ONE shared boundary; it does
-                # not duplicate or replace InboxService's OWN earlier check
-                # (still load-bearing to avoid claiming a message row before
-                # even getting here) -- it exists because that check cannot
-                # see a completion that lands strictly after it ran.
-                if current_status == TerminalStatus.COMPLETED:
-                    from cli_agent_orchestrator.services.assigned_worker_completion_service import (
-                        assigned_worker_completion_service,
-                    )
-
-                    wait_result = (
-                        assigned_worker_completion_service._wait_for_capture_before_input_detailed(
-                            terminal_id
-                        )
-                    )
-                    if not wait_result.ready:
-                        raise TerminalCaptureNotDurableError(
-                            f"Terminal {terminal_id} is COMPLETED but its final report "
-                            "is not yet durably captured; refusing to paste."
-                        )
-                    if wait_result.blocked:
-                        # The lock was genuinely relinquished during this
-                        # wait -- everything above (including the
-                        # acceptance check) may now be stale. Discard it
-                        # and start this iteration over from the top.
-                        continue
-
                 # Guard: refuse to type into a terminal whose provider process has
                 # exited. Without this check, queued messages would be pasted into
-                # a bare shell and executed as arbitrary commands.
+                # a bare shell and executed as arbitrary commands. Checked BEFORE
+                # the capture-hold wait below: a dead provider can never clear a
+                # hold, so failing fast here avoids waiting out a whole timeout
+                # only to raise anyway.
                 if current_status == TerminalStatus.ERROR:
                     raise TerminalInputBlockedError(
                         f"Terminal {terminal_id} provider is in ERROR state "
                         "(provider process may have exited). Refusing to deliver input."
                     )
+
+                # Re-check the capture hold HERE, after the acceptance-fence wait
+                # above, not just wherever a caller happened to check status
+                # before calling send_input() (correction-994): a fresh COMPLETED
+                # can be observed for the first time in the gap between an
+                # earlier IDLE read and this point, since the same detection
+                # event that just released the acceptance fence also arms the
+                # capture barrier below. This is the ONE shared boundary; it does
+                # not duplicate or replace InboxService's OWN earlier check
+                # (still load-bearing to avoid claiming a message row before
+                # even getting here) -- it exists because that check cannot see
+                # a completion that lands strictly after it ran.
+                #
+                # correction-1038: this used to be gated on
+                # ``current_status == TerminalStatus.COMPLETED``, on the
+                # assumption that a barrier can only ever matter while a worker
+                # is (or was, moments ago) COMPLETED. That assumption broke for
+                # a hold reconstructed at startup for an unresolved persisted
+                # assignment (correction-1033): a provider can legitimately
+                # report IDLE for an already-quiet, ready composer even though
+                # the assignment itself was never resolved, and IDLE skipped
+                # this check entirely -- letting new input land on top of an
+                # acknowledged-but-unreleased incident. ``_wait_for_capture_
+                # before_input_detailed`` already fast-paths to
+                # ``ready=True, blocked=False`` the instant no barrier exists
+                # for this ``terminal_id`` (the overwhelming majority of calls,
+                # including every genuine first ASSIGNED dispatch -- a brand
+                # new worker is "known" but has no barrier until either a live
+                # COMPLETED detection or a restart reconstruction arms one), so
+                # calling it unconditionally here costs nothing on that fast
+                # path and closes the gap uniformly for every other status
+                # (IDLE included) instead of only COMPLETED.
+                from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+                    assigned_worker_completion_service,
+                )
+
+                wait_result = (
+                    assigned_worker_completion_service._wait_for_capture_before_input_detailed(
+                        terminal_id
+                    )
+                )
+                if not wait_result.ready:
+                    if current_status == TerminalStatus.COMPLETED:
+                        raise TerminalCaptureNotDurableError(
+                            f"Terminal {terminal_id} is COMPLETED but its final report "
+                            "is not yet durably captured; refusing to paste."
+                        )
+                    raise TerminalCaptureNotDurableError(
+                        f"Terminal {terminal_id} has an unresolved capture hold "
+                        f"(current status: {current_status.value}); refusing to paste "
+                        "until the incident is captured or explicitly acknowledged."
+                    )
+                if wait_result.blocked:
+                    # The lock was genuinely relinquished during this
+                    # wait -- everything above (including the
+                    # acceptance check) may now be stale. Discard it
+                    # and start this iteration over from the top.
+                    continue
 
                 if (
                     provider.blocks_orchestrated_input_while_waiting_user_answer is True

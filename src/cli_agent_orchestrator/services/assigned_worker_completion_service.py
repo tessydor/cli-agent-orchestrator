@@ -295,6 +295,8 @@ class AssignedWorkerCompletionService:
         recorded_at: str,
         acknowledgement: str,
         acknowledged_at: str,
+        supersede_message_ids: Optional[list[int]] = None,
+        superseding_message_id: Optional[int] = None,
     ) -> Any:
         """The one supported guarded recovery transition (correction-997/1001).
 
@@ -306,6 +308,25 @@ class AssignedWorkerCompletionService:
         this exact dispatch's capture barrier. It never sends or delivers
         anything -- the existing pending follow-up row is left completely
         untouched for ordinary InboxService delivery to observe exactly once.
+
+        ``supersede_message_ids``/``superseding_message_id`` (correction-1038,
+        both optional and ``None`` by default -- every existing caller that
+        omits them gets EXACTLY today's behavior, unchanged): when both are
+        given, this transition ALSO durably supersedes those exact obsolete
+        PENDING rows (via :func:`clients.database.supersede_inbox_messages`,
+        scoped to ``sender_id=requesting_caller_id, receiver_id=
+        worker_terminal_id``) before releasing the barrier -- so an
+        oldest-first delivery query cannot select a stale target ahead of
+        the message meant to replace it. This is a PREREQUISITE of release,
+        not an independent step: if the acknowledgement above succeeds but
+        this supersession then raises, the barrier is deliberately NOT
+        released and no partial state is left ambiguous -- an identical
+        retry (acknowledgement re-validates as an idempotent replay,
+        supersession re-validates the same way) can complete both and then
+        release, exactly like the existing crash-between-commit-and-release
+        seam this method already tolerates (see ``_capture_release_
+        checkpoint``). Never deletes or fabricates DELIVERED for the
+        superseded rows; never touches the pending follow-up row itself.
 
         Message-1001's TOCTOU finding: a ``live_status`` read taken BEFORE
         acquiring the per-terminal input/capture lock can be stale by the
@@ -404,6 +425,30 @@ class AssignedWorkerCompletionService:
                     acknowledgement=acknowledgement,
                     acknowledged_at=acknowledged_at,
                 )
+
+                if supersede_message_ids is not None and superseding_message_id is not None:
+                    # correction-1038 Part B prerequisite: durably supersede
+                    # the exact obsolete rows BEFORE releasing the barrier.
+                    # A failure here (identity/state mismatch, or any other
+                    # ValueError from supersede_inbox_messages) propagates
+                    # and deliberately leaves the barrier armed -- the
+                    # acknowledgement above already committed, but release
+                    # is intentionally withheld until this prerequisite also
+                    # succeeds. An identical retry re-validates both steps
+                    # (acknowledge_native_dispatch_corruption's own
+                    # idempotent-replay path, and supersede_inbox_messages'
+                    # own idempotent-replay path) and can then proceed.
+                    from cli_agent_orchestrator.clients.database import (
+                        supersede_inbox_messages,
+                    )
+
+                    supersede_inbox_messages(
+                        sender_id=requesting_caller_id,
+                        receiver_id=worker_terminal_id,
+                        target_message_ids=list(supersede_message_ids),
+                        superseding_message_id=superseding_message_id,
+                    )
+
                 # Fault-injection seam (correction-1007 item 2): a test can
                 # monkeypatch this to raise, simulating a process crash
                 # exactly at the post-commit/pre-release boundary. A

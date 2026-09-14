@@ -172,6 +172,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     OutputMode,
     TerminalInputBlockedError,
     _notify_elastic_terminal_ended,
+    drain_all_terminal_input_locks,
 )
 from cli_agent_orchestrator.services.workflow_journal import (
     _TERMINAL_RUN_STATES as _JOURNAL_TERMINAL_RUN_STATES,
@@ -1392,6 +1393,26 @@ async def lifespan(app: FastAPI):
     # threading.Thread (not asyncio), so join it directly rather than via
     # asyncio.gather with the tasks above.
     fifo_manager.stop_watchdog()
+
+    # correction-1038 Part C.3: every task above that could have DISPATCHED
+    # new native input has now been cancelled and awaited. Prove no
+    # physical write is still mid-flight -- from ANY of the four send_input
+    # entry points, not just the tasks above -- before this process is
+    # considered safe to replace. Bounded so a stuck terminal cannot hang
+    # shutdown indefinitely; a non-empty result is logged truthfully, never
+    # silently treated as drained (see drain_all_terminal_input_locks's own
+    # docstring for why an existing lock, not new tracking state, proves
+    # this).
+    still_busy = await asyncio.to_thread(drain_all_terminal_input_locks, 5.0)
+    if still_busy:
+        logger.warning(
+            "Shutdown proceeding with %d terminal(s) whose native-input lock could not be "
+            "confirmed free within the drain timeout: %s",
+            len(still_busy),
+            still_busy,
+        )
+    else:
+        logger.info("Confirmed no native-input write is in flight for any known terminal")
 
     await registry.teardown()
     # OpenTelemetry (ported): flush + shut down exporters (no-op when disabled).
