@@ -1347,3 +1347,317 @@ class TestGuardedReconciliationSupersedesTheObsoleteQueue:
             assigned_worker_completion_service._release_capture_barrier(worker_id)
             assigned_worker_completion_service.__init__()
             status_monitor_mod.status_monitor.clear_terminal(worker_id)
+
+
+class TestPersistedAssignedAndDurableCompletionAcrossRestart:
+    """Correction-1042/1044: two confirmed defects in
+    register_persisted_assignments' unrefined loop over
+    list_protected_assigned_worker_callbacks' broader (ASSIGNED,
+    DISPATCHED, UNRESOLVED) filter.
+
+    1. ASSIGNED (never dispatched) must never be armed -- a hold exists to
+       protect an already-captured/in-flight completion, which cannot
+       exist before the assignment's first real dispatch. The existing
+       test_genuine_first_assigned_dispatch_is_unaffected never actually
+       went through register_persisted_assignments, so it could not catch
+       this.
+    2. A DISPATCHED/UNRESOLVED record whose incident has ALREADY durably
+       completed its entire guarded transition must not be re-armed on a
+       SECOND restart -- caller_acknowledgement alone is not sufficient
+       durable proof of that; capture_release_completed_at is.
+    """
+
+    @staticmethod
+    def _send_direct(worker_id: str, message: str, orchestration_type=None) -> list[str]:
+        """Same mocking as TestRestartReconstructsTheCaptureHoldBefore
+        ConsumersStart._deliver, but calls terminal_service.send_input
+        directly -- the shape a genuine FIRST assignment dispatch takes
+        (agent_step.run_agent_step), never via InboxService (which only
+        ever delivers an existing PENDING row; a never-dispatched ASSIGNED
+        worker has none).
+        """
+        writes: list[str] = []
+
+        def send_keys_side_effect(session, window, message, **kwargs):
+            writes.append(message)
+
+        provider = MagicMock()
+        provider.paste_enter_count = 1
+        provider.paste_submit_delay = 0.0
+        provider.accepts_input_while_processing = False
+        provider.assume_processing_on_dispatch = False
+        provider.blocks_orchestrated_input_while_waiting_user_answer = False
+        provider.force_bracketed_paste = True
+        provider.encode_terminal_input = lambda message, orchestration_value: message
+
+        with (
+            patch("cli_agent_orchestrator.backends.registry._backend") as mock_backend,
+            patch.object(
+                real_terminal_service.provider_manager,
+                "get_provider",
+                return_value=provider,
+            ),
+        ):
+            mock_backend.send_keys.side_effect = send_keys_side_effect
+            mock_backend.supports_event_inbox.return_value = False
+            mock_backend.session_exists.return_value = True
+            mock_backend.get_history.return_value = ""
+            real_terminal_service.send_input(
+                worker_id, message, orchestration_type=orchestration_type
+            )
+        return writes
+
+    def test_persisted_assigned_callback_is_not_armed_and_first_dispatch_is_permitted(
+        self, capture_release_db, monkeypatch
+    ):
+        from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+            assigned_worker_completion_service,
+        )
+
+        # bind_completion_dispatch's identity guard requires an 8-hex
+        # terminal_id and a 32-hex completion_id for the ASSIGN branch
+        # (real production IDs always are) -- every other id in this test
+        # file that never exercises that branch can use a descriptive
+        # string instead.
+        worker_id = "a1a1a1a1"
+        caller_id = "b2b2b2b2"
+        completion_id = "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3"
+        try:
+            db.create_terminal(caller_id, "cao-session", f"developer-{caller_id}", "mock_cli")
+            db.create_terminal(
+                worker_id,
+                "cao-session",
+                f"developer-{worker_id}",
+                "mock_cli",
+                caller_id=caller_id,
+                assignment_id="assignment-persisted-assigned-e2e-0001",
+                completion_id=completion_id,
+            )
+            # Deliberately never call mark_assigned_worker_dispatched --
+            # the callback row's lifecycle stays ASSIGNED, the exact
+            # persisted-but-never-dispatched shape this fix targets.
+            callback = db.get_assigned_worker_callback(worker_id)
+            assert callback.lifecycle == AssignmentLifecycle.ASSIGNED
+
+            # Simulate a restart with this ASSIGNED record already persisted.
+            assigned_worker_completion_service.__init__()
+            assigned_worker_completion_service.register_persisted_assignments()
+            monkeypatch.setattr(
+                status_monitor_mod.status_monitor,
+                "get_status",
+                lambda _id: TerminalStatus.IDLE,
+            )
+
+            assert (
+                assigned_worker_completion_service.wait_for_capture_before_input(
+                    worker_id, timeout=0.2
+                )
+                is True
+            ), "a never-dispatched ASSIGNED record must never have a hold armed against it"
+
+            writes = self._send_direct(
+                worker_id, "first assignment dispatch", orchestration_type=OrchestrationType.ASSIGN
+            )
+            assert writes == ["first assignment dispatch"], (
+                "the genuine first dispatch to a persisted ASSIGNED worker was blocked -- "
+                "correction-1042/1044's exact regression reproduced"
+            )
+        finally:
+            assigned_worker_completion_service._release_capture_barrier(worker_id)
+            assigned_worker_completion_service.__init__()
+            status_monitor_mod.status_monitor.clear_terminal(worker_id)
+
+    def test_second_restart_does_not_rearm_a_fully_resolved_incident(
+        self, capture_release_db, monkeypatch
+    ):
+        """Deterministic restart E2E, per message 1044's own required
+        coverage: IDLE pre-ack blocks; acknowledgement + supersession
+        completes and releases; original 948 delivered exactly once;
+        a SECOND restart must NOT re-arm this same incident.
+        """
+        from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+            assigned_worker_completion_service,
+        )
+
+        worker_id = "second-restart-worker-e2e"
+        caller_id = "second-restart-caller-e2e"
+        assignment_id = "assignment-second-restart-e2e-0001"
+        completion_id = "completion-second-restart-e2e-0001"
+        message_948_content = "synthetic 948 analogue, second-restart case"
+        bound_prefix = "synthetic second-restart dispatch (1042/1044)"
+        message_874_content = "synthetic 874 analogue, second-restart case"
+        corrupted_transcript = bound_prefix + message_874_content
+
+        def restart(status: TerminalStatus) -> None:
+            assigned_worker_completion_service.__init__()
+            assigned_worker_completion_service.register_persisted_assignments()
+            monkeypatch.setattr(status_monitor_mod.status_monitor, "get_status", lambda _id: status)
+
+        try:
+            TestRestartReconstructsTheCaptureHoldBeforeConsumersStart._seed(
+                worker_id, caller_id, assignment_id, completion_id, message_948_content
+            )
+
+            # First restart, into IDLE: blocked pre-ack.
+            restart(TerminalStatus.IDLE)
+            assert (
+                TestRestartReconstructsTheCaptureHoldBeforeConsumersStart._deliver(worker_id) == []
+            )
+
+            result = (
+                assigned_worker_completion_service.reconcile_corrupted_dispatch_capture_release(
+                    worker_id,
+                    assignment_id=assignment_id,
+                    requesting_caller_id=caller_id,
+                    transcript_first_user_text=corrupted_transcript,
+                    expected_transcript_sha256=utf8_sha256(corrupted_transcript),
+                    admissible_dispatch_sha256=[utf8_sha256(bound_prefix)],
+                    concatenated_message_id="874-second-restart",
+                    concatenated_message_sender_id=caller_id,
+                    concatenated_message_receiver_id=worker_id,
+                    concatenated_message_content=message_874_content,
+                    concatenated_message_delivery_state="delivered",
+                    concatenated_message_session_id="synthetic-second-restart-session",
+                    recorded_at="2026-09-14T00:00:00+00:00",
+                    acknowledgement=f"{caller_id} acknowledges the corrupted dispatch is abandoned",
+                    acknowledged_at="2026-09-14T00:01:00+00:00",
+                )
+            )
+            assert result.released_now is True
+
+            # 948 delivered exactly once.
+            writes = TestRestartReconstructsTheCaptureHoldBeforeConsumersStart._deliver(worker_id)
+            assert writes == [message_948_content]
+
+            # SECOND restart: the incident is now fully resolved (no
+            # supersession was requested, so the completion marker was set
+            # immediately after acknowledgement) -- must NOT re-arm.
+            restart(TerminalStatus.IDLE)
+            assert (
+                assigned_worker_completion_service.wait_for_capture_before_input(
+                    worker_id, timeout=0.2
+                )
+                is True
+            ), "a fully-resolved incident was re-armed on a second restart"
+
+            # A brand-new follow-up queued after the second restart must be
+            # delivered normally -- the worker is not permanently stuck.
+            # The first delivery above armed the native-acceptance fence
+            # (correction-984); nothing in this mocked environment ever
+            # produces the real detection event that clears it, so
+            # explicitly clear it here -- standing in for the genuine
+            # passage of time/detection a real terminal would produce,
+            # exactly like status_monitor.clear_terminal's own role in
+            # every other test in this file's teardown.
+            status_monitor_mod.status_monitor.clear_terminal(worker_id)
+            monkeypatch.setattr(
+                status_monitor_mod.status_monitor,
+                "get_status",
+                lambda _id: TerminalStatus.IDLE,
+            )
+            db.create_inbox_message(
+                caller_id,
+                worker_id,
+                "post-second-restart follow-up",
+                origin=InboxMessageOrigin.EXPLICIT,
+            )
+            writes_after = TestRestartReconstructsTheCaptureHoldBeforeConsumersStart._deliver(
+                worker_id
+            )
+            assert writes_after == ["post-second-restart follow-up"]
+        finally:
+            assigned_worker_completion_service._release_capture_barrier(worker_id)
+            assigned_worker_completion_service.__init__()
+            status_monitor_mod.status_monitor.clear_terminal(worker_id)
+
+    def test_second_restart_still_rearms_when_supersession_never_completed(
+        self, capture_release_db, monkeypatch
+    ):
+        """The counterpart safety case: acknowledgement alone must NOT be
+        treated as durable proof of full resolution. If a requested
+        supersession never completed (simulated here via the same
+        fault-injection seam correction-1007 already uses), a second
+        restart MUST still re-arm the hold.
+        """
+        from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+            assigned_worker_completion_service,
+        )
+
+        worker_id = "second-restart-incomplete-worker-e2e"
+        caller_id = "second-restart-incomplete-caller-e2e"
+        assignment_id = "assignment-second-restart-incomplete-e2e-0001"
+        completion_id = "completion-second-restart-incomplete-e2e-0001"
+        message_948_content = "synthetic 948 analogue, incomplete-supersession case"
+        bound_prefix = "synthetic incomplete-supersession dispatch (1042/1044)"
+        message_874_content = "synthetic 874 analogue, incomplete-supersession case"
+        corrupted_transcript = bound_prefix + message_874_content
+
+        def restart(status: TerminalStatus) -> None:
+            assigned_worker_completion_service.__init__()
+            assigned_worker_completion_service.register_persisted_assignments()
+            monkeypatch.setattr(status_monitor_mod.status_monitor, "get_status", lambda _id: status)
+
+        try:
+            TestRestartReconstructsTheCaptureHoldBeforeConsumersStart._seed(
+                worker_id, caller_id, assignment_id, completion_id, message_948_content
+            )
+            restart(TerminalStatus.IDLE)
+
+            # Simulate a crash between the acknowledgement commit and the
+            # completion marker: acknowledge_native_dispatch_corruption
+            # itself is untouched (it genuinely succeeds and commits), but
+            # mark_native_dispatch_corruption_capture_release_completed --
+            # imported locally inside the method, so patching the database
+            # module's own attribute is observed on the very next call --
+            # is made to raise, standing in for a process crash at exactly
+            # that point.
+            def crash_before_marking_complete(record_key, completed_at):
+                raise RuntimeError("simulated crash before completion marker")
+
+            monkeypatch.setattr(
+                db,
+                "mark_native_dispatch_corruption_capture_release_completed",
+                crash_before_marking_complete,
+            )
+            with pytest.raises(RuntimeError, match="simulated crash"):
+                assigned_worker_completion_service.reconcile_corrupted_dispatch_capture_release(
+                    worker_id,
+                    assignment_id=assignment_id,
+                    requesting_caller_id=caller_id,
+                    transcript_first_user_text=corrupted_transcript,
+                    expected_transcript_sha256=utf8_sha256(corrupted_transcript),
+                    admissible_dispatch_sha256=[utf8_sha256(bound_prefix)],
+                    concatenated_message_id="874-incomplete",
+                    concatenated_message_sender_id=caller_id,
+                    concatenated_message_receiver_id=worker_id,
+                    concatenated_message_content=message_874_content,
+                    concatenated_message_delivery_state="delivered",
+                    concatenated_message_session_id="synthetic-incomplete-session",
+                    recorded_at="2026-09-14T00:00:00+00:00",
+                    acknowledgement=f"{caller_id} acknowledges the corrupted dispatch is abandoned",
+                    acknowledged_at="2026-09-14T00:01:00+00:00",
+                )
+
+            # The barrier from the FIRST restart is still armed (the crash
+            # happened after acknowledgement's own commit, but before this
+            # method's own release call).
+            assert (
+                assigned_worker_completion_service.wait_for_capture_before_input(
+                    worker_id, timeout=0.2
+                )
+                is False
+            )
+
+            # SECOND restart: caller_acknowledgement IS durably set, but
+            # capture_release_completed_at is NOT -- must still re-arm.
+            restart(TerminalStatus.IDLE)
+            assert (
+                assigned_worker_completion_service.wait_for_capture_before_input(
+                    worker_id, timeout=0.2
+                )
+                is False
+            ), "an acknowledged-but-not-fully-completed incident was NOT re-armed on restart"
+        finally:
+            assigned_worker_completion_service._release_capture_barrier(worker_id)
+            assigned_worker_completion_service.__init__()
+            status_monitor_mod.status_monitor.clear_terminal(worker_id)

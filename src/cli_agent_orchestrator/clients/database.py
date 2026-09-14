@@ -638,6 +638,18 @@ class NativeDispatchCorruptionModel(Base):
     still no lifecycle/delivery_state/final_result column exists here, so
     that transition remains structurally incapable of touching completion or
     retirement semantics too.
+
+    ``capture_release_completed_at`` (correction-1042/1044) is a SEPARATE,
+    later marker than the acknowledgement columns above: it is set ONLY
+    after the ENTIRE guarded transition -- the acknowledgement AND any
+    supersession prerequisite the caller requested alongside it -- has
+    durably finished (see ``mark_native_dispatch_corruption_capture_
+    release_completed``). An acknowledged-but-not-yet-fully-completed row
+    (ack committed, requested supersession still pending or failed) MUST
+    still be treated as an unresolved incident by startup -- this column,
+    not ``caller_acknowledgement``, is the one durable predicate
+    ``register_persisted_assignments`` consults to decide whether a hold
+    may safely never be re-armed after a restart.
     """
 
     __tablename__ = "native_dispatch_corruption_records"
@@ -659,6 +671,7 @@ class NativeDispatchCorruptionModel(Base):
     recorded_at = Column(String, nullable=False)
     caller_acknowledgement = Column(String, nullable=True)
     capture_release_acknowledged_at = Column(String, nullable=True)
+    capture_release_completed_at = Column(String, nullable=True)
 
 
 def _ensure_db_dir() -> None:
@@ -2830,10 +2843,15 @@ def supersede_inbox_messages(
 
     An exact replay -- the identical ``target_message_ids`` and identical
     ``superseding_message_id``, already fully applied by a prior call -- is
-    idempotent: already-superseded-by-this-exact-superseder rows are
-    returned unchanged rather than erroring, so a retried guarded
-    reconciliation (correction-1038's own recovery transition) can safely
-    repeat this call.
+    idempotent: if EVERY target is already superseded by exactly this
+    superseder, this call is a pure no-op read (correction-1044's own
+    finding: the superseder's OWN current status must NOT gate a pure
+    replay, since nothing is being mutated -- a superseder that has since
+    been legitimately DELIVERED, by the ordinary InboxService path this
+    exact supersession was meant to unblock, must not turn a harmless
+    repeat call into a hard failure). A MIXED call -- some targets already
+    applied, at least one genuinely new -- still requires the superseder to
+    be PENDING, since that one really does mutate a target row.
 
     Never deletes a row, never fabricates DELIVERED, never touches any row
     outside ``target_message_ids``, and never invents a fourth status:
@@ -2853,6 +2871,43 @@ def supersede_inbox_messages(
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         try:
+            rows: List[InboxModel] = []
+            for target_id in target_message_ids:
+                row = db.query(InboxModel).filter(InboxModel.id == target_id).first()
+                if row is None or row.sender_id != sender_id or row.receiver_id != receiver_id:
+                    raise ValueError(
+                        f"target message {target_id} does not exist for "
+                        f"sender_id={sender_id!r} receiver_id={receiver_id!r}"
+                    )
+                rows.append(row)
+
+            already_fully_applied = all(
+                row.status == MessageStatus.SUPERSEDED.value
+                and row.superseded_by_message_id == superseding_message_id
+                for row in rows
+            )
+            if already_fully_applied:
+                # Pure idempotent replay: still confirm the superseder's
+                # IDENTITY (never its current status -- nothing here is
+                # about to mutate it).
+                superseder = (
+                    db.query(InboxModel).filter(InboxModel.id == superseding_message_id).first()
+                )
+                if (
+                    superseder is None
+                    or superseder.sender_id != sender_id
+                    or superseder.receiver_id != receiver_id
+                ):
+                    raise ValueError(
+                        f"superseding message {superseding_message_id} does not exist for "
+                        f"sender_id={sender_id!r} receiver_id={receiver_id!r}"
+                    )
+                db.commit()
+                return [_inbox_message_from_row(row) for row in rows]
+
+            # At least one target genuinely needs to change -- the full,
+            # mutating guard set applies, including the superseder's own
+            # PENDING requirement.
             superseder = (
                 db.query(InboxModel).filter(InboxModel.id == superseding_message_id).first()
             )
@@ -2872,24 +2927,18 @@ def supersede_inbox_messages(
                 )
 
             results: List[InboxMessage] = []
-            for target_id in target_message_ids:
-                row = db.query(InboxModel).filter(InboxModel.id == target_id).first()
-                if row is None or row.sender_id != sender_id or row.receiver_id != receiver_id:
-                    raise ValueError(
-                        f"target message {target_id} does not exist for "
-                        f"sender_id={sender_id!r} receiver_id={receiver_id!r}"
-                    )
+            for row in rows:
                 if row.status == MessageStatus.SUPERSEDED.value:
                     if row.superseded_by_message_id == superseding_message_id:
                         results.append(_inbox_message_from_row(row))
                         continue
                     raise ValueError(
-                        f"target message {target_id} is already superseded by a "
+                        f"target message {row.id} is already superseded by a "
                         f"different message ({row.superseded_by_message_id})"
                     )
                 if row.status != MessageStatus.PENDING.value:
                     raise ValueError(
-                        f"target message {target_id} is not pending "
+                        f"target message {row.id} is not pending "
                         f"(status={row.status!r}); refusing to supersede a claimed/"
                         "delivering/delivered/failed row"
                     )
@@ -3815,6 +3864,82 @@ def acknowledge_native_dispatch_corruption(
             capture_release_acknowledged_at=acknowledged_at,
         )
         return AcknowledgedCorruptionRecord(acknowledged_record, True)
+
+
+def mark_native_dispatch_corruption_capture_release_completed(
+    record_key: str, completed_at: str
+) -> None:
+    """Durably mark that the ENTIRE guarded capture-release transition --
+    the acknowledgement AND any supersession the caller requested alongside
+    it -- has finished for this exact incident (correction-1042/1044).
+
+    This is the SECOND, later phase of a two-phase durable transition:
+    ``acknowledge_native_dispatch_corruption`` records the first phase
+    (``caller_acknowledgement`` non-NULL) as soon as the caller's
+    acknowledgement itself is verified and committed, which can legitimately
+    happen BEFORE a requested supersession has run (or even if it later
+    fails) -- so ``caller_acknowledgement`` alone is NOT sufficient proof
+    that this incident is safe to never re-arm on a future restart. This
+    function's own column, ``capture_release_completed_at``, is set only
+    once the orchestrating transition (``AssignedWorkerCompletionService.
+    reconcile_corrupted_dispatch_capture_release``) has confirmed every
+    requested prerequisite actually completed, immediately before it
+    releases the in-memory barrier.
+
+    Requires the row to already be acknowledged (raises ``ValueError``
+    otherwise -- this can never mark phase two complete before phase one).
+    Idempotent: a repeat call for the same ``record_key`` is a safe no-op
+    that never overwrites an existing non-NULL value with a different one
+    -- the FIRST recorded completion timestamp is authoritative, exactly
+    like ``caller_acknowledgement``'s own collision-refusal discipline one
+    level up, except silent rather than raising, since two callers racing
+    to mark the SAME already-completed transition complete a second time
+    is not a conflict worth failing closed over.
+    """
+    with SessionLocal() as db:
+        row = (
+            db.query(NativeDispatchCorruptionModel)
+            .filter(NativeDispatchCorruptionModel.record_key == record_key)
+            .first()
+        )
+        if row is None:
+            raise ValueError(f"no corruption record exists for {record_key!r}")
+        if row.caller_acknowledgement is None:
+            raise ValueError(
+                f"corruption record {record_key!r} is not yet acknowledged -- cannot mark "
+                "its capture-release transition complete before its first phase"
+            )
+        if row.capture_release_completed_at is None:
+            row.capture_release_completed_at = completed_at
+            db.commit()
+
+
+def is_native_dispatch_corruption_capture_release_completed(
+    worker_terminal_id: str, assignment_id: str
+) -> bool:
+    """True iff a durable corruption record exists for this EXACT
+    ``(worker_terminal_id, assignment_id)`` pair whose entire guarded
+    capture-release transition has already completed (correction-1042/
+    1044).
+
+    Scoped to the exact assignment, not merely the worker terminal, so an
+    unrelated, already-resolved incident on a REUSED ``worker_terminal_id``
+    (a terminal retired and later reassigned) can never suppress a
+    genuinely new incident's hold for the new assignment -- consulted by
+    ``register_persisted_assignments`` before arming, never by anything
+    that itself releases a barrier.
+    """
+    with SessionLocal() as db:
+        row = (
+            db.query(NativeDispatchCorruptionModel)
+            .filter(
+                NativeDispatchCorruptionModel.worker_terminal_id == worker_terminal_id,
+                NativeDispatchCorruptionModel.assignment_id == assignment_id,
+                NativeDispatchCorruptionModel.capture_release_completed_at.isnot(None),
+            )
+            .first()
+        )
+        return row is not None
 
 
 def list_reconcilable_assigned_worker_callbacks() -> List[AssignedWorkerCallback]:

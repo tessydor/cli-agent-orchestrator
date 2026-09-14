@@ -6759,6 +6759,17 @@ class CorruptionCaptureReleaseRequest(BaseModel):
     recorded_at: str
     acknowledgement: str
     acknowledged_at: str
+    # correction-1042/1044 Part A: the live entry point for the optional
+    # supersession prerequisite (correction-1038 Part B). Both absent
+    # (the default) means no supersession is requested -- identical
+    # behavior to before this field pair existed. Both present applies
+    # the exact transactional prerequisite before release. A PARTIAL pair
+    # is refused before any acknowledgement -- see
+    # AssignedWorkerCompletionService.reconcile_corrupted_dispatch_
+    # capture_release's own upfront XOR guard, which this route never
+    # duplicates or second-guesses, only forwards to.
+    supersede_message_ids: Optional[List[int]] = None
+    superseding_message_id: Optional[int] = None
 
 
 @app.post("/assigned-workers/{worker_terminal_id}/corruption-recovery")
@@ -6821,6 +6832,8 @@ async def reconcile_corrupted_dispatch_capture_release_endpoint(
             concatenated_message_delivery_state=body.concatenated_message_delivery_state,
             concatenated_message_session_id=body.concatenated_message_session_id,
             recorded_at=body.recorded_at,
+            supersede_message_ids=body.supersede_message_ids,
+            superseding_message_id=body.superseding_message_id,
             acknowledgement=body.acknowledgement,
             acknowledged_at=body.acknowledged_at,
         )

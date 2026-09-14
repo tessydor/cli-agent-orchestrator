@@ -1051,6 +1051,8 @@ def release_corrupted_dispatch_capture(
     acknowledgement: str,
     acknowledged_at: str,
     concatenated_message_session_id: Optional[str] = None,
+    supersede_message_ids: Optional[List[int]] = None,
+    superseding_message_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Acknowledge an immutable native-dispatch corruption archive and
     idempotently release ONLY that exact dispatch's capture barrier
@@ -1091,6 +1093,17 @@ def release_corrupted_dispatch_capture(
     inert like every other scope-gated route in this codebase, not a
     claim that the local MCP->API hop is thereby authenticated -- it is
     trusted only because it is the same local deployment.
+
+    ``supersede_message_ids``/``superseding_message_id`` (correction-1042/
+    1044, both optional and ``None`` by default -- omitting them is
+    identical to calling this tool before they existed): when both are
+    given, the exact obsolete pending rows named by
+    ``supersede_message_ids`` are durably superseded by the exact PENDING
+    row named by ``superseding_message_id``, scoped to
+    ``(requesting_caller_id, worker_terminal_id)``, as one prerequisite of
+    this SAME release transition -- BEFORE the barrier releases. Supplying
+    only one of the two is refused server-side before any acknowledgement
+    at all (no partial application).
     """
     own_terminal_id = _own_terminal_id_or_error("release corrupted dispatch capture")
     if isinstance(own_terminal_id, dict):
@@ -1114,6 +1127,8 @@ def release_corrupted_dispatch_capture(
                 "recorded_at": recorded_at,
                 "acknowledgement": acknowledgement,
                 "acknowledged_at": acknowledged_at,
+                "supersede_message_ids": supersede_message_ids,
+                "superseding_message_id": superseding_message_id,
             },
             timeout=_mcp_timeout(),
         )

@@ -239,6 +239,80 @@ class TestReleaseCorruptedDispatchCaptureLiveEntryPoint:
             assigned_worker_completion_service._release_capture_barrier(WORKER_ID)
 
 
+class TestReleaseCorruptedDispatchCaptureSupersessionWiring:
+    """Correction-1042/1044 Part A.3: prove the LIVE entry point (not only
+    the internal service call) carries supersede_message_ids/
+    superseding_message_id all the way into supersede_inbox_messages,
+    through the real MCP tool -> real REST route -> real service call
+    chain -- and that a partial pair is refused before any mutation here
+    too.
+    """
+
+    def test_supersession_pair_reaches_the_db_through_the_live_mcp_entry_point(
+        self, mcp_over_testclient, isolated_db, monkeypatch
+    ):
+        try:
+            _seed_incident(WORKER_ID, CALLER_ID)
+            obsolete = db.create_inbox_message(
+                CALLER_ID, WORKER_ID, "877 analogue via MCP", origin=InboxMessageOrigin.EXPLICIT
+            )
+            superseder_row = next(
+                r
+                for r in db.get_pending_messages(WORKER_ID, limit=10)
+                if r.message == MESSAGE_948_CONTENT
+            )
+            monkeypatch.setattr(
+                status_monitor_mod.status_monitor, "get_status", lambda _id: TerminalStatus.IDLE
+            )
+
+            result = _call(
+                supersede_message_ids=[obsolete.id],
+                superseding_message_id=superseder_row.id,
+            )
+
+            assert result["success"] is True, result
+            assert result["released_now"] is True
+
+            rows = {m.id: m for m in db.get_inbox_messages(WORKER_ID, limit=10)}
+            assert rows[obsolete.id].status == MessageStatus.SUPERSEDED
+            assert rows[obsolete.id].superseded_by_message_id == superseder_row.id
+            assert rows[superseder_row.id].status == MessageStatus.PENDING
+        finally:
+            assigned_worker_completion_service._release_capture_barrier(WORKER_ID)
+
+    def test_partial_supersession_pair_is_refused_before_any_mutation_via_mcp(
+        self, mcp_over_testclient, isolated_db, monkeypatch
+    ):
+        try:
+            _seed_incident(WORKER_ID, CALLER_ID)
+            obsolete = db.create_inbox_message(
+                CALLER_ID,
+                WORKER_ID,
+                "877 analogue, partial via MCP",
+                origin=InboxMessageOrigin.EXPLICIT,
+            )
+            monkeypatch.setattr(
+                status_monitor_mod.status_monitor, "get_status", lambda _id: TerminalStatus.IDLE
+            )
+
+            result = _call(
+                superseding_message_id=obsolete.id + 999999
+            )  # supersede_message_ids omitted
+
+            assert result["success"] is False, result
+            assert (
+                assigned_worker_completion_service.wait_for_capture_before_input(
+                    WORKER_ID, timeout=0.2
+                )
+                is False
+            ), "a partial supersession pair must never release the barrier"
+            row = next(m for m in db.get_inbox_messages(WORKER_ID, limit=10) if m.id == obsolete.id)
+            assert row.status == MessageStatus.PENDING
+            assert row.superseded_by_message_id is None
+        finally:
+            assigned_worker_completion_service._release_capture_barrier(WORKER_ID)
+
+
 class TestReleaseCorruptedDispatchCaptureMachineBearer:
     """Message 1024: evidence that the supported MCP call still works
     through the EXISTING machine-bearer mechanism when auth is enabled --

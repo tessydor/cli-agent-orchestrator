@@ -395,8 +395,30 @@ class AssignedWorkerCompletionService:
         as ``acknowledge_native_dispatch_corruption`` on any guard failure or
         collision -- this method adds no additional silent-success paths.
         """
+        # correction-1042/1044 Part A.2: validate the supersession pair
+        # BEFORE any acknowledgement, not merely before release. A partial
+        # pair (exactly one of the two provided) used to be silently
+        # ignored by the ``and`` check below -- acknowledging and
+        # releasing the hold without ever superseding anything. Fail
+        # closed here instead: no ACK, no supersession, no release.
+        if (supersede_message_ids is None) != (superseding_message_id is None):
+            raise ValueError(
+                "supersede_message_ids and superseding_message_id must be supplied "
+                "together or not at all -- refusing a partial supersession pair "
+                "before any acknowledgement"
+            )
+        if supersede_message_ids is not None and not supersede_message_ids:
+            raise ValueError(
+                "supersede_message_ids must be non-empty when superseding_message_id " "is supplied"
+            )
+        if supersede_message_ids is not None and len(set(supersede_message_ids)) != len(
+            supersede_message_ids
+        ):
+            raise ValueError("supersede_message_ids must not contain duplicates")
+
         from cli_agent_orchestrator.clients.database import (
             acknowledge_native_dispatch_corruption,
+            mark_native_dispatch_corruption_capture_release_completed,
         )
         from cli_agent_orchestrator.services.terminal_service import terminal_input_lock
 
@@ -448,6 +470,21 @@ class AssignedWorkerCompletionService:
                         target_message_ids=list(supersede_message_ids),
                         superseding_message_id=superseding_message_id,
                     )
+
+                # correction-1042/1044 Part B: durably mark the ENTIRE
+                # transition (ack + any requested supersession) complete
+                # BEFORE releasing the barrier -- the one durable predicate
+                # register_persisted_assignments consults so a SECOND
+                # restart, after this incident is genuinely fully resolved,
+                # never re-arms it. caller_acknowledgement alone (set
+                # inside acknowledge_native_dispatch_corruption above) is
+                # NOT sufficient proof of this: it can be durably true
+                # while a requested supersession is still pending or has
+                # failed, which is exactly the state a restart MUST keep
+                # protecting.
+                mark_native_dispatch_corruption_capture_release_completed(
+                    result.record.record_key(), acknowledged_at
+                )
 
                 # Fault-injection seam (correction-1007 item 2): a test can
                 # monkeypatch this to raise, simulating a process crash
@@ -1235,19 +1272,39 @@ class AssignedWorkerCompletionService:
         receive its next queued message, while nothing ever told this
         service a hold was needed.
 
-        Reconstructing the hold here, unconditionally, for every
-        unresolved persisted assignment closes that gap completely,
-        regardless of whether the worker happens to be genuinely COMPLETED
-        right now: a hold armed for a worker that is still actually
-        PROCESSING is simply never consulted (InboxService's OWN, separate
-        status gate already blocks delivery for any non-ready status,
-        barrier or not) until a real COMPLETED transition is observed --
-        at which point the normal, already-armed-or-idempotently-re-armed
-        (``_arm_capture_barrier_if_known``'s own presence check) barrier
-        behaves exactly as if this reconstruction had never run. This
-        method never itself RELEASES anything; only the existing,
+        Reconstructing the hold here, for every unresolved persisted
+        assignment, closes that gap completely, regardless of whether the
+        worker happens to be genuinely COMPLETED or IDLE right now
+        (correction-1038 made the two send_input/InboxService checks
+        unconditional on status for exactly this reason -- a hold armed
+        here is consulted regardless of which ready status is observed).
+        This method never itself RELEASES anything; only the existing,
         already-tested paths (a real capture success, or the explicit
         guarded corruption-recovery operation) do that.
+
+        Two scoping refinements on top of ``list_protected_assigned_
+        worker_callbacks``' own broader ``(ASSIGNED, DISPATCHED,
+        UNRESOLVED)`` filter (correction-1042/1044, both confirmed real
+        defects against the unrefined loop, not hypothetical):
+
+        1. ASSIGNED is excluded from arming here. That broader filter's
+           OWN purpose (shared with ``cleanup_service``, which must not
+           delete a terminal that was merely assigned but never dispatched)
+           is legitimately wider than "needs a capture hold" -- a capture
+           hold exists to protect an already-captured or in-flight
+           completion, which cannot exist before the assignment's first
+           real dispatch has even happened. Arming one anyway would block
+           that FIRST genuine ``send_input`` call the moment correction-
+           1038 made the check unconditional on status, for a worker that
+           was never corrupted at all.
+        2. A DISPATCHED/UNRESOLVED record whose corruption incident has
+           already durably completed its ENTIRE guarded transition
+           (``is_native_dispatch_corruption_capture_release_completed`` --
+           correction-1042/1044 Part B) is also skipped: re-arming it on a
+           SECOND restart after a genuinely resolved incident would strand
+           any future message to this worker with no supported release
+           path, since the superseded row(s) this incident already
+           consumed are gone from PENDING for good.
         """
         try:
             records = list_protected_assigned_worker_callbacks()
@@ -1263,8 +1320,21 @@ class AssignedWorkerCompletionService:
                 exc_info=True,
             )
             return
+        from cli_agent_orchestrator.clients.database import (
+            is_native_dispatch_corruption_capture_release_completed,
+        )
+
         for record in records:
             self.register_assignment(record.worker_terminal_id)
+            if record.lifecycle not in (
+                AssignmentLifecycle.DISPATCHED,
+                AssignmentLifecycle.UNRESOLVED,
+            ):
+                continue
+            if is_native_dispatch_corruption_capture_release_completed(
+                record.worker_terminal_id, record.assignment_id
+            ):
+                continue
             self._arm_capture_barrier_if_known(record.worker_terminal_id)
 
     @staticmethod

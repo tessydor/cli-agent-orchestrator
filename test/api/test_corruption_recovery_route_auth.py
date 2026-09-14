@@ -210,3 +210,87 @@ class TestCorruptionRecoveryRouteDirectRestAuth:
             )
         finally:
             assigned_worker_completion_service._release_capture_barrier(WORKER_ID)
+
+    def test_supersession_pair_reaches_the_db_operation_via_the_live_route(
+        self, client, isolated_db, auth_on
+    ):
+        """Correction-1042/1044 Part A.3: the live REST route (not only the
+        internal service call) must actually carry ``target_message_ids``/
+        ``superseding_message_id`` into ``supersede_inbox_messages``, apply
+        the exact transactional prerequisite, and release only afterward.
+        """
+        try:
+            _seed_incident()
+            obsolete = db.create_inbox_message(
+                REAL_CALLER_ID,
+                WORKER_ID,
+                "877 analogue via REST",
+                origin=InboxMessageOrigin.EXPLICIT,
+            )
+            superseder = db.create_inbox_message(
+                REAL_CALLER_ID,
+                WORKER_ID,
+                "948 analogue via REST",
+                origin=InboxMessageOrigin.EXPLICIT,
+            )
+            app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_ADMIN])
+
+            resp = client.post(
+                ROUTE,
+                json=_body(
+                    supersede_message_ids=[obsolete.id],
+                    superseding_message_id=superseder.id,
+                ),
+            )
+
+            assert resp.status_code == 200, resp.text
+            payload = resp.json()
+            assert payload["success"] is True
+            assert payload["released_now"] is True
+
+            rows = {m.id: m for m in db.get_inbox_messages(WORKER_ID, limit=10)}
+            assert rows[obsolete.id].status == MessageStatus.SUPERSEDED
+            assert rows[obsolete.id].superseded_by_message_id == superseder.id
+            assert rows[superseder.id].status == MessageStatus.PENDING
+            assert (
+                assigned_worker_completion_service.wait_for_capture_before_input(
+                    WORKER_ID, timeout=1.0
+                )
+                is True
+            )
+        finally:
+            assigned_worker_completion_service._release_capture_barrier(WORKER_ID)
+
+    def test_partial_supersession_pair_is_refused_before_any_mutation_via_the_live_route(
+        self, client, isolated_db, auth_on
+    ):
+        """Correction-1042/1044 Part A.2: a partial pair (exactly one of
+        the two supplied) must fail closed via the live route too -- no
+        ACK, no supersession, no release, exactly as the internal service
+        guard now enforces.
+        """
+        try:
+            _seed_incident()
+            obsolete = db.create_inbox_message(
+                REAL_CALLER_ID,
+                WORKER_ID,
+                "877 analogue, partial pair",
+                origin=InboxMessageOrigin.EXPLICIT,
+            )
+            app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_ADMIN])
+
+            resp = client.post(ROUTE, json=_body(supersede_message_ids=[obsolete.id]))
+
+            assert resp.status_code == 409, resp.text
+            assert (
+                assigned_worker_completion_service.wait_for_capture_before_input(
+                    WORKER_ID, timeout=0.2
+                )
+                is False
+            ), "a partial supersession pair must never release the barrier"
+            # The obsolete row is completely untouched -- no partial apply.
+            row = next(m for m in db.get_inbox_messages(WORKER_ID, limit=10) if m.id == obsolete.id)
+            assert row.status == MessageStatus.PENDING
+            assert row.superseded_by_message_id is None
+        finally:
+            assigned_worker_completion_service._release_capture_barrier(WORKER_ID)
