@@ -54,6 +54,7 @@ from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.cli.commands.init import seed_default_skills
 from cli_agent_orchestrator.clients.database import (
+    NativeDispatchCorruptionGuardError,
     create_inbox_message,
     get_assigned_worker_callback,
     get_inbox_messages,
@@ -174,6 +175,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     OutputMode,
     TerminalInputBlockedError,
     _notify_elastic_terminal_ended,
+    drain_all_terminal_input_locks,
 )
 from cli_agent_orchestrator.services.workflow_journal import (
     _TERMINAL_RUN_STATES as _JOURNAL_TERMINAL_RUN_STATES,
@@ -1394,6 +1396,26 @@ async def lifespan(app: FastAPI):
     # threading.Thread (not asyncio), so join it directly rather than via
     # asyncio.gather with the tasks above.
     fifo_manager.stop_watchdog()
+
+    # correction-1038 Part C.3: every task above that could have DISPATCHED
+    # new native input has now been cancelled and awaited. Prove no
+    # physical write is still mid-flight -- from ANY of the four send_input
+    # entry points, not just the tasks above -- before this process is
+    # considered safe to replace. Bounded so a stuck terminal cannot hang
+    # shutdown indefinitely; a non-empty result is logged truthfully, never
+    # silently treated as drained (see drain_all_terminal_input_locks's own
+    # docstring for why an existing lock, not new tracking state, proves
+    # this).
+    still_busy = await asyncio.to_thread(drain_all_terminal_input_locks, 5.0)
+    if still_busy:
+        logger.warning(
+            "Shutdown proceeding with %d terminal(s) whose native-input lock could not be "
+            "confirmed free within the drain timeout: %s",
+            len(still_busy),
+            still_busy,
+        )
+    else:
+        logger.info("Confirmed no native-input write is in flight for any known terminal")
 
     await registry.teardown()
     # OpenTelemetry (ported): flush + shut down exporters (no-op when disabled).
@@ -6681,6 +6703,182 @@ async def get_assigned_worker_completion_callback_endpoint(
     # time the request lands (see compute_reconciliation_state_token).
     payload["state_token"] = compute_reconciliation_state_token(record)
     return cast(Dict, jsonable_encoder(payload))
+
+
+class CorruptionCaptureReleaseRequest(BaseModel):
+    """Body for the guarded native-dispatch corruption capture-release
+    transition (correction-997/1001/1007/1020) -- the one supported live
+    entry point for AssignedWorkerCompletionService.reconcile_corrupted_
+    dispatch_capture_release.
+
+    ``requesting_caller_id`` is a plain body field. For the MCP tool
+    (``mcp_server.server.release_corrupted_dispatch_capture``) it is
+    populated from THAT PROCESS's own ``CAO_TERMINAL_ID`` -- never a
+    client-settable tool argument -- so an MCP-mediated call cannot lie
+    about who is asking. A direct REST caller has no equivalent
+    constraint: this codebase's auth layer (``security/auth.py``) grants
+    only flat scopes (``cao:read``/``cao:write``/``cao:admin``) from the
+    bearer token -- ``get_current_scopes``/``extract_scopes_from_token``
+    extract scope claims only, never a subject/terminal-identity claim --
+    so nothing at the transport layer ties a request to a specific
+    terminal. A body field can therefore never itself be "identity" for a
+    direct caller (message 1020's finding, verified against the real
+    ``get_current_scopes`` implementation, not assumed).
+
+    Because of that gap, this route is deliberately ADMIN-only (see the
+    route's own scope dependency) rather than WRITE-or-ADMIN: the SAME
+    already-established trust tier this codebase uses for other
+    consequential, no-ownership-check terminal operations
+    (``DELETE /terminals/{id}`` takes no caller parameter at all and
+    deletes any terminal outright for any ADMIN-scoped caller). This is
+    the smallest existing, architecture-consistent boundary available --
+    not a claim that admin scope cryptographically proves the supplied
+    ``requesting_caller_id``, and not a claim that ``requesting_caller_id``
+    equality authenticates the HTTP requester at all (correction-1024:
+    documenting this truthfully, not merely narrowing the scope).
+
+    The truthful framing: ``cao:admin`` authorizes WHO may perform this
+    administrative recovery action at all. ``check_recovery_guards``'
+    ``GUARD_CALLER_MISMATCH`` is an entirely separate, real, load-bearing
+    guard that answers a different question -- WHICH incident/recorded
+    caller this specific administrative action targets. It is a
+    provenance/target guard, not authentication of the requester: an
+    admin-scoped caller can only ever act on the exact incident whose
+    immutable recorded caller matches the supplied ``requesting_caller_
+    id``, but nothing here proves that caller supplied that value
+    honestly rather than an admin performing the recovery ON BEHALF OF
+    (for) that recorded caller/incident -- which is exactly what this
+    operation is: an administrative recovery, performed for the exact
+    recorded caller and incident identified by the match, not a
+    self-service action authenticated as that caller.
+
+    One further honest limitation, inherent to ``require_any_scope``/
+    ``is_auth_enabled`` everywhere in this codebase (see docs/
+    configuration.md's own callout on this), not unique to this route:
+    when auth is DISABLED (the default), the ``cao:admin`` requirement
+    above is INERT -- ``require_any_scope`` grants the full scope set
+    unconditionally, so this route (like every other scope-gated route)
+    admits any caller who can reach the port at all. That default-off
+    posture is an operational limitation of running without auth
+    enabled, never a claim that a same-user local process (e.g. the MCP
+    server's own loopback hop) is thereby cryptographically authenticated
+    -- it is trusted only because it IS the same local deployment, the
+    same trust boundary every other MCP->API call already relies on.
+    """
+
+    assignment_id: str
+    requesting_caller_id: str
+    transcript_first_user_text: str
+    expected_transcript_sha256: str
+    admissible_dispatch_sha256: List[str]
+    concatenated_message_id: str
+    concatenated_message_sender_id: str
+    concatenated_message_receiver_id: str
+    concatenated_message_content: str
+    concatenated_message_delivery_state: str
+    concatenated_message_session_id: Optional[str] = None
+    recorded_at: str
+    acknowledgement: str
+    acknowledged_at: str
+    # correction-1042/1044 Part A: the live entry point for the optional
+    # supersession prerequisite (correction-1038 Part B). Both absent
+    # (the default) means no supersession is requested -- identical
+    # behavior to before this field pair existed. Both present applies
+    # the exact transactional prerequisite before release. A PARTIAL pair
+    # is refused before any acknowledgement -- see
+    # AssignedWorkerCompletionService.reconcile_corrupted_dispatch_
+    # capture_release's own upfront XOR guard, which this route never
+    # duplicates or second-guesses, only forwards to.
+    supersede_message_ids: Optional[List[int]] = None
+    superseding_message_id: Optional[int] = None
+
+
+@app.post("/assigned-workers/{worker_terminal_id}/corruption-recovery")
+async def reconcile_corrupted_dispatch_capture_release_endpoint(
+    worker_terminal_id: TerminalId,
+    body: CorruptionCaptureReleaseRequest,
+    # ADMIN-only, not WRITE-or-ADMIN (correction-1020): the auth layer has
+    # no per-terminal subject binding at all (verified against security/
+    # auth.py -- get_current_scopes returns flat scopes only), so a WRITE-
+    # scoped direct REST caller could otherwise supply ANY requesting_
+    # caller_id in the body and satisfy GUARD_CALLER_MISMATCH simply by
+    # knowing/guessing it. Narrowing to ADMIN matches this codebase's own
+    # existing precedent for consequential, no-ownership-check terminal
+    # operations (DELETE /terminals/{id} takes no caller parameter and
+    # authorizes purely on ADMIN scope) -- see CorruptionCaptureRelease
+    # Request's docstring for the full evidence trail.
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
+) -> Dict:
+    """Perform the administrative native-dispatch-corruption recovery
+    action for the exact recorded caller/incident identified by the
+    request, idempotently releasing ONLY that exact dispatch's capture
+    barrier (correction-997/1001/1007/1020/1024).
+
+    The one supported live entry point for the guarded recovery
+    transition already required by 997/1007 -- previously defined and
+    tested but reachable only from an in-process test, never from a
+    running server. Every guard from ``check_recovery_guards`` (identity,
+    evidence integrity, hash/prefix match, lifecycle eligibility, live-
+    terminal activity, claimed-message content/direction) plus the
+    acknowledgement-specific guard is freshly rerun, at mutation time,
+    against the CURRENT database and CURRENT live terminal status -- never
+    trusted from any caller-supplied precomputed result. Never marks the
+    task successful, fabricates a final_result/completion, replays the
+    concatenated message, changes its historical delivery, or creates any
+    new inbox row. Ordinary InboxService remains solely responsible for
+    delivering any existing pending follow-up, exactly once, through its
+    own unrelated normal path -- this endpoint never sends or delivers
+    anything itself.
+
+    ``cao:admin`` authorizes performing this administrative action at
+    all; ``GUARD_CALLER_MISMATCH`` (inside the call below) separately
+    targets it to the exact recorded caller/incident -- see
+    ``CorruptionCaptureReleaseRequest``'s docstring for why these are two
+    distinct guards, neither of which is cryptographic authentication of
+    the HTTP requester, and for the honest auth-disabled caveat.
+    """
+    try:
+        result = await asyncio.to_thread(
+            assigned_worker_completion_service.reconcile_corrupted_dispatch_capture_release,
+            worker_terminal_id,
+            assignment_id=body.assignment_id,
+            requesting_caller_id=body.requesting_caller_id,
+            transcript_first_user_text=body.transcript_first_user_text,
+            expected_transcript_sha256=body.expected_transcript_sha256,
+            admissible_dispatch_sha256=body.admissible_dispatch_sha256,
+            concatenated_message_id=body.concatenated_message_id,
+            concatenated_message_sender_id=body.concatenated_message_sender_id,
+            concatenated_message_receiver_id=body.concatenated_message_receiver_id,
+            concatenated_message_content=body.concatenated_message_content,
+            concatenated_message_delivery_state=body.concatenated_message_delivery_state,
+            concatenated_message_session_id=body.concatenated_message_session_id,
+            recorded_at=body.recorded_at,
+            supersede_message_ids=body.supersede_message_ids,
+            superseding_message_id=body.superseding_message_id,
+            acknowledgement=body.acknowledgement,
+            acknowledged_at=body.acknowledged_at,
+        )
+    except NativeDispatchCorruptionGuardError as exc:
+        # Fail closed: every guard refusal (wrong caller, wrong assignment/
+        # message/archive/acknowledgement binding, live/ineligible state,
+        # tampered evidence) surfaces as a 409 naming the exact reason code
+        # -- never a silent 200, never a 500 that could be mistaken for a
+        # transient/retryable failure.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except ValueError as exc:
+        # A genuine, different existing record already occupies this exact
+        # (assignment, concatenated message) identity, or a concurrent
+        # transaction won first -- also a conflict, never a 500.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    return {
+        "success": True,
+        "released_now": result.released_now,
+        "record_key": result.record.record_key(),
+        "assignment_id": result.record.assignment_id,
+        "worker_terminal_id": result.record.worker_terminal_id,
+        "caller_acknowledgement": result.record.caller_acknowledgement,
+        "capture_release_acknowledged_at": result.record.capture_release_acknowledged_at,
+    }
 
 
 @app.post("/terminals/{receiver_id}/inbox/messages")

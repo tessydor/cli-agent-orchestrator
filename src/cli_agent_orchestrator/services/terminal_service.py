@@ -155,6 +155,63 @@ class TerminalRecordCorruptError(Exception):
     """
 
 
+class NativeAcceptanceTimeoutError(Exception):
+    """A prior send_input() dispatch to this terminal has not been confirmed
+    accepted by its native process within the bounded wait.
+
+    Correction-984: terminal_input_lock (correction-971) serializes the
+    PHYSICAL tmux write between concurrent send_input() callers for the same
+    terminal_id, but says nothing about whether the terminal's own process
+    has actually registered a PRIOR dispatch by the time a SUBSEQUENT
+    caller's turn to hold that lock arrives -- for a provider that does not
+    ``assume_processing_on_dispatch`` (see providers/base.py), that
+    confirmation depends on StatusMonitor's real output-based detection
+    observing a transition away from IDLE (see
+    StatusMonitor.wait_for_native_acceptance / notify_input_sent), which can
+    genuinely take a bounded amount of wall-clock time after the physical
+    paste+Enter returns. Raised instead of proceeding: a too-early second
+    paste risks landing inside a composer the prior dispatch has not yet
+    cleared, silently merging two turns into one. Callers that can safely
+    retry later (e.g. InboxService, which re-checks status on the next
+    IDLE/COMPLETED event) should treat this the same as a transient,
+    not-ready-yet condition -- never as a permanent failure, and never by
+    retrying immediately in a tight loop.
+    """
+
+
+class TerminalCaptureNotDurableError(Exception):
+    """A terminal is (now) COMPLETED but its final report is not yet
+    durably captured; refusing to paste rather than risk transcript loss.
+
+    Correction-994: a caller (typically InboxService) can legitimately read
+    IDLE and skip its own COMPLETED-capture check, only for the terminal to
+    finish its turn WHILE this call is blocked inside
+    wait_for_native_acceptance() -- the same detection that releases the
+    acceptance fence also arms AssignedWorkerCompletionService's capture
+    barrier for the newly-COMPLETED status. Without a fresh recheck here,
+    send_input would then observe COMPLETED and paste straight through,
+    before the just-finished turn's report is safely durable -- exactly the
+    kind of premature paste this whole correction chain exists to prevent,
+    just arriving via a different door. Checked once, here, at the single
+    boundary shared by every send_input() caller, rather than duplicated
+    (and inevitably drifting out of sync) in each of the four entry points.
+    Treat identically to NativeAcceptanceTimeoutError: transient, safe to
+    retry later, never a permanent failure.
+    """
+
+
+# Bounded wait (seconds) for a PRIOR dispatch's native acceptance before a
+# SUBSEQUENT send_input() call for the same terminal refuses to paste
+# (correction-984). Generous relative to the slowest known real-world
+# component of that latency -- claude_code's own paste_submit_delay is up to
+# 2.0s -- plus margin for StatusMonitor's rising-edge detection (fires on the
+# first output chunk after quiet, not after a further debounce) to actually
+# observe and apply the transition. Not tunable per-provider: a single
+# generous bound keeps this fail-closed without needing to plumb provider
+# identity to the wait call.
+NATIVE_ACCEPTANCE_TIMEOUT_S = 8.0
+
+
 # Upper bound (bytes) on a single offset-ranged read of a terminal log
 # (U5 / #504, BR-2). ``read_output_range`` clamps its ``length`` to this so a
 # caller (playback fetching output around a selected event) can never trigger
@@ -181,6 +238,125 @@ _CURRENT_COMPOSER_PROBE_MAX_CHARS = 64
 # deferred provider.initialize() + input-send task could be GC'd mid-run,
 # silently leaving a worker uninitialized. Tasks drop themselves on completion.
 _deferred_init_tasks: set = set()
+
+# One RLock per terminal ever sent input to in this process, guarding
+# send_input()'s entire physical-write critical section (status/dispatch-
+# identity bookkeeping through the actual tmux paste + Enter keys) against
+# ANY concurrent caller for the SAME terminal_id.
+#
+# Before this, ONLY InboxService's own private per-terminal lock serialized
+# its OWN sequential deliveries against each other; nothing serialized those
+# against send_input's other three callers (agent_step's initial dispatch,
+# the raw POST /terminals/{id}/input endpoint, agui's handoff-approval send).
+# Two calls to send_input for the same terminal from different entry points
+# could therefore have their tmux writes genuinely overlap: bracketed-paste
+# text from one call landing inside the still-open paste of another before
+# either's Enter key was sent, merging two logically distinct turns into one
+# from the native provider's point of view (correction-971's proven defect:
+# an assigned worker's registered first-user dispatch, whose exact bytes are
+# bound by bind_completion_dispatch() below, ends up with an unrelated
+# follow-up message physically appended to it in the native transcript with
+# no turn boundary — corrupting the very identity bind_completion_dispatch
+# exists to protect).
+#
+# An RLock (not a plain Lock) because InboxService.deliver_pending acquires
+# this SAME lock (see terminal_input_lock() below) before calling
+# wait_for_capture_before_input() and holds it across its own eventual call
+# into send_input() -- extending the capture-barrier's protection to every
+# entry point, not just InboxService's own -- and send_input() re-acquires
+# it internally; same-thread reentrant acquisition must not deadlock.
+_terminal_input_locks_guard = threading.Lock()
+_terminal_input_locks: dict[str, threading.RLock] = {}
+
+
+def terminal_input_lock(terminal_id: str) -> threading.RLock:
+    """Return the stable per-terminal RLock guarding native-input delivery.
+
+    Every caller of :func:`send_input` for a given ``terminal_id`` is
+    automatically serialized against every other, because ``send_input``
+    itself acquires this lock (see its body). Callers that also need to
+    serialize a PRE-send step against send_input for the same terminal (see
+    ``InboxService.deliver_pending``) acquire it explicitly first and hold it
+    across their own call into ``send_input`` -- safe because this is an
+    ``RLock`` and both acquisitions happen on the same thread.
+    """
+    with _terminal_input_locks_guard:
+        lock = _terminal_input_locks.get(terminal_id)
+        if lock is None:
+            lock = threading.RLock()
+            _terminal_input_locks[terminal_id] = lock
+        return lock
+
+
+def drain_all_terminal_input_locks(timeout: float = 5.0) -> list[str]:
+    """Prove no physical native-input write is currently in flight for any
+    known terminal, within a bounded overall timeout (correction-1038 Part
+    C.3).
+
+    Message-1038's finding: neither ``WAITING_USER_ANSWER`` nor any
+    completion-callback flag proves a physical tmux write is not mid-flight
+    right now, and this codebase's shutdown sequence only ever cancels
+    async tasks -- it never verifies the ONE thing that actually matters
+    before replacing the running process: whether ``send_input`` (from ANY
+    of its four entry points -- InboxService, the raw POST /terminals/{id}/
+    input route, agent_step's initial dispatch, or agui's handoff-approval
+    send -- this function does not need to know or care which) is
+    currently between acquiring ``terminal_input_lock`` and releasing it
+    after its physical write. Searched first for an existing supported
+    drain/graceful-shutdown path -- none exists; ``lifespan()`` only ever
+    ``.cancel()``s its own async tasks, which does not stop (and, for a
+    task already running inside ``asyncio.to_thread``, cannot stop) a
+    synchronous physical write already under way in a worker thread, and
+    says nothing at all about the raw HTTP/agui entry points, which are not
+    tasks this module tracks.
+
+    Deliberately reuses the EXISTING per-terminal ``terminal_input_lock``
+    rather than inventing new tracking state: every native-input entry
+    point already serializes through this exact lock for its physical
+    write (see ``send_input``'s own module docstring), so a lock this
+    function can acquire-and-immediately-release is, by construction, not
+    currently held by any in-flight write -- covering all four entry
+    points uniformly, with no new counter to keep consistent. A capture-
+    barrier waiter parked in ``Condition.wait()`` (correction-1007) is
+    NOT mistaken for an in-flight write: ``Condition.wait()`` atomically
+    releases this same lock while blocked, exactly per its own docstring.
+
+    Bounded and non-blocking-forever by design (a systemd stop has its own
+    timeout): tries every known terminal's lock in turn, each capped so one
+    genuinely stuck terminal cannot starve the check for the rest, and
+    returns the list of terminal_ids that could NOT be confirmed free
+    within ``timeout`` -- an empty list means every one was. Never invents
+    an assertion: a non-empty return is reported truthfully by the caller
+    (logged, not silently treated as drained) rather than asserted safe.
+    """
+    with _terminal_input_locks_guard:
+        terminal_ids = list(_terminal_input_locks.keys())
+    if not terminal_ids:
+        return []
+    # An even per-terminal slice of the overall budget: one genuinely stuck
+    # terminal's acquire() attempt is capped at its own share, so it cannot
+    # exhaust the shared deadline before every OTHER terminal has had its
+    # fair chance to be checked. The overall deadline is still enforced too
+    # (never exceeded in total), so the bound promised by ``timeout``
+    # remains an upper bound either way.
+    per_lock_timeout = timeout / len(terminal_ids)
+    deadline = time.monotonic() + timeout
+    still_busy: list[str] = []
+    for terminal_id in terminal_ids:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            still_busy.append(terminal_id)
+            continue
+        lock = terminal_input_lock(terminal_id)
+        acquired = lock.acquire(timeout=min(per_lock_timeout, remaining))
+        if not acquired:
+            still_busy.append(terminal_id)
+            continue
+        try:
+            pass  # Acquired and released immediately: proven free right now.
+        finally:
+            lock.release()
+    return still_busy
 
 
 def inject_memory_context(
@@ -2401,6 +2577,8 @@ def send_input(
     sender_id: str | None = None,
     orchestration_type: OrchestrationType | None = None,
     frozen_memory: str | None = None,
+    *,
+    _defer_plugin_dispatch: Optional[List[Callable[[], None]]] = None,
 ) -> bool:
     """Send input to terminal via tmux paste buffer.
 
@@ -2414,148 +2592,297 @@ def send_input(
     not logged. It is last and defaulted so existing positional callers (notably
     ``agent_step.run_agent_step``, which passes exactly two arguments) are
     unaffected.
+
+    ``_defer_plugin_dispatch`` is a private, keyword-only escape hatch
+    (correction-1007 item 3 / message 1004): when the caller already holds
+    ``terminal_input_lock(terminal_id)`` OUTSIDE this call (today, only
+    ``InboxService.deliver_pending``, via ``_deliver_pending_locked``),
+    moving plugin dispatch to after THIS function's own ``with
+    terminal_input_lock(...):`` block (correction-994) is not enough --
+    that block is a REENTRANT acquire of the SAME RLock the caller already
+    holds, so the lock is still held by the caller's own outer critical
+    section while this function's "after the lock" code runs. Passing a
+    list here defers the actual dispatch (as a zero-arg callable, appended
+    in call order) instead of invoking it inline, so the true outermost
+    lock holder can drain and run it after ITS OWN lock genuinely releases.
+    Every other caller leaves this ``None`` and keeps today's behavior
+    (dispatch immediately after this function's own lock releases), which
+    is already correct for them since none of them are nested inside
+    another holder of this same lock.
     """
-    try:
-        metadata = get_terminal_metadata(terminal_id)
-        if not metadata:
-            raise ValueError(f"Terminal '{terminal_id}' not found")
-
-        if (
-            metadata.get("provider") == ProviderType.KIRO_CLI.value
-            and resolve_kiro_engine(persisted=metadata.get("engine")) == KiroEngine.KAS
-        ):
-            raise KiroPhase0KASError(profile_has_v2_policy=False)
-
-        provider = provider_manager.get_provider(terminal_id)
-        orchestration_value = (
-            orchestration_type.value
-            if isinstance(orchestration_type, OrchestrationType)
-            else str(orchestration_type or "")
-        )
-
-        if provider:
-            current_status = status_monitor.get_status(terminal_id)
-
-            # Guard: refuse to type into a terminal whose provider process has
-            # exited. Without this check, queued messages would be pasted into
-            # a bare shell and executed as arbitrary commands.
-            if current_status == TerminalStatus.ERROR:
-                raise TerminalInputBlockedError(
-                    f"Terminal {terminal_id} provider is in ERROR state "
-                    "(provider process may have exited). Refusing to deliver input."
-                )
+    with terminal_input_lock(terminal_id):
+        try:
+            metadata = get_terminal_metadata(terminal_id)
+            if not metadata:
+                raise ValueError(f"Terminal '{terminal_id}' not found")
 
             if (
-                provider.blocks_orchestrated_input_while_waiting_user_answer is True
-                and orchestration_value
-                in {OrchestrationType.ASSIGN.value, OrchestrationType.HANDOFF.value}
-                and current_status == TerminalStatus.WAITING_USER_ANSWER
+                metadata.get("provider") == ProviderType.KIRO_CLI.value
+                and resolve_kiro_engine(persisted=metadata.get("engine")) == KiroEngine.KAS
             ):
-                raise TerminalInputBlockedError(
-                    f"Terminal {terminal_id} is waiting for a user answer. "
-                    "Use answer_user_prompt to submit a selection or approval before "
-                    f"sending {orchestration_value} input."
+                raise KiroPhase0KASError(profile_has_v2_policy=False)
+
+            provider = provider_manager.get_provider(terminal_id)
+            orchestration_value = (
+                orchestration_type.value
+                if isinstance(orchestration_type, OrchestrationType)
+                else str(orchestration_type or "")
+            )
+
+            # Acceptance/status/capture validation as one coherent,
+            # retryable guard sequence (correction-1017). The capture wait
+            # below (``_wait_for_capture_before_input_detailed``) can
+            # genuinely relinquish and reacquire ``terminal_input_lock``
+            # (correction-1007's Condition-based fix) to avoid starving the
+            # one path that releases it -- but that means a DIFFERENT
+            # send_input() call for this SAME terminal_id can run an entire
+            # dispatch cycle (including arming a brand-new native-
+            # acceptance fence) during the gap. Everything checked BEFORE
+            # or DURING that gap -- the acceptance check above it, and the
+            # ``current_status`` read below -- is then stale and must be
+            # discarded, not acted on. Looping back to the top re-derives
+            # both from scratch; only a pass that never had to relinquish
+            # the lock (``blocked=False``) is trustworthy enough to proceed
+            # past this point. This does not spin unconditionally: each
+            # iteration either raises (a bounded sub-timeout expired) or
+            # made real, bounded progress via a genuine wait -- a COMPLETED
+            # status with NO capture barrier at all reports
+            # ``blocked=False`` immediately (nothing to relinquish) and
+            # exits the loop right away, exactly like the non-COMPLETED
+            # case, rather than being mistaken for staleness.
+            while True:
+                # Native acceptance/order fence (correction-984). The lock
+                # above only guarantees no OTHER send_input() call for this
+                # terminal_id is physically writing right now; it says
+                # nothing about whether a PRIOR dispatch (from before this
+                # call acquired the lock, or armed during a relinquished
+                # capture wait below) has actually been accepted by the
+                # terminal's native process yet. Checked first every
+                # iteration, so a still-pending turn -- including one a
+                # concurrent contender just started -- can never be raced
+                # by this call's own paste.
+                if not status_monitor.wait_for_native_acceptance(
+                    terminal_id, timeout=NATIVE_ACCEPTANCE_TIMEOUT_S
+                ):
+                    raise NativeAcceptanceTimeoutError(
+                        f"Terminal {terminal_id}: a prior dispatch was not confirmed "
+                        f"accepted within {NATIVE_ACCEPTANCE_TIMEOUT_S}s; refusing to "
+                        "paste to avoid landing inside an unconfirmed composer."
+                    )
+
+                if not provider:
+                    break
+
+                current_status = status_monitor.get_status(terminal_id)
+
+                # Guard: refuse to type into a terminal whose provider process has
+                # exited. Without this check, queued messages would be pasted into
+                # a bare shell and executed as arbitrary commands. Checked BEFORE
+                # the capture-hold wait below: a dead provider can never clear a
+                # hold, so failing fast here avoids waiting out a whole timeout
+                # only to raise anyway.
+                if current_status == TerminalStatus.ERROR:
+                    raise TerminalInputBlockedError(
+                        f"Terminal {terminal_id} provider is in ERROR state "
+                        "(provider process may have exited). Refusing to deliver input."
+                    )
+
+                # Re-check the capture hold HERE, after the acceptance-fence wait
+                # above, not just wherever a caller happened to check status
+                # before calling send_input() (correction-994): a fresh COMPLETED
+                # can be observed for the first time in the gap between an
+                # earlier IDLE read and this point, since the same detection
+                # event that just released the acceptance fence also arms the
+                # capture barrier below. This is the ONE shared boundary; it does
+                # not duplicate or replace InboxService's OWN earlier check
+                # (still load-bearing to avoid claiming a message row before
+                # even getting here) -- it exists because that check cannot see
+                # a completion that lands strictly after it ran.
+                #
+                # correction-1038: this used to be gated on
+                # ``current_status == TerminalStatus.COMPLETED``, on the
+                # assumption that a barrier can only ever matter while a worker
+                # is (or was, moments ago) COMPLETED. That assumption broke for
+                # a hold reconstructed at startup for an unresolved persisted
+                # assignment (correction-1033): a provider can legitimately
+                # report IDLE for an already-quiet, ready composer even though
+                # the assignment itself was never resolved, and IDLE skipped
+                # this check entirely -- letting new input land on top of an
+                # acknowledged-but-unreleased incident. ``_wait_for_capture_
+                # before_input_detailed`` already fast-paths to
+                # ``ready=True, blocked=False`` the instant no barrier exists
+                # for this ``terminal_id`` (the overwhelming majority of calls,
+                # including every genuine first ASSIGNED dispatch -- a brand
+                # new worker is "known" but has no barrier until either a live
+                # COMPLETED detection or a restart reconstruction arms one), so
+                # calling it unconditionally here costs nothing on that fast
+                # path and closes the gap uniformly for every other status
+                # (IDLE included) instead of only COMPLETED.
+                from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+                    assigned_worker_completion_service,
                 )
 
-        # Inject memory context into the very first user message after init.
-        # Phase 1 wires injection inline for every provider. The Kiro
-        # AgentSpawn hook will replace this path once the plugin
-        # migration PR lands; until then, inline injection is the only
-        # delivery path.
-        # Keep the original message for the PostSendMessageEvent so
-        # plugins/webhooks see what the caller sent — not the
-        # internal <cao-memory> block that we paste into the TUI.
-        original_message = message
-        message = inject_memory_context(message, terminal_id, frozen_memory)
-
-        if orchestration_value == OrchestrationType.ASSIGN.value:
-            callback = get_assigned_worker_callback(terminal_id)
-            if callback is not None:
-                # Bind the exact post-injection bytes before the external paste
-                # can occur. Provider completion reports must correlate to this
-                # immutable completion and one of its bounded dispatch attempts.
-                from cli_agent_orchestrator.services.provider_completion_report import (
-                    bind_completion_dispatch,
+                wait_result = (
+                    assigned_worker_completion_service._wait_for_capture_before_input_detailed(
+                        terminal_id
+                    )
                 )
+                if not wait_result.ready:
+                    if current_status == TerminalStatus.COMPLETED:
+                        raise TerminalCaptureNotDurableError(
+                            f"Terminal {terminal_id} is COMPLETED but its final report "
+                            "is not yet durably captured; refusing to paste."
+                        )
+                    raise TerminalCaptureNotDurableError(
+                        f"Terminal {terminal_id} has an unresolved capture hold "
+                        f"(current status: {current_status.value}); refusing to paste "
+                        "until the incident is captured or explicitly acknowledged."
+                    )
+                if wait_result.blocked:
+                    # The lock was genuinely relinquished during this
+                    # wait -- everything above (including the
+                    # acceptance check) may now be stale. Discard it
+                    # and start this iteration over from the top.
+                    continue
 
-                bind_completion_dispatch(
-                    metadata["provider"],
-                    terminal_id,
-                    callback.completion_id,
-                    message,
-                )
+                if (
+                    provider.blocks_orchestrated_input_while_waiting_user_answer is True
+                    and orchestration_value
+                    in {OrchestrationType.ASSIGN.value, OrchestrationType.HANDOFF.value}
+                    and current_status == TerminalStatus.WAITING_USER_ANSWER
+                ):
+                    raise TerminalInputBlockedError(
+                        f"Terminal {terminal_id} is waiting for a user answer. "
+                        "Use answer_user_prompt to submit a selection or approval before "
+                        f"sending {orchestration_value} input."
+                    )
 
-        # Provider wire encoding happens only after the exact logical task
-        # bytes above are bound.  Assigned Claude Code uses one-line SDK JSONL
-        # so multiline/Unicode task content reaches stream-json without tmux
-        # treating embedded newlines as separate submissions.
-        terminal_input = message
-        force_bracketed_paste = True
-        if provider:
-            encoded_input = provider.encode_terminal_input(message, orchestration_value)
-            # Defensive compatibility for third-party/test provider doubles
-            # that predate the optional structured-input hook.
-            if isinstance(encoded_input, str):
-                terminal_input = encoded_input
-            provider_bracketed_paste = provider.force_bracketed_paste
-            if isinstance(provider_bracketed_paste, bool):
-                force_bracketed_paste = provider_bracketed_paste
+                # A clean pass: nothing above needed to relinquish the lock,
+                # so nothing checked in this iteration can be stale.
+                break
 
-        # Check how many Enter keys the provider needs after paste
-        enter_count = provider.paste_enter_count if provider else 1
+            # Inject memory context into the very first user message after init.
+            # Phase 1 wires injection inline for every provider. The Kiro
+            # AgentSpawn hook will replace this path once the plugin
+            # migration PR lands; until then, inline injection is the only
+            # delivery path.
+            # Keep the original message for the PostSendMessageEvent so
+            # plugins/webhooks see what the caller sent — not the
+            # internal <cao-memory> block that we paste into the TUI.
+            original_message = message
+            message = inject_memory_context(message, terminal_id, frozen_memory)
 
-        # Arm the StatusMonitor stickiness gate so that the next provider-
-        # detected PROCESSING transition is honored (overriding the latched
-        # IDLE/COMPLETED). Without this, sticky ready-status would block
-        # the genuine PROCESSING signal that arrives once the agent starts
-        # working on the new message.
-        if provider and provider.assume_processing_on_dispatch is True:
-            status_monitor.notify_input_sent(terminal_id, assume_processing=True)
-        else:
-            status_monitor.notify_input_sent(terminal_id)
+            if orchestration_value == OrchestrationType.ASSIGN.value:
+                callback = get_assigned_worker_callback(terminal_id)
+                if callback is not None:
+                    # Bind the exact post-injection bytes before the external paste
+                    # can occur. Provider completion reports must correlate to this
+                    # immutable completion and one of its bounded dispatch attempts.
+                    from cli_agent_orchestrator.services.provider_completion_report import (
+                        bind_completion_dispatch,
+                    )
 
-        # Clear ONLY the rolling byte buffer BEFORE sending keys, so stale idle
-        # prompts from BEFORE the input can't trigger a false COMPLETED
-        # (kiro-cli 2.11's TUI keeps the "ask a question" placeholder in the raw
-        # buffer, which combined with input_received=True would return COMPLETED
-        # within seconds of send_input). Clearing here — not after send_keys —
-        # avoids a race: send_keys includes a submit-delay sleep during which
-        # the agent can begin emitting output; a post-send_keys clear would wipe
-        # that newly-emitted first chunk of the turn (lost from
-        # GET /terminals/{id}/output?mode=full and from early detection). This
-        # uses clear_rolling_buffer (byte-only), which preserves the sticky-latch
-        # arm set by notify_input_sent above; reset_buffer would wipe the arm and
-        # latch-block the IDLE→PROCESSING transition for the whole turn.
-        # Give stateful providers the same explicit generation boundary as the
-        # rolling byte buffer.  Grok uses this to distinguish a new,
-        # byte-identical completion from a retained completion screen.
-        status_monitor.clear_rolling_buffer(terminal_id, provider)
+                    bind_completion_dispatch(
+                        metadata["provider"],
+                        terminal_id,
+                        callback.completion_id,
+                        message,
+                    )
 
-        # Mark the provider before send_keys rather than after it.  send_keys
-        # includes the provider-specific submit delay, during which a fast CLI
-        # can already emit its first processing and completion frames.  Those
-        # frames must be parsed as belonging to this turn, not as a stale
-        # post-clear redraw.  StatusMonitor has already armed and cleared the
-        # same dispatch boundary above.
-        if provider:
-            provider.mark_input_received()
+            # Provider wire encoding happens only after the exact logical task
+            # bytes above are bound.  Assigned Claude Code uses one-line SDK JSONL
+            # so multiline/Unicode task content reaches stream-json without tmux
+            # treating embedded newlines as separate submissions.
+            terminal_input = message
+            force_bracketed_paste = True
+            if provider:
+                encoded_input = provider.encode_terminal_input(message, orchestration_value)
+                # Defensive compatibility for third-party/test provider doubles
+                # that predate the optional structured-input hook.
+                if isinstance(encoded_input, str):
+                    terminal_input = encoded_input
+                provider_bracketed_paste = provider.force_bracketed_paste
+                if isinstance(provider_bracketed_paste, bool):
+                    force_bracketed_paste = provider_bracketed_paste
 
-        get_backend().send_keys(
-            metadata["tmux_session"],
-            metadata["tmux_window"],
-            terminal_input,
-            enter_count=enter_count,
-            force_bracketed_paste=force_bracketed_paste,
-            submit_delay=provider.paste_submit_delay if provider else 0.3,
-        )
+            # Check how many Enter keys the provider needs after paste
+            enter_count = provider.paste_enter_count if provider else 1
 
-        update_last_active(terminal_id)
-        logger.info(f"Sent input to terminal: {terminal_id}")
-        if registry is not None and sender_id is not None and orchestration_type is not None:
-            # Telemetry (opt-in; no-ops without the [otel] extra or when the SDK
-            # is disabled): record a GenAI ``execute_tool`` span for the dispatch,
-            # count it, and propagate the active trace context into the plugin
-            # event so downstream consumers can continue the trace.
+            # Arm the StatusMonitor stickiness gate so that the next provider-
+            # detected PROCESSING transition is honored (overriding the latched
+            # IDLE/COMPLETED). Without this, sticky ready-status would block
+            # the genuine PROCESSING signal that arrives once the agent starts
+            # working on the new message.
+            if provider and provider.assume_processing_on_dispatch is True:
+                status_monitor.notify_input_sent(terminal_id, assume_processing=True)
+            else:
+                status_monitor.notify_input_sent(terminal_id)
+
+            # Clear ONLY the rolling byte buffer BEFORE sending keys, so stale idle
+            # prompts from BEFORE the input can't trigger a false COMPLETED
+            # (kiro-cli 2.11's TUI keeps the "ask a question" placeholder in the raw
+            # buffer, which combined with input_received=True would return COMPLETED
+            # within seconds of send_input). Clearing here — not after send_keys —
+            # avoids a race: send_keys includes a submit-delay sleep during which
+            # the agent can begin emitting output; a post-send_keys clear would wipe
+            # that newly-emitted first chunk of the turn (lost from
+            # GET /terminals/{id}/output?mode=full and from early detection). This
+            # uses clear_rolling_buffer (byte-only), which preserves the sticky-latch
+            # arm set by notify_input_sent above; reset_buffer would wipe the arm and
+            # latch-block the IDLE→PROCESSING transition for the whole turn.
+            # Give stateful providers the same explicit generation boundary as the
+            # rolling byte buffer.  Grok uses this to distinguish a new,
+            # byte-identical completion from a retained completion screen.
+            status_monitor.clear_rolling_buffer(terminal_id, provider)
+
+            # Mark the provider before send_keys rather than after it.  send_keys
+            # includes the provider-specific submit delay, during which a fast CLI
+            # can already emit its first processing and completion frames.  Those
+            # frames must be parsed as belonging to this turn, not as a stale
+            # post-clear redraw.  StatusMonitor has already armed and cleared the
+            # same dispatch boundary above.
+            if provider:
+                provider.mark_input_received()
+
+            get_backend().send_keys(
+                metadata["tmux_session"],
+                metadata["tmux_window"],
+                terminal_input,
+                enter_count=enter_count,
+                force_bracketed_paste=force_bracketed_paste,
+                submit_delay=provider.paste_submit_delay if provider else 0.3,
+            )
+
+            update_last_active(terminal_id)
+            logger.info(f"Sent input to terminal: {terminal_id}")
+
+        except Exception as e:
+            logger.error(f"Failed to send input to terminal {terminal_id}: {e}")
+            raise
+
+    # Plugin dispatch happens AFTER the per-terminal lock above is released
+    # (correction-994) -- or, when this call is nested inside a caller that
+    # already holds the SAME lock (correction-1007 item 3), is deferred to
+    # that caller via _defer_plugin_dispatch instead of running here.
+    # dispatch_plugin_event can run a plugin's handler SYNCHRONOUSLY
+    # (asyncio.run) whenever no event loop is active on this thread --
+    # plugins are arbitrary, out-of-tree code and must never execute while
+    # holding the physical-write/acceptance-fence lock every other
+    # send_input()/send_special_key() caller for this SAME terminal_id is
+    # waiting on: a plugin that happens to (directly or transitively) touch
+    # this terminal_id would otherwise deadlock against itself, and even a
+    # plugin that never does still needlessly extends how long unrelated
+    # callers for this terminal are blocked. The one legitimate dispatch
+    # still fires exactly once, still strictly after the physical send,
+    # using values captured while the lock was held.
+    if registry is not None and sender_id is not None and orchestration_type is not None:
+
+        def _dispatch() -> None:
+            # Telemetry (opt-in; no-ops without the [otel] extra or when
+            # the SDK is disabled): record a GenAI ``execute_tool`` span
+            # for the dispatch, count it, and propagate the active trace
+            # context into the plugin event so downstream consumers can
+            # continue the trace.
             from cli_agent_orchestrator.telemetry import (
                 execute_tool_span,
                 inject_traceparent,
@@ -2579,14 +2906,15 @@ def send_input(
                         traceparent=inject_traceparent(),
                     ),
                 )
-        return True
 
-    except Exception as e:
-        logger.error(f"Failed to send input to terminal {terminal_id}: {e}")
-        raise
+        if _defer_plugin_dispatch is not None:
+            _defer_plugin_dispatch.append(_dispatch)
+        else:
+            _dispatch()
+    return True
 
 
-def send_special_key(terminal_id: str, key: str) -> bool:
+def send_special_key(terminal_id: str, key: str, *, submits_turn: bool = True) -> bool:
     """Send a tmux special key sequence (e.g., C-d, C-c) to terminal.
 
     Unlike send_input(), this sends the key as a tmux key name (not literal text)
@@ -2595,32 +2923,73 @@ def send_special_key(terminal_id: str, key: str) -> bool:
     Args:
         terminal_id: Target terminal identifier
         key: Tmux key name (e.g., "C-d", "C-c", "Escape")
+        submits_turn: Whether this key is expected to start a new native
+            processing turn (correction-994). Default True matches every
+            call site's actual behavior except the two documented below.
 
     Returns:
         True if the key was sent successfully
 
     Raises:
         ValueError: If terminal not found
+        NativeAcceptanceTimeoutError: if ``submits_turn`` and a PRIOR
+            dispatch's acceptance is not confirmed within the bound.
+
+    Guarded by the same per-terminal terminal_input_lock as send_input(): a
+    caller commonly sends a special key (e.g. C-u to clear a partial line)
+    immediately before a send_input() paste for the same terminal (see
+    agui/handoff_approval.py's TerminalServiceAnswerDelivery), and both are
+    genuine tmux writes to the same pane. Without sharing the lock, that
+    special key could still land in the middle of an unrelated concurrent
+    caller's paste even after send_input() itself was made safe against
+    other send_input() calls (correction-971).
+
+    ``submits_turn=False`` (correction-994): C-u (clearing a partially-typed
+    composer line before a retry paste) and menu-navigation Up/Down (moving a
+    selection cursor, claude_question.py) never cause the terminal's native
+    process to start a new processing cycle -- nothing about them can ever
+    produce the real IDLE->non-IDLE transition the acceptance fence waits
+    for. Treating them as submitted turns anyway means the very NEXT
+    genuine send_input()/submitting send_special_key() for the same terminal
+    -- e.g. TerminalServiceAnswerDelivery.send_input's C-u immediately
+    followed by the real answer paste -- would wait the full
+    NATIVE_ACCEPTANCE_TIMEOUT_S for evidence that can never arrive, then fail
+    closed for no reason. ``submits_turn=False`` skips both the wait (a
+    non-submitting key is safe to send regardless of a prior unconfirmed
+    dispatch: at worst it clears an already-cleared or still-open composer,
+    never corrupts one) and the arm (nothing here should make a later caller
+    wait on IT either) -- the physical-write mutex above still fully applies.
     """
-    try:
-        metadata = get_terminal_metadata(terminal_id)
-        if not metadata:
-            raise ValueError(f"Terminal '{terminal_id}' not found")
+    with terminal_input_lock(terminal_id):
+        try:
+            if submits_turn and not status_monitor.wait_for_native_acceptance(
+                terminal_id, timeout=NATIVE_ACCEPTANCE_TIMEOUT_S
+            ):
+                raise NativeAcceptanceTimeoutError(
+                    f"Terminal {terminal_id}: a prior dispatch was not confirmed "
+                    f"accepted within {NATIVE_ACCEPTANCE_TIMEOUT_S}s; refusing to "
+                    "send this special key."
+                )
 
-        # Arm StatusMonitor stickiness: special keys (Enter on a permission
-        # prompt, C-c interrupting work, C-d sending EOF) all initiate a new
-        # processing cycle that must be allowed to push past any latched
-        # ready status.
-        status_monitor.notify_input_sent(terminal_id)
-        get_backend().send_special_key(metadata["tmux_session"], metadata["tmux_window"], key)
+            metadata = get_terminal_metadata(terminal_id)
+            if not metadata:
+                raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        update_last_active(terminal_id)
-        logger.info(f"Sent special key '{key}' to terminal: {terminal_id}")
-        return True
+            if submits_turn:
+                # Arm StatusMonitor stickiness: special keys (Enter on a permission
+                # prompt, C-c interrupting work, C-d sending EOF) all initiate a new
+                # processing cycle that must be allowed to push past any latched
+                # ready status. Also arms the native-acceptance fence (see above).
+                status_monitor.notify_input_sent(terminal_id)
+            get_backend().send_special_key(metadata["tmux_session"], metadata["tmux_window"], key)
 
-    except Exception as e:
-        logger.error(f"Failed to send special key to terminal {terminal_id}: {e}")
-        raise
+            update_last_active(terminal_id)
+            logger.info(f"Sent special key '{key}' to terminal: {terminal_id}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to send special key to terminal {terminal_id}: {e}")
+            raise
 
 
 def exit_terminal_cli(terminal_id: str) -> None:

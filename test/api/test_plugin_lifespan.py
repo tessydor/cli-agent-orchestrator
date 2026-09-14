@@ -210,3 +210,106 @@ class TestPluginRegistryLifespan:
 
                 assert isinstance(registry, PluginRegistry)
                 assert len(registry._plugins) == 1
+
+
+class TestLifespanShutdownDrainsNativeInputLocks:
+    """Correction-1038 Part C.3: shutdown must prove no physical native-
+    input write is in flight -- for any known terminal -- before this
+    process is considered safe to replace. Pins that the real ``lifespan``
+    shutdown sequence actually calls ``drain_all_terminal_input_locks``
+    (not just that the primitive itself works in isolation, which
+    ``test_native_input_serialization_race.py`` already covers).
+    """
+
+    @pytest.mark.asyncio
+    async def test_shutdown_calls_drain_all_terminal_input_locks(self) -> None:
+        (
+            status_run,
+            log_run,
+            inbox_run,
+            assigned_completion_run,
+            assigned_completion_register,
+            opencode_daemon,
+        ) = _consumer_patches()
+        mock_teardown = AsyncMock()
+
+        with (
+            patch("cli_agent_orchestrator.api.main.setup_logging"),
+            patch("cli_agent_orchestrator.api.main.init_db"),
+            patch(
+                "cli_agent_orchestrator.services.memory_reconciliation.reconcile_memory_startup",
+                return_value=None,
+            ),
+            patch("cli_agent_orchestrator.api.main.cleanup_old_data"),
+            patch(
+                "cli_agent_orchestrator.api.main.cleanup_expired_memories", new_callable=AsyncMock
+            ),
+            patch("cli_agent_orchestrator.api.main.flow_daemon", fake_flow_daemon),
+            patch("cli_agent_orchestrator.api.main.bus.set_loop"),
+            status_run,
+            log_run,
+            inbox_run,
+            assigned_completion_run,
+            assigned_completion_register,
+            opencode_daemon,
+            patch.object(PluginRegistry, "teardown", mock_teardown),
+            patch(
+                "cli_agent_orchestrator.api.main.drain_all_terminal_input_locks",
+                return_value=[],
+            ) as mock_drain,
+        ):
+            async with lifespan(app):
+                mock_drain.assert_not_called()
+
+            # Called exactly once, during shutdown, with a positive bounded
+            # timeout -- never "assumed drained" without actually asking.
+            mock_drain.assert_called_once()
+            (timeout_arg,), _ = mock_drain.call_args
+            assert timeout_arg > 0
+
+    @pytest.mark.asyncio
+    async def test_shutdown_logs_a_truthful_warning_when_a_terminal_stays_busy(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A non-empty drain result must be logged, never silently treated
+        as drained (message-1038's own "do not invent an assertion").
+        """
+        (
+            status_run,
+            log_run,
+            inbox_run,
+            assigned_completion_run,
+            assigned_completion_register,
+            opencode_daemon,
+        ) = _consumer_patches()
+
+        with (
+            patch("cli_agent_orchestrator.api.main.setup_logging"),
+            patch("cli_agent_orchestrator.api.main.init_db"),
+            patch(
+                "cli_agent_orchestrator.services.memory_reconciliation.reconcile_memory_startup",
+                return_value=None,
+            ),
+            patch("cli_agent_orchestrator.api.main.cleanup_old_data"),
+            patch(
+                "cli_agent_orchestrator.api.main.cleanup_expired_memories", new_callable=AsyncMock
+            ),
+            patch("cli_agent_orchestrator.api.main.flow_daemon", fake_flow_daemon),
+            patch("cli_agent_orchestrator.api.main.bus.set_loop"),
+            status_run,
+            log_run,
+            inbox_run,
+            assigned_completion_run,
+            assigned_completion_register,
+            opencode_daemon,
+            patch.object(PluginRegistry, "teardown", AsyncMock()),
+            patch(
+                "cli_agent_orchestrator.api.main.drain_all_terminal_input_locks",
+                return_value=["stuck-terminal-xyz"],
+            ),
+        ):
+            with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.api.main"):
+                async with lifespan(app):
+                    pass
+
+        assert "stuck-terminal-xyz" in caplog.text

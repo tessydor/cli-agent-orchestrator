@@ -12,7 +12,8 @@ import json
 import logging
 import re
 import threading
-from typing import Any, Mapping, Optional, Tuple
+import time
+from typing import Any, Mapping, NamedTuple, Optional, Tuple
 
 from sqlalchemy.exc import OperationalError
 
@@ -89,6 +90,53 @@ _RECONCILIATION_FIELD_MAX_BYTES = 4096
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
+class CaptureWaitResult(NamedTuple):
+    """Result of ``_wait_for_capture_before_input_detailed`` (correction-
+    1017). ``ready`` is the same meaning as the public
+    ``wait_for_capture_before_input``'s bare bool. ``blocked`` is True only
+    when this call actually entered ``Condition.wait()`` -- i.e. genuinely
+    relinquished and reacquired ``terminal_input_lock`` -- and therefore
+    signals that a caller's earlier-cached validation (native-acceptance
+    check, ``current_status`` read) must be discarded and rechecked fresh
+    before any physical paste, since a concurrent holder could have run an
+    entire dispatch cycle during the gap.
+    """
+
+    ready: bool
+    blocked: bool
+
+
+class _CaptureBarrier:
+    """A capture-release wait/notify primitive built on ONE specific
+    worker terminal's own ``terminal_input_lock`` (correction-1007).
+
+    Both existing callers of ``wait_for_capture_before_input``
+    (``terminal_service.send_input`` and ``InboxService.deliver_pending``)
+    already hold that exact lock for the whole duration of their call --
+    that is the entire reason a prior plain ``threading.Event`` was unsafe
+    here: blocking on a bare Event while still holding the lock starves
+    ANY other thread that needs the SAME lock to perform the release (the
+    guarded capture-release transition, correction-997/1001, needs exactly
+    this lock for its own fresh-status-read-then-CAS). A
+    ``threading.Condition`` built on that SAME lock is the correct,
+    standard fix: ``Condition.wait()`` atomically releases the underlying
+    lock while blocked and reacquires it before returning, exactly as if
+    the waiting thread had briefly exited its own ``with
+    terminal_input_lock(...):`` block -- so the release-side transition
+    can actually acquire the lock, act, and notify, and the waiter picks
+    back up exactly where a normal (non-reentrant) reacquire would leave
+    it. No caller-visible behavior changes: from every existing caller's
+    point of view this is still "acquire the lock, then block until
+    release or timeout."
+    """
+
+    __slots__ = ("condition", "released")
+
+    def __init__(self, lock: threading.RLock) -> None:
+        self.condition = threading.Condition(lock)
+        self.released = False
+
+
 class AssignedWorkerCompletionService:
     """Capture and deliver successful assigned-worker terminal completions."""
 
@@ -107,7 +155,7 @@ class AssignedWorkerCompletionService:
         self._worker_locks_guard = threading.Lock()
         self._known_workers: set[str] = set()
         self._failure_notice_pending: set[str] = set()
-        self._capture_barriers: dict[str, threading.Event] = {}
+        self._capture_barriers: dict[str, _CaptureBarrier] = {}
         self._retry_initial_delay = retry_initial_delay
         self._retry_max_delay = retry_max_delay
         self._retry_lifecycle_guard = threading.Lock()
@@ -129,6 +177,33 @@ class AssignedWorkerCompletionService:
         with self._worker_locks_guard:
             self._known_workers.add(worker_terminal_id)
 
+    def _arm_capture_barrier_if_known(self, worker_terminal_id: str) -> None:
+        """Shared arm logic for a KNOWN worker's capture barrier.
+
+        Used by ``announce_terminal_status`` (a genuine live COMPLETED
+        detection) and by ``register_persisted_assignments`` (correction-
+        1033: proactively reconstructing the hold for an unresolved
+        persisted assignment at startup, before either can rely on a live
+        detection ever happening). Idempotent via ``setdefault``-style
+        presence check: calling this when a barrier already exists for
+        ``worker_terminal_id`` is a safe no-op, so the two callers can
+        never conflict or double-arm.
+        """
+        with self._worker_locks_guard:
+            if worker_terminal_id not in self._known_workers:
+                return
+            if worker_terminal_id not in self._capture_barriers:
+                # Local import: avoids a module-level import cycle (see
+                # reconcile_corrupted_dispatch_capture_release's own local
+                # import of the same name, same rationale).
+                from cli_agent_orchestrator.services.terminal_service import (
+                    terminal_input_lock,
+                )
+
+                self._capture_barriers[worker_terminal_id] = _CaptureBarrier(
+                    terminal_input_lock(worker_terminal_id)
+                )
+
     def announce_terminal_status(self, worker_terminal_id: str, status: TerminalStatus) -> None:
         """Install a capture barrier before a COMPLETED event is published.
 
@@ -138,10 +213,7 @@ class AssignedWorkerCompletionService:
         """
         if status != TerminalStatus.COMPLETED:
             return
-        with self._worker_locks_guard:
-            if worker_terminal_id not in self._known_workers:
-                return
-            self._capture_barriers.setdefault(worker_terminal_id, threading.Event())
+        self._arm_capture_barrier_if_known(worker_terminal_id)
 
     def wait_for_capture_before_input(self, worker_terminal_id: str, timeout: float = 5.0) -> bool:
         """Return only when a known completed worker's report is safely durable.
@@ -149,17 +221,311 @@ class AssignedWorkerCompletionService:
         Unknown/non-assigned terminals have no barrier and retain the existing
         zero-wait inbox path.  On timeout the caller leaves the inbox row PENDING;
         reconciliation retries after capture rather than risking transcript loss.
+
+        Both real callers (``terminal_service.send_input``,
+        ``InboxService.deliver_pending``) already hold
+        ``terminal_input_lock(worker_terminal_id)`` for their entire call
+        into this method -- the barrier's own condition is built on that
+        SAME lock (see ``_CaptureBarrier``), so blocking here via
+        ``condition.wait()`` correctly releases it for the duration of the
+        wait (correction-1007) rather than starving the one path that can
+        actually release it (``reconcile_corrupted_dispatch_capture_
+        release``, which needs this identical lock for its own guarded
+        read-then-CAS).
+
+        This bare-bool form is kept, unchanged, for ``InboxService`` and
+        every existing test: it is used there only as a cheap PRE-filter
+        (whether to even attempt a delivery at all), with the REAL safety
+        boundary living entirely inside ``send_input``'s own recheck
+        (994-B) -- so ``InboxService`` never needed the richer "was the
+        lock actually relinquished" signal below. ``send_input`` itself
+        calls ``_wait_for_capture_before_input_detailed`` directly, since
+        it DOES need that signal (correction-1017).
+        """
+        return self._wait_for_capture_before_input_detailed(worker_terminal_id, timeout).ready
+
+    def _wait_for_capture_before_input_detailed(
+        self, worker_terminal_id: str, timeout: float = 5.0
+    ) -> CaptureWaitResult:
+        """Same wait as ``wait_for_capture_before_input``, plus ``blocked``:
+        whether this call actually entered ``condition.wait()`` at least
+        once -- i.e. whether ``terminal_input_lock`` was genuinely
+        relinquished during this call (correction-1017).
+
+        ``blocked=False`` covers BOTH "no barrier exists at all" and "a
+        barrier exists but was already released before this call had to
+        wait" -- in neither case did this call give up the lock, so
+        nothing computed by the caller before or during this call can have
+        been invalidated by a concurrent lock holder. ``blocked=True``
+        means the lock WAS relinquished (via ``Condition.wait()``) and
+        reacquired before returning -- any state a caller cached before
+        this call (a native-acceptance check, a ``current_status`` read)
+        must be treated as stale and rechecked from scratch, since another
+        thread could have run an entire ``send_input`` cycle (including
+        arming a brand-new native-acceptance fence) during the gap.
         """
         with self._worker_locks_guard:
             barrier = self._capture_barriers.get(worker_terminal_id)
-        return True if barrier is None else barrier.wait(timeout)
+        if barrier is None:
+            return CaptureWaitResult(ready=True, blocked=False)
+        deadline = time.monotonic() + timeout
+        blocked = False
+        with barrier.condition:
+            while not barrier.released:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return CaptureWaitResult(ready=False, blocked=blocked)
+                blocked = True
+                barrier.condition.wait(timeout=remaining)
+        return CaptureWaitResult(ready=True, blocked=blocked)
 
     def _release_capture_barrier(self, worker_terminal_id: str) -> None:
         with self._worker_locks_guard:
             barrier = self._capture_barriers.pop(worker_terminal_id, None)
             self._known_workers.discard(worker_terminal_id)
         if barrier is not None:
-            barrier.set()
+            # notify_all() requires holding the condition's own lock
+            # (terminal_input_lock(worker_terminal_id)). Callers that
+            # already hold it (reconcile_corrupted_dispatch_capture_
+            # release) reenter for free (RLock); callers that don't
+            # (the async status-event consumer's normal completion path)
+            # acquire it here -- safe, since no path anywhere acquires
+            # _worker_lock and terminal_input_lock for the SAME
+            # terminal_id in the opposite order (verified: the only two
+            # wait_for_capture_before_input callers never touch
+            # _worker_lock at all), so this can never invert against
+            # anything that holds _worker_lock and waits on this lock.
+            with barrier.condition:
+                barrier.released = True
+                barrier.condition.notify_all()
+
+    def reconcile_corrupted_dispatch_capture_release(
+        self,
+        worker_terminal_id: str,
+        *,
+        assignment_id: str,
+        requesting_caller_id: str,
+        transcript_first_user_text: str,
+        expected_transcript_sha256: str,
+        admissible_dispatch_sha256: list[str],
+        concatenated_message_id: str,
+        concatenated_message_sender_id: str,
+        concatenated_message_receiver_id: str,
+        concatenated_message_content: str,
+        concatenated_message_delivery_state: str,
+        concatenated_message_session_id: Optional[str],
+        recorded_at: str,
+        acknowledgement: str,
+        acknowledged_at: str,
+        supersede_message_ids: Optional[list[int]] = None,
+        superseding_message_id: Optional[int] = None,
+    ) -> Any:
+        """The one supported guarded recovery transition (correction-997/1001).
+
+        Consumes an immutable corrupted-dispatch archive plus an explicit,
+        non-empty caller acknowledgement, re-verifies every mutation-time
+        binding fresh (via :func:`clients.database.acknowledge_native_dispatch_
+        corruption`), records the incident as reconciled/abandoned-for-
+        input-capture WITHOUT marking the task successful, and releases ONLY
+        this exact dispatch's capture barrier. It never sends or delivers
+        anything -- the existing pending follow-up row is left completely
+        untouched for ordinary InboxService delivery to observe exactly once.
+
+        ``supersede_message_ids``/``superseding_message_id`` (correction-1038,
+        both optional and ``None`` by default -- every existing caller that
+        omits them gets EXACTLY today's behavior, unchanged): when both are
+        given, this transition ALSO durably supersedes those exact obsolete
+        PENDING rows (via :func:`clients.database.supersede_inbox_messages`,
+        scoped to ``sender_id=requesting_caller_id, receiver_id=
+        worker_terminal_id``) before releasing the barrier -- so an
+        oldest-first delivery query cannot select a stale target ahead of
+        the message meant to replace it. This is a PREREQUISITE of release,
+        not an independent step: if the acknowledgement above succeeds but
+        this supersession then raises, the barrier is deliberately NOT
+        released and no partial state is left ambiguous -- an identical
+        retry (acknowledgement re-validates as an idempotent replay,
+        supersession re-validates the same way) can complete both and then
+        release, exactly like the existing crash-between-commit-and-release
+        seam this method already tolerates (see ``_capture_release_
+        checkpoint``). Never deletes or fabricates DELIVERED for the
+        superseded rows; never touches the pending follow-up row itself.
+
+        Message-1001's TOCTOU finding: a ``live_status`` read taken BEFORE
+        acquiring the per-terminal input/capture lock can be stale by the
+        time the DB CAS runs -- a concurrent ``send_input``/status detection
+        could change what "live" means in between. This method closes that
+        gap by acquiring ``terminal_input_lock`` (the same per-terminal
+        physical-write/acceptance-fence guard every other native-input entry
+        point serializes against -- see terminal_service.terminal_input_lock)
+        and reading live status only AFTER acquiring it, immediately before
+        the DB call. ``self._worker_lock`` is held OUTER (this class's own
+        existing convention for every state-mutating method) purely to
+        serialize this transition's callback-row view against this class's
+        OTHER worker-lifecycle methods for the same worker; every existing
+        caller of ``_worker_lock`` that also touches a lock for THIS SAME
+        terminal_id only ever does so via ``wait_for_capture_before_input``
+        (which never touches ``_worker_lock`` at all -- see below), so this
+        nesting introduces no lock-order inversion between these two locks.
+
+        Message-1007's real-call-graph finding: the claimed ``_worker_lock``
+        inversion above did not actually exist in the code (verified by
+        reading ``wait_for_capture_before_input``'s body, which only ever
+        touches the short-lived ``_worker_locks_guard``) -- but a REAL
+        starvation issue did, in ``terminal_input_lock`` alone. Both
+        ``send_input`` and ``InboxService.deliver_pending`` hold
+        ``terminal_input_lock(worker_terminal_id)`` for their entire call
+        into ``wait_for_capture_before_input``; that call used to block on a
+        bare ``threading.Event`` while still holding the lock, so a
+        concurrent call to THIS method (which needs that same lock to
+        perform its guarded read-then-CAS) could never acquire it until the
+        waiter's own timeout expired -- functionally a deadlock, bounded
+        only by an unrelated caller's timeout constant rather than by
+        design. Fixed at the barrier's own definition (see
+        ``_CaptureBarrier``): its wait/notify is now a ``threading.
+        Condition`` built on that SAME ``terminal_input_lock``, whose
+        ``wait()`` atomically releases the lock while blocked and
+        reacquires it before returning -- so this method's acquisition
+        below can succeed immediately regardless of any concurrent waiter,
+        and the waiter resumes normally once notified. This required no
+        change to ``send_input``/``deliver_pending``'s own code or lock
+        order at all (the "already-live delivery order" is preserved
+        exactly); only the barrier's internal wait mechanism changed.
+
+        The barrier release is idempotent regardless of ``released_now``
+        (correction-1007 item 2): a process that dies after the DB
+        acknowledgement above durably commits but before
+        ``_release_capture_barrier`` runs would otherwise strand the
+        barrier forever, because a later retry of the SAME acknowledgement
+        sees ``released_now=False`` (the DB already reflects this exact,
+        matching acknowledgement) and -- under the OLD gated logic -- would
+        never attempt release again. ``released_now`` is therefore now only
+        an audit/transition signal in the returned record, never a gate on
+        whether to release. This is safe to call unconditionally because
+        (a) ``_release_capture_barrier`` is already a no-op when no barrier
+        is armed for this worker_terminal_id, and (b) reaching this line at
+        all already required ``acknowledge_native_dispatch_corruption``'s
+        fresh guard revalidation (the exact same guards as message 997) to
+        succeed against the CURRENT callback row for this exact assignment
+        -- so a stale/reused-terminal_id retry for a since-superseded
+        assignment is refused with an exception well before this point,
+        never reaching (and therefore never able to mis-release) a
+        different, later, unrelated barrier for a reused worker_terminal_id.
+        Never happens across any plugin hook or inbox delivery (none occur
+        in this path at all, unlike ``_drive_delivery``).
+
+        Raises the same ``NativeDispatchCorruptionGuardError``/``ValueError``
+        as ``acknowledge_native_dispatch_corruption`` on any guard failure or
+        collision -- this method adds no additional silent-success paths.
+        """
+        # correction-1042/1044 Part A.2: validate the supersession pair
+        # BEFORE any acknowledgement, not merely before release. A partial
+        # pair (exactly one of the two provided) used to be silently
+        # ignored by the ``and`` check below -- acknowledging and
+        # releasing the hold without ever superseding anything. Fail
+        # closed here instead: no ACK, no supersession, no release.
+        if (supersede_message_ids is None) != (superseding_message_id is None):
+            raise ValueError(
+                "supersede_message_ids and superseding_message_id must be supplied "
+                "together or not at all -- refusing a partial supersession pair "
+                "before any acknowledgement"
+            )
+        if supersede_message_ids is not None and not supersede_message_ids:
+            raise ValueError(
+                "supersede_message_ids must be non-empty when superseding_message_id " "is supplied"
+            )
+        if supersede_message_ids is not None and len(set(supersede_message_ids)) != len(
+            supersede_message_ids
+        ):
+            raise ValueError("supersede_message_ids must not contain duplicates")
+
+        from cli_agent_orchestrator.clients.database import (
+            acknowledge_native_dispatch_corruption,
+            mark_native_dispatch_corruption_capture_release_completed,
+        )
+        from cli_agent_orchestrator.services.terminal_service import terminal_input_lock
+
+        with self._worker_lock(worker_terminal_id):
+            with terminal_input_lock(worker_terminal_id):
+                # Freshly read live status only now, INSIDE the same guard
+                # that serializes every physical native-input write and the
+                # acceptance fence for this terminal -- never a snapshot
+                # read before this lock was acquired.
+                live_status = status_monitor.get_status(worker_terminal_id)
+
+                result = acknowledge_native_dispatch_corruption(
+                    assignment_id=assignment_id,
+                    requesting_caller_id=requesting_caller_id,
+                    live_status=live_status,
+                    transcript_first_user_text=transcript_first_user_text,
+                    expected_transcript_sha256=expected_transcript_sha256,
+                    admissible_dispatch_sha256=admissible_dispatch_sha256,
+                    concatenated_message_id=concatenated_message_id,
+                    concatenated_message_sender_id=concatenated_message_sender_id,
+                    concatenated_message_receiver_id=concatenated_message_receiver_id,
+                    concatenated_message_content=concatenated_message_content,
+                    concatenated_message_delivery_state=concatenated_message_delivery_state,
+                    concatenated_message_session_id=concatenated_message_session_id,
+                    recorded_at=recorded_at,
+                    acknowledgement=acknowledgement,
+                    acknowledged_at=acknowledged_at,
+                )
+
+                if supersede_message_ids is not None and superseding_message_id is not None:
+                    # correction-1038 Part B prerequisite: durably supersede
+                    # the exact obsolete rows BEFORE releasing the barrier.
+                    # A failure here (identity/state mismatch, or any other
+                    # ValueError from supersede_inbox_messages) propagates
+                    # and deliberately leaves the barrier armed -- the
+                    # acknowledgement above already committed, but release
+                    # is intentionally withheld until this prerequisite also
+                    # succeeds. An identical retry re-validates both steps
+                    # (acknowledge_native_dispatch_corruption's own
+                    # idempotent-replay path, and supersede_inbox_messages'
+                    # own idempotent-replay path) and can then proceed.
+                    from cli_agent_orchestrator.clients.database import (
+                        supersede_inbox_messages,
+                    )
+
+                    supersede_inbox_messages(
+                        sender_id=requesting_caller_id,
+                        receiver_id=worker_terminal_id,
+                        target_message_ids=list(supersede_message_ids),
+                        superseding_message_id=superseding_message_id,
+                    )
+
+                # correction-1042/1044 Part B: durably mark the ENTIRE
+                # transition (ack + any requested supersession) complete
+                # BEFORE releasing the barrier -- the one durable predicate
+                # register_persisted_assignments consults so a SECOND
+                # restart, after this incident is genuinely fully resolved,
+                # never re-arms it. caller_acknowledgement alone (set
+                # inside acknowledge_native_dispatch_corruption above) is
+                # NOT sufficient proof of this: it can be durably true
+                # while a requested supersession is still pending or has
+                # failed, which is exactly the state a restart MUST keep
+                # protecting.
+                mark_native_dispatch_corruption_capture_release_completed(
+                    result.record.record_key(), acknowledged_at
+                )
+
+                # Fault-injection seam (correction-1007 item 2): a test can
+                # monkeypatch this to raise, simulating a process crash
+                # exactly at the post-commit/pre-release boundary. A
+                # subsequent retry of the identical acknowledgement must
+                # still release the barrier below, since the release is
+                # unconditional rather than gated on released_now.
+                self._capture_release_checkpoint(worker_terminal_id, result)
+                self._release_capture_barrier(worker_terminal_id)
+                return result
+
+    @staticmethod
+    def _capture_release_checkpoint(worker_terminal_id: str, result: Any) -> None:
+        """No-op fault-injection seam between the durable acknowledgement
+        commit and the in-memory capture-barrier release (correction-1007
+        item 2). Mirrors ``_phase_checkpoint``'s existing role for the
+        completion-delivery state machine.
+        """
+        del worker_terminal_id, result
 
     def start_retry_scheduler(self) -> None:
         """Start the single event-woken retry scheduler on the running loop.
@@ -901,10 +1267,66 @@ class AssignedWorkerCompletionService:
     def register_persisted_assignments(self) -> None:
         """Prime restart barriers before status/inbox consumers can observe readiness.
 
-        This deliberately performs only the bounded callback-row read and
-        in-memory registration.  Full provider/status reconciliation remains a
-        background operation, but every unfinished assignment is protected before
-        the server starts accepting or delivering terminal input.
+        This performs the bounded callback-row read, in-memory registration,
+        AND reconstruction of each unresolved assignment's capture hold
+        (correction-1033) -- all synchronously, before the server starts
+        accepting or delivering terminal input. Full provider/status
+        reconciliation remains a separate, later, background operation
+        (``reconcile_pending``); this method's own job is narrower and more
+        urgent: make sure a hold EXISTS for every unresolved assignment
+        before anything else can act on this worker's readiness.
+
+        Why this is needed, not merely "in-memory registration": the ONLY
+        other path that arms a capture barrier (``announce_terminal_
+        status``) is called exclusively from StatusMonitor's live, chunk-
+        driven detection pipeline (``_apply_detection_locked``), which fires
+        only on a genuine NEW output chunk. A worker whose pane has been
+        quiet since before a restart (the corrupted/uncaptured turn's own
+        output already fully arrived, nothing new since) never produces
+        one, so that pipeline never runs for it post-restart. Meanwhile
+        ``status_monitor.get_status()``'s OWN restart-status derivation
+        (its "cached == UNKNOWN -> probe the full live history" branch,
+        deliberately left UNCACHED) can independently report this SAME
+        worker as COMPLETED to InboxService's separate, unrelated
+        readiness gate -- without ever updating ``_last_status`` or
+        triggering ``announce_terminal_status``. The two paths disagreeing
+        is exactly the race: InboxService believes the worker is ready to
+        receive its next queued message, while nothing ever told this
+        service a hold was needed.
+
+        Reconstructing the hold here, for every unresolved persisted
+        assignment, closes that gap completely, regardless of whether the
+        worker happens to be genuinely COMPLETED or IDLE right now
+        (correction-1038 made the two send_input/InboxService checks
+        unconditional on status for exactly this reason -- a hold armed
+        here is consulted regardless of which ready status is observed).
+        This method never itself RELEASES anything; only the existing,
+        already-tested paths (a real capture success, or the explicit
+        guarded corruption-recovery operation) do that.
+
+        Two scoping refinements on top of ``list_protected_assigned_
+        worker_callbacks``' own broader ``(ASSIGNED, DISPATCHED,
+        UNRESOLVED)`` filter (correction-1042/1044, both confirmed real
+        defects against the unrefined loop, not hypothetical):
+
+        1. ASSIGNED is excluded from arming here. That broader filter's
+           OWN purpose (shared with ``cleanup_service``, which must not
+           delete a terminal that was merely assigned but never dispatched)
+           is legitimately wider than "needs a capture hold" -- a capture
+           hold exists to protect an already-captured or in-flight
+           completion, which cannot exist before the assignment's first
+           real dispatch has even happened. Arming one anyway would block
+           that FIRST genuine ``send_input`` call the moment correction-
+           1038 made the check unconditional on status, for a worker that
+           was never corrupted at all.
+        2. A DISPATCHED/UNRESOLVED record whose corruption incident has
+           already durably completed its ENTIRE guarded transition
+           (``is_native_dispatch_corruption_capture_release_completed`` --
+           correction-1042/1044 Part B) is also skipped: re-arming it on a
+           SECOND restart after a genuinely resolved incident would strand
+           any future message to this worker with no supported release
+           path, since the superseded row(s) this incident already
+           consumed are gone from PENDING for good.
         """
         try:
             records = list_protected_assigned_worker_callbacks()
@@ -920,8 +1342,22 @@ class AssignedWorkerCompletionService:
                 exc_info=True,
             )
             return
+        from cli_agent_orchestrator.clients.database import (
+            is_native_dispatch_corruption_capture_release_completed,
+        )
+
         for record in records:
             self.register_assignment(record.worker_terminal_id)
+            if record.lifecycle not in (
+                AssignmentLifecycle.DISPATCHED,
+                AssignmentLifecycle.UNRESOLVED,
+            ):
+                continue
+            if is_native_dispatch_corruption_capture_release_completed(
+                record.worker_terminal_id, record.assignment_id
+            ):
+                continue
+            self._arm_capture_barrier_if_known(record.worker_terminal_id)
 
     @staticmethod
     def _detect_live_status(record: AssignedWorkerCallback) -> TerminalStatus:
@@ -1151,8 +1587,28 @@ class AssignedWorkerCompletionService:
                 # retirement is actually attempted, so live activity is
                 # re-checked right here, at teardown time, rather than trusted
                 # from whatever it was when reconciliation was recorded.
-                status = self._detect_live_status(record)
-                return status not in (
+                #
+                # message-1074's review of an earlier merge-1072 draft of
+                # this branch: _RECONCILABLE_STUCK_STATES includes
+                # (UNRESOLVED, MANUAL_RECOVERY), one of the lifecycles a
+                # capture barrier can be armed for -- but releasing it HERE
+                # is unsafe, not merely optional. delete_terminal calls this
+                # method, then capture_terminal_snapshot, then dismantle_
+                # terminal_runtime, with no lock held across that whole
+                # sequence (this method's own self._worker_lock is a
+                # DIFFERENT lock than the barrier's own terminal_input_lock).
+                # Releasing the barrier here would notify any concurrent
+                # send_input/InboxService waiter immediately, which could
+                # then physically paste into this terminal's still-live pane
+                # before dismantle_terminal_runtime ever unregisters delivery
+                # or kills it -- a real, higher-severity race than the
+                # cleanup gap it would fix. This gap already existed in
+                # standalone PR11's own caller_reconciled_at path against
+                # the pre-existing barrier implementation; it is a real,
+                # pre-existing limitation, not a defect this merge
+                # introduced, and is intentionally left unresolved here --
+                # see this cycle's own report for the tracked follow-up.
+                return self._detect_live_status(record) not in (
                     TerminalStatus.PROCESSING,
                     TerminalStatus.WAITING_USER_ANSWER,
                 )

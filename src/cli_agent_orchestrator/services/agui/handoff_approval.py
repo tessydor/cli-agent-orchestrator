@@ -227,7 +227,10 @@ class TerminalServiceAnswerDelivery:
         # a prior attempt pasted text but failed before Enter. Best-effort: a
         # failed clear must not fail the delivery itself.
         try:
-            terminal_service.send_special_key(terminal_id, "C-u")
+            # submits_turn=False (correction-994): C-u clears the composer
+            # but starts no new native processing turn -- it must not arm
+            # or wait on the acceptance fence the real paste below checks.
+            terminal_service.send_special_key(terminal_id, "C-u", submits_turn=False)
         except Exception:
             logger.debug("line-clear before paste failed for terminal %s", terminal_id)
         terminal_service.send_input(terminal_id, text)

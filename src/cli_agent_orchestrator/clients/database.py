@@ -1,5 +1,6 @@
 """Minimal database client with only terminal metadata."""
 
+import dataclasses
 import hashlib
 import logging
 import os
@@ -161,6 +162,11 @@ class InboxModel(Base):
     claim_token = Column(String, nullable=True)
     claimed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.now)
+    # correction-1038: id of the exact PENDING row (same sender/receiver
+    # pair) that durably superseded this one, via supersede_inbox_messages.
+    # NULL for every row never superseded. Never a foreign key to allow the
+    # superseding row itself to be deleted/retained independently.
+    superseded_by_message_id = Column(Integer, nullable=True)
 
     __table_args__ = (Index("uq_inbox_idempotency_key", "idempotency_key", unique=True),)
 
@@ -634,6 +640,69 @@ class IdempotencyKeyModel(Base):
     # It is compared like any other value and simply mismatches, loudly.
     request_fingerprint = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.now)
+
+
+class NativeDispatchCorruptionModel(Base):
+    """Durable, insert-only archive of one proven native-dispatch corruption
+    incident (correction-971/984/994; see services/native_dispatch_recovery.py).
+
+    ``record_key`` (``f"native-dispatch-corruption:{assignment_id}:{concatenated_message_id}"``,
+    matching ``CorruptionRecord.record_key()``) is the PRIMARY KEY specifically
+    so a second ``INSERT`` for an already-recorded incident raises
+    ``IntegrityError`` at ``commit()`` time -- true DB-level compare-and-swap,
+    not merely an in-process lock -- mirroring ``IdempotencyKeyModel``'s own
+    key-as-PK design one section above.
+
+    Deliberately carries NO lifecycle/delivery_state/final_result/receiver_state
+    columns and is never read by retirement/reconciliation logic: writing a row
+    here can never make an assignment eligible for retirement, forge a
+    completion, or otherwise touch completion semantics -- unlike
+    ``assigned_worker_callbacks.reconciliation_evidence`` (PR #11), which this
+    correction deliberately does not reuse for exactly that reason (see
+    ``record_native_dispatch_corruption``'s docstring).
+
+    ``caller_acknowledgement``/``capture_release_acknowledged_at`` (correction-
+    997/1001) are NULL for a plain record-only row. They are filled in ONLY by
+    ``acknowledge_native_dispatch_corruption`` -- their presence is the
+    durable, idempotent proof that the SEPARATE, explicit-acknowledgement
+    capture-release transition already ran once for this exact incident;
+    still no lifecycle/delivery_state/final_result column exists here, so
+    that transition remains structurally incapable of touching completion or
+    retirement semantics too.
+
+    ``capture_release_completed_at`` (correction-1042/1044) is a SEPARATE,
+    later marker than the acknowledgement columns above: it is set ONLY
+    after the ENTIRE guarded transition -- the acknowledgement AND any
+    supersession prerequisite the caller requested alongside it -- has
+    durably finished (see ``mark_native_dispatch_corruption_capture_
+    release_completed``). An acknowledged-but-not-yet-fully-completed row
+    (ack committed, requested supersession still pending or failed) MUST
+    still be treated as an unresolved incident by startup -- this column,
+    not ``caller_acknowledgement``, is the one durable predicate
+    ``register_persisted_assignments`` consults to decide whether a hold
+    may safely never be re-armed after a restart.
+    """
+
+    __tablename__ = "native_dispatch_corruption_records"
+
+    record_key = Column(String, primary_key=True)
+    assignment_id = Column(String, nullable=False)
+    completion_id = Column(String, nullable=False)
+    worker_terminal_id = Column(String, nullable=False)
+    caller_id = Column(String, nullable=False)
+    registered_dispatch_sha256 = Column(String, nullable=False)
+    bound_prefix_length = Column(Integer, nullable=False)
+    transcript_sha256 = Column(String, nullable=False)
+    concatenated_message_id = Column(String, nullable=False)
+    concatenated_message_sender_id = Column(String, nullable=False)
+    concatenated_message_receiver_id = Column(String, nullable=False)
+    concatenated_message_content_sha256 = Column(String, nullable=False)
+    concatenated_message_delivery_state = Column(String, nullable=False)
+    concatenated_message_session_id = Column(String, nullable=True)
+    recorded_at = Column(String, nullable=False)
+    caller_acknowledgement = Column(String, nullable=True)
+    capture_release_acknowledged_at = Column(String, nullable=True)
+    capture_release_completed_at = Column(String, nullable=True)
 
 
 def _ensure_db_dir() -> None:
@@ -1649,6 +1718,8 @@ def _migrate_inbox_callback_schema() -> None:
                 conn.execute("ALTER TABLE inbox ADD COLUMN claim_token TEXT")
             if "claimed_at" not in columns:
                 conn.execute("ALTER TABLE inbox ADD COLUMN claimed_at DATETIME")
+            if "superseded_by_message_id" not in columns:
+                conn.execute("ALTER TABLE inbox ADD COLUMN superseded_by_message_id INTEGER")
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_inbox_idempotency_key "
                 "ON inbox (idempotency_key)"
@@ -2481,6 +2552,7 @@ def _inbox_message_from_row(row: InboxModel) -> InboxMessage:
         idempotency_key=getattr(row, "idempotency_key", None),
         claim_token=getattr(row, "claim_token", None),
         claimed_at=getattr(row, "claimed_at", None),
+        superseded_by_message_id=getattr(row, "superseded_by_message_id", None),
     )
 
 
@@ -2796,6 +2868,146 @@ def resolve_inbox_claim(
             _validate_inbox_callback_evidence(db, row)
         db.commit()
         return updated == 1
+
+
+def supersede_inbox_messages(
+    sender_id: str,
+    receiver_id: str,
+    target_message_ids: List[int],
+    superseding_message_id: int,
+) -> List[InboxMessage]:
+    """Durably mark exact PENDING rows superseded by one exact PENDING row.
+
+    The one supported prerequisite for message-1038's Part B: a sender-
+    scoped, audited supersession so an exact-order oldest-first delivery
+    query does not send an obsolete target message ahead of the message
+    that was meant to replace it. Searched first for an existing supported
+    sender-scoped supersession/cancellation/reconciliation operation --
+    none exists (the only other "supersedes" string in this module names an
+    unrelated memory-contradiction edge type).
+
+    Every identity/state check is fresh, inside one ``BEGIN IMMEDIATE``
+    write transaction covering both the superseding row and every target
+    row -- all succeed or none do; no partial application. Refuses
+    (raises ``ValueError``, no partial effect):
+
+    - an empty ``target_message_ids``, or ``superseding_message_id`` naming
+      one of its own targets;
+    - a ``superseding_message_id`` row that does not exist, does not match
+      EXACTLY ``(sender_id, receiver_id)``, or is not itself PENDING;
+    - any target row that does not exist, does not match EXACTLY
+      ``(sender_id, receiver_id)``, is CLAIMED/DELIVERING/DELIVERED/FAILED,
+      or is already SUPERSEDED by a *different* superseding_message_id.
+
+    An exact replay -- the identical ``target_message_ids`` and identical
+    ``superseding_message_id``, already fully applied by a prior call -- is
+    idempotent: if EVERY target is already superseded by exactly this
+    superseder, this call is a pure no-op read (correction-1044's own
+    finding: the superseder's OWN current status must NOT gate a pure
+    replay, since nothing is being mutated -- a superseder that has since
+    been legitimately DELIVERED, by the ordinary InboxService path this
+    exact supersession was meant to unblock, must not turn a harmless
+    repeat call into a hard failure). A MIXED call -- some targets already
+    applied, at least one genuinely new -- still requires the superseder to
+    be PENDING, since that one really does mutate a target row.
+
+    Never deletes a row, never fabricates DELIVERED, never touches any row
+    outside ``target_message_ids``, and never invents a fourth status:
+    ``message``/``sender_id``/``receiver_id``/``id``/``created_at`` on every
+    affected row are unchanged -- only ``status`` and
+    ``superseded_by_message_id`` change. ``get_pending_messages`` filters on
+    ``status == PENDING`` alone, so a superseded row is automatically
+    excluded from delivery with no separate query change required.
+    """
+    if not target_message_ids:
+        raise ValueError("target_message_ids must be non-empty")
+    if superseding_message_id in target_message_ids:
+        raise ValueError(
+            f"superseding_message_id {superseding_message_id} must not be one of "
+            "its own target_message_ids"
+        )
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        try:
+            rows: List[InboxModel] = []
+            for target_id in target_message_ids:
+                row = db.query(InboxModel).filter(InboxModel.id == target_id).first()
+                if row is None or row.sender_id != sender_id or row.receiver_id != receiver_id:
+                    raise ValueError(
+                        f"target message {target_id} does not exist for "
+                        f"sender_id={sender_id!r} receiver_id={receiver_id!r}"
+                    )
+                rows.append(row)
+
+            already_fully_applied = all(
+                row.status == MessageStatus.SUPERSEDED.value
+                and row.superseded_by_message_id == superseding_message_id
+                for row in rows
+            )
+            if already_fully_applied:
+                # Pure idempotent replay: still confirm the superseder's
+                # IDENTITY (never its current status -- nothing here is
+                # about to mutate it).
+                superseder = (
+                    db.query(InboxModel).filter(InboxModel.id == superseding_message_id).first()
+                )
+                if (
+                    superseder is None
+                    or superseder.sender_id != sender_id
+                    or superseder.receiver_id != receiver_id
+                ):
+                    raise ValueError(
+                        f"superseding message {superseding_message_id} does not exist for "
+                        f"sender_id={sender_id!r} receiver_id={receiver_id!r}"
+                    )
+                db.commit()
+                return [_inbox_message_from_row(row) for row in rows]
+
+            # At least one target genuinely needs to change -- the full,
+            # mutating guard set applies, including the superseder's own
+            # PENDING requirement.
+            superseder = (
+                db.query(InboxModel).filter(InboxModel.id == superseding_message_id).first()
+            )
+            if (
+                superseder is None
+                or superseder.sender_id != sender_id
+                or superseder.receiver_id != receiver_id
+            ):
+                raise ValueError(
+                    f"superseding message {superseding_message_id} does not exist for "
+                    f"sender_id={sender_id!r} receiver_id={receiver_id!r}"
+                )
+            if superseder.status != MessageStatus.PENDING.value:
+                raise ValueError(
+                    f"superseding message {superseding_message_id} is not pending "
+                    f"(status={superseder.status!r})"
+                )
+
+            results: List[InboxMessage] = []
+            for row in rows:
+                if row.status == MessageStatus.SUPERSEDED.value:
+                    if row.superseded_by_message_id == superseding_message_id:
+                        results.append(_inbox_message_from_row(row))
+                        continue
+                    raise ValueError(
+                        f"target message {row.id} is already superseded by a "
+                        f"different message ({row.superseded_by_message_id})"
+                    )
+                if row.status != MessageStatus.PENDING.value:
+                    raise ValueError(
+                        f"target message {row.id} is not pending "
+                        f"(status={row.status!r}); refusing to supersede a claimed/"
+                        "delivering/delivered/failed row"
+                    )
+                row.status = MessageStatus.SUPERSEDED.value
+                row.superseded_by_message_id = superseding_message_id
+                results.append(_inbox_message_from_row(row))
+            db.commit()
+            return results
+        except Exception:
+            db.rollback()
+            raise
 
 
 def is_assigned_worker_callback_inbox_message(message_id: int) -> bool:
@@ -3266,6 +3478,551 @@ def get_assigned_worker_callback_by_assignment(
             return None
         _validate_assigned_worker_callback_row(db, row)
         return _assigned_worker_callback_from_row(row)
+
+
+class NativeDispatchCorruptionGuardError(Exception):
+    """One of native_dispatch_recovery.check_recovery_guards' fail-closed
+    guards refused this corruption-record mutation. Carries the exact
+    ``reason_code``/``detail`` from that guard result. Callers must not
+    react by relaxing or re-deriving inputs to force a pass -- a refusal
+    here means the fresh, mutation-time-rechecked state genuinely does not
+    satisfy one of: assignment/callback exists and belongs to the
+    requesting caller, the archived transcript matches its expected digest,
+    the transcript actually corrupts a registered dispatch, there is a
+    genuine unbound suffix, the callback's lifecycle is still eligible, the
+    terminal is not currently live, or the claimed concatenated message's
+    content/direction matches what was independently recomputed.
+    """
+
+    def __init__(self, reason_code: Optional[str], detail: str) -> None:
+        super().__init__(f"{reason_code}: {detail}")
+        self.reason_code = reason_code
+        self.detail = detail
+
+
+def _corruption_record_matches_row(record: Any, row: "NativeDispatchCorruptionModel") -> bool:
+    """True if ``record`` (a native_dispatch_recovery.CorruptionRecord) and
+    an existing durable ``row`` describe the SAME incident.
+
+    ``recorded_at`` is deliberately excluded: two independent, otherwise-
+    identical recordings of the same real incident (e.g. a caller retrying
+    after a transient failure) legitimately carry different wall-clock
+    timestamps and must still be recognized as an idempotent replay, not a
+    conflict -- every field that is actually EVIDENCE of the incident itself
+    must still match exactly. The acknowledgement columns are compared
+    separately by callers that care about them (record_native_dispatch_
+    corruption does not; acknowledge_native_dispatch_corruption does) --
+    two callers racing to RECORD (not acknowledge) the same incident must
+    still match here regardless of whether either has been acknowledged.
+    """
+    return (
+        record.assignment_id == row.assignment_id
+        and record.completion_id == row.completion_id
+        and record.worker_terminal_id == row.worker_terminal_id
+        and record.caller_id == row.caller_id
+        and record.registered_dispatch_sha256 == row.registered_dispatch_sha256
+        and record.bound_prefix_length == row.bound_prefix_length
+        and record.transcript_sha256 == row.transcript_sha256
+        and str(record.concatenated_message_id) == row.concatenated_message_id
+        and record.concatenated_message_sender_id == row.concatenated_message_sender_id
+        and record.concatenated_message_receiver_id == row.concatenated_message_receiver_id
+        and record.concatenated_message_content_sha256 == row.concatenated_message_content_sha256
+        and record.concatenated_message_delivery_state == row.concatenated_message_delivery_state
+        and record.concatenated_message_session_id == row.concatenated_message_session_id
+    )
+
+
+def _row_to_corruption_record(row: "NativeDispatchCorruptionModel") -> Any:
+    """Reconstruct a native_dispatch_recovery.CorruptionRecord from a durable row."""
+    from cli_agent_orchestrator.services.native_dispatch_recovery import CorruptionRecord
+
+    return CorruptionRecord(
+        assignment_id=row.assignment_id,
+        completion_id=row.completion_id,
+        worker_terminal_id=row.worker_terminal_id,
+        caller_id=row.caller_id,
+        registered_dispatch_sha256=row.registered_dispatch_sha256,
+        bound_prefix_length=row.bound_prefix_length,
+        transcript_sha256=row.transcript_sha256,
+        concatenated_message_id=row.concatenated_message_id,
+        concatenated_message_sender_id=row.concatenated_message_sender_id,
+        concatenated_message_receiver_id=row.concatenated_message_receiver_id,
+        concatenated_message_content_sha256=row.concatenated_message_content_sha256,
+        concatenated_message_delivery_state=row.concatenated_message_delivery_state,
+        concatenated_message_session_id=row.concatenated_message_session_id,
+        recorded_at=row.recorded_at,
+        caller_acknowledgement=row.caller_acknowledgement,
+        capture_release_acknowledged_at=row.capture_release_acknowledged_at,
+    )
+
+
+def _resolve_and_guard_corruption_record(
+    db: Any,
+    *,
+    assignment_id: str,
+    requesting_caller_id: str,
+    live_status: Any,
+    transcript_first_user_text: str,
+    expected_transcript_sha256: str,
+    admissible_dispatch_sha256: List[str],
+    concatenated_message_id: str,
+    concatenated_message_sender_id: str,
+    concatenated_message_receiver_id: str,
+    concatenated_message_content: str,
+    concatenated_message_delivery_state: str,
+    concatenated_message_session_id: Optional[str],
+    recorded_at: str,
+) -> Any:
+    """Shared mutation-time resolve-and-guard core for BOTH
+    record_native_dispatch_corruption and acknowledge_native_dispatch_
+    corruption (correction-997): re-read the assignment/callback row fresh
+    from ``db`` (an already-open, caller-owned transaction), recompute the
+    transcript digest and corruption analysis from the raw inputs, rerun
+    every check_recovery_guards() guard against those fresh values, and
+    build the resulting CorruptionRecord. Raises
+    NativeDispatchCorruptionGuardError on any guard failure. Callers own
+    the transaction (begin/commit/rollback) and any acknowledgement-
+    specific guard on top of this.
+    """
+    from cli_agent_orchestrator.services.native_dispatch_recovery import (
+        ConcatenatedMessageClaim,
+        analyze_native_dispatch_corruption,
+        build_corruption_record,
+        check_recovery_guards,
+        utf8_sha256,
+    )
+
+    row = (
+        db.query(AssignedWorkerCallbackModel)
+        .filter(AssignedWorkerCallbackModel.assignment_id == assignment_id)
+        .first()
+    )
+    callback = None
+    if row is not None:
+        _validate_assigned_worker_callback_row(db, row)
+        callback = _assigned_worker_callback_from_row(row)
+
+    transcript_sha256 = utf8_sha256(transcript_first_user_text)
+    analysis = analyze_native_dispatch_corruption(
+        transcript_first_user_text, admissible_dispatch_sha256
+    )
+    claim = ConcatenatedMessageClaim(
+        message_id=concatenated_message_id,
+        sender_id=concatenated_message_sender_id,
+        receiver_id=concatenated_message_receiver_id,
+        content=concatenated_message_content,
+        delivery_state=concatenated_message_delivery_state,
+        session_id=concatenated_message_session_id,
+    )
+    guard = check_recovery_guards(
+        requesting_caller_id=requesting_caller_id,
+        callback=callback,
+        analysis=analysis,
+        live_status=live_status,
+        archived_transcript_sha256=transcript_sha256,
+        expected_archived_transcript_sha256=expected_transcript_sha256,
+        claim=claim,
+    )
+    if not guard.allowed:
+        db.rollback()
+        raise NativeDispatchCorruptionGuardError(guard.reason_code, guard.detail)
+
+    return build_corruption_record(
+        callback=callback,
+        analysis=analysis,
+        claim=claim,
+        transcript_sha256=transcript_sha256,
+        recorded_at=recorded_at,
+    )
+
+
+def record_native_dispatch_corruption(
+    *,
+    assignment_id: str,
+    requesting_caller_id: str,
+    live_status: Any,
+    transcript_first_user_text: str,
+    expected_transcript_sha256: str,
+    admissible_dispatch_sha256: List[str],
+    concatenated_message_id: str,
+    concatenated_message_sender_id: str,
+    concatenated_message_receiver_id: str,
+    concatenated_message_content: str,
+    concatenated_message_delivery_state: str,
+    concatenated_message_session_id: Optional[str],
+    recorded_at: str,
+) -> Any:
+    """The one supported, real durable mutation for a proven native-dispatch
+    corruption incident (correction-971/984/994).
+
+    Everything guard-relevant is freshly resolved and bound INSIDE this one
+    ``BEGIN IMMEDIATE`` transaction, at mutation time -- not trusted from any
+    caller-supplied pre-computed guard result:
+
+    - The assignment/callback row is re-read from the database right here
+      (never a snapshot the caller might be holding from earlier).
+    - The transcript's SHA-256 is recomputed from ``transcript_first_user_text``
+      right here (never trusted from a caller-supplied digest) and compared
+      against ``expected_transcript_sha256`` -- a mismatch means the archived
+      transcript was tampered with or is stale, and fails closed.
+    - The corruption analysis (which admissible dispatch digest the
+      transcript's prefix matches, and what the exact unbound suffix is) is
+      recomputed right here from the fresh transcript text.
+    - Every check_recovery_guards() guard (identity, evidence integrity,
+      hash/prefix match, lifecycle eligibility, live-terminal activity,
+      claimed-message content/direction) is rerun right here, against all of
+      the above freshly-resolved values -- never a stale prior guard result.
+
+    ``live_status`` is the one input this function cannot itself resolve
+    inside the SQL transaction (a live terminal's status comes from reading
+    tmux/provider state, not the database) -- callers must read it as close
+    as practical to this call, mirroring how ``prepare_terminal_retirement``
+    (PR #11) already accepts this same real, documented, non-SQL-transactional
+    gap for the identical reason. Everything else above IS bound inside the
+    one transaction.
+
+    Insert-only and idempotent, enforced by the database itself, not merely
+    application logic: ``NativeDispatchCorruptionModel.record_key`` is a
+    PRIMARY KEY, so a concurrent transaction that already committed the same
+    record raises ``IntegrityError`` here, which this function resolves the
+    same way as an existing row found by its own SELECT -- a byte-for-byte
+    (except ``recorded_at``) matching existing record is a safe no-op;
+    anything else is refused outright, never silently overwritten.
+
+    Raises ``NativeDispatchCorruptionGuardError`` (guard refused, fail
+    closed) or ``ValueError`` (a genuine, different existing record already
+    occupies this identity). Never mutates
+    lifecycle/delivery_state/final_result/receiver_state on the assignment,
+    never creates/replays/resolves any inbox message, never releases any
+    OTHER pending message's delivery barrier.
+    """
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+
+        record = _resolve_and_guard_corruption_record(
+            db,
+            assignment_id=assignment_id,
+            requesting_caller_id=requesting_caller_id,
+            live_status=live_status,
+            transcript_first_user_text=transcript_first_user_text,
+            expected_transcript_sha256=expected_transcript_sha256,
+            admissible_dispatch_sha256=admissible_dispatch_sha256,
+            concatenated_message_id=concatenated_message_id,
+            concatenated_message_sender_id=concatenated_message_sender_id,
+            concatenated_message_receiver_id=concatenated_message_receiver_id,
+            concatenated_message_content=concatenated_message_content,
+            concatenated_message_delivery_state=concatenated_message_delivery_state,
+            concatenated_message_session_id=concatenated_message_session_id,
+            recorded_at=recorded_at,
+        )
+
+        existing = (
+            db.query(NativeDispatchCorruptionModel)
+            .filter(NativeDispatchCorruptionModel.record_key == record.record_key())
+            .first()
+        )
+        if existing is not None:
+            if _corruption_record_matches_row(record, existing):
+                db.commit()
+                return record
+            db.rollback()
+            raise ValueError(
+                f"corruption record collision for {record.record_key()!r}: an existing, "
+                "DIFFERENT record already exists for this assignment/message identity"
+            )
+
+        db.add(
+            NativeDispatchCorruptionModel(
+                record_key=record.record_key(),
+                assignment_id=record.assignment_id,
+                completion_id=record.completion_id,
+                worker_terminal_id=record.worker_terminal_id,
+                caller_id=record.caller_id,
+                registered_dispatch_sha256=record.registered_dispatch_sha256,
+                bound_prefix_length=record.bound_prefix_length,
+                transcript_sha256=record.transcript_sha256,
+                concatenated_message_id=str(record.concatenated_message_id),
+                concatenated_message_sender_id=record.concatenated_message_sender_id,
+                concatenated_message_receiver_id=record.concatenated_message_receiver_id,
+                concatenated_message_content_sha256=record.concatenated_message_content_sha256,
+                concatenated_message_delivery_state=record.concatenated_message_delivery_state,
+                concatenated_message_session_id=record.concatenated_message_session_id,
+                recorded_at=record.recorded_at,
+            )
+        )
+        try:
+            db.commit()
+        except IntegrityError:
+            # Genuine DB-level CAS: another transaction committed the same
+            # record_key between our SELECT above and this INSERT. Resolve
+            # exactly like the existing-row branch above -- never silently
+            # overwrite, never treat this as this call's own success without
+            # verifying the winner recorded the SAME incident.
+            db.rollback()
+            existing = (
+                db.query(NativeDispatchCorruptionModel)
+                .filter(NativeDispatchCorruptionModel.record_key == record.record_key())
+                .first()
+            )
+            if existing is not None and _corruption_record_matches_row(record, existing):
+                return record
+            raise ValueError(
+                f"corruption record collision for {record.record_key()!r}: a concurrent "
+                "transaction recorded a DIFFERENT record for this identity first"
+            )
+        return record
+
+
+class AcknowledgedCorruptionRecord(NamedTuple):
+    """Result of acknowledge_native_dispatch_corruption.
+
+    ``released_now`` is True only on the transition from unacknowledged to
+    acknowledged that THIS call itself performed -- False for an idempotent
+    replay of an already-acknowledged incident. Callers (the guarded
+    capture-release orchestrator) use this to decide whether the in-memory
+    capture barrier actually needs releasing, vs. a repeat call that must
+    not try to release it again.
+    """
+
+    record: Any
+    released_now: bool
+
+
+def acknowledge_native_dispatch_corruption(
+    *,
+    assignment_id: str,
+    requesting_caller_id: str,
+    live_status: Any,
+    transcript_first_user_text: str,
+    expected_transcript_sha256: str,
+    admissible_dispatch_sha256: List[str],
+    concatenated_message_id: str,
+    concatenated_message_sender_id: str,
+    concatenated_message_receiver_id: str,
+    concatenated_message_content: str,
+    concatenated_message_delivery_state: str,
+    concatenated_message_session_id: Optional[str],
+    recorded_at: str,
+    acknowledgement: str,
+    acknowledged_at: str,
+) -> AcknowledgedCorruptionRecord:
+    """The narrow, explicit-caller-acknowledged transition that a plain
+    record_native_dispatch_corruption() row does NOT perform (correction-
+    997/1001): re-verify every mutation-time binding fresh (reusing
+    _resolve_and_guard_corruption_record -- the exact same guards as
+    record_native_dispatch_corruption, at the exact same freshness), require
+    a non-empty explicit ``acknowledgement`` from the requesting caller, and
+    durably mark this exact incident acknowledged.
+
+    This function does NOT itself touch the in-memory capture barrier --
+    see AssignedWorkerCompletionService.reconcile_corrupted_dispatch_
+    capture_release for the orchestrating transition that acquires the
+    per-terminal lock, calls this function for the DB-side CAS, and only
+    then releases the barrier. ``live_status`` here is deliberately still a
+    plain parameter (not read by this function) -- the orchestrator is
+    responsible for reading it freshly INSIDE that lock, immediately before
+    calling this function, never as a stale pre-lock snapshot (message
+    1001's TOCTOU finding).
+
+    Idempotent-or-refuse, same discipline as record_native_dispatch_
+    corruption: no existing row -- inserts one, already acknowledged.
+    Existing row, not yet acknowledged, matching content -- upgrades it in
+    place (this is the one real "release" transition; ``released_now`` is
+    True). Existing row, already acknowledged with the SAME acknowledgement
+    text -- safe idempotent no-op (``released_now`` False; the orchestrator
+    must not re-release). Existing row that differs in content OR in a
+    DIFFERENT prior acknowledgement text -- refused outright as a
+    collision, never silently overwritten.
+
+    Never mutates lifecycle/delivery_state/final_result/receiver_state
+    (the table has no such columns at all), never marks the task
+    successful, never replays the concatenated message, never creates any
+    inbox row.
+    """
+    from cli_agent_orchestrator.services.native_dispatch_recovery import (
+        check_acknowledgement_guard,
+    )
+
+    ack_guard = check_acknowledgement_guard(acknowledgement)
+    if not ack_guard.allowed:
+        raise NativeDispatchCorruptionGuardError(ack_guard.reason_code, ack_guard.detail)
+
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+
+        record = _resolve_and_guard_corruption_record(
+            db,
+            assignment_id=assignment_id,
+            requesting_caller_id=requesting_caller_id,
+            live_status=live_status,
+            transcript_first_user_text=transcript_first_user_text,
+            expected_transcript_sha256=expected_transcript_sha256,
+            admissible_dispatch_sha256=admissible_dispatch_sha256,
+            concatenated_message_id=concatenated_message_id,
+            concatenated_message_sender_id=concatenated_message_sender_id,
+            concatenated_message_receiver_id=concatenated_message_receiver_id,
+            concatenated_message_content=concatenated_message_content,
+            concatenated_message_delivery_state=concatenated_message_delivery_state,
+            concatenated_message_session_id=concatenated_message_session_id,
+            recorded_at=recorded_at,
+        )
+
+        existing = (
+            db.query(NativeDispatchCorruptionModel)
+            .filter(NativeDispatchCorruptionModel.record_key == record.record_key())
+            .first()
+        )
+        if existing is not None:
+            if not _corruption_record_matches_row(record, existing):
+                db.rollback()
+                raise ValueError(
+                    f"corruption record collision for {record.record_key()!r}: an existing, "
+                    "DIFFERENT record already exists for this assignment/message identity"
+                )
+            if existing.capture_release_acknowledged_at is not None:
+                if existing.caller_acknowledgement == acknowledgement:
+                    db.commit()
+                    return AcknowledgedCorruptionRecord(_row_to_corruption_record(existing), False)
+                db.rollback()
+                raise ValueError(
+                    f"corruption record {record.record_key()!r} was already acknowledged with "
+                    "a DIFFERENT acknowledgement text -- refusing to overwrite"
+                )
+            existing.caller_acknowledgement = acknowledgement
+            existing.capture_release_acknowledged_at = acknowledged_at
+            db.commit()
+            return AcknowledgedCorruptionRecord(_row_to_corruption_record(existing), True)
+
+        db.add(
+            NativeDispatchCorruptionModel(
+                record_key=record.record_key(),
+                assignment_id=record.assignment_id,
+                completion_id=record.completion_id,
+                worker_terminal_id=record.worker_terminal_id,
+                caller_id=record.caller_id,
+                registered_dispatch_sha256=record.registered_dispatch_sha256,
+                bound_prefix_length=record.bound_prefix_length,
+                transcript_sha256=record.transcript_sha256,
+                concatenated_message_id=str(record.concatenated_message_id),
+                concatenated_message_sender_id=record.concatenated_message_sender_id,
+                concatenated_message_receiver_id=record.concatenated_message_receiver_id,
+                concatenated_message_content_sha256=record.concatenated_message_content_sha256,
+                concatenated_message_delivery_state=record.concatenated_message_delivery_state,
+                concatenated_message_session_id=record.concatenated_message_session_id,
+                recorded_at=record.recorded_at,
+                caller_acknowledgement=acknowledgement,
+                capture_release_acknowledged_at=acknowledged_at,
+            )
+        )
+        try:
+            db.commit()
+        except IntegrityError:
+            # See record_native_dispatch_corruption's own comment: SQLite's
+            # BEGIN IMMEDIATE already serializes genuinely concurrent callers
+            # against each other, so this is a defensive fallback, not the
+            # primary mechanism. Resolve the same way: match content AND an
+            # identical prior acknowledgement is a safe no-op; anything else
+            # (different content, not-yet-acknowledged, or a DIFFERENT
+            # acknowledgement) is refused rather than silently overwritten.
+            db.rollback()
+            existing = (
+                db.query(NativeDispatchCorruptionModel)
+                .filter(NativeDispatchCorruptionModel.record_key == record.record_key())
+                .first()
+            )
+            if (
+                existing is not None
+                and _corruption_record_matches_row(record, existing)
+                and existing.capture_release_acknowledged_at is not None
+                and existing.caller_acknowledgement == acknowledgement
+            ):
+                return AcknowledgedCorruptionRecord(_row_to_corruption_record(existing), False)
+            raise ValueError(
+                f"corruption record collision for {record.record_key()!r}: a concurrent "
+                "transaction recorded a DIFFERENT or not-yet-acknowledged record first"
+            )
+        acknowledged_record = dataclasses.replace(
+            record,
+            caller_acknowledgement=acknowledgement,
+            capture_release_acknowledged_at=acknowledged_at,
+        )
+        return AcknowledgedCorruptionRecord(acknowledged_record, True)
+
+
+def mark_native_dispatch_corruption_capture_release_completed(
+    record_key: str, completed_at: str
+) -> None:
+    """Durably mark that the ENTIRE guarded capture-release transition --
+    the acknowledgement AND any supersession the caller requested alongside
+    it -- has finished for this exact incident (correction-1042/1044).
+
+    This is the SECOND, later phase of a two-phase durable transition:
+    ``acknowledge_native_dispatch_corruption`` records the first phase
+    (``caller_acknowledgement`` non-NULL) as soon as the caller's
+    acknowledgement itself is verified and committed, which can legitimately
+    happen BEFORE a requested supersession has run (or even if it later
+    fails) -- so ``caller_acknowledgement`` alone is NOT sufficient proof
+    that this incident is safe to never re-arm on a future restart. This
+    function's own column, ``capture_release_completed_at``, is set only
+    once the orchestrating transition (``AssignedWorkerCompletionService.
+    reconcile_corrupted_dispatch_capture_release``) has confirmed every
+    requested prerequisite actually completed, immediately before it
+    releases the in-memory barrier.
+
+    Requires the row to already be acknowledged (raises ``ValueError``
+    otherwise -- this can never mark phase two complete before phase one).
+    Idempotent: a repeat call for the same ``record_key`` is a safe no-op
+    that never overwrites an existing non-NULL value with a different one
+    -- the FIRST recorded completion timestamp is authoritative, exactly
+    like ``caller_acknowledgement``'s own collision-refusal discipline one
+    level up, except silent rather than raising, since two callers racing
+    to mark the SAME already-completed transition complete a second time
+    is not a conflict worth failing closed over.
+    """
+    with SessionLocal() as db:
+        row = (
+            db.query(NativeDispatchCorruptionModel)
+            .filter(NativeDispatchCorruptionModel.record_key == record_key)
+            .first()
+        )
+        if row is None:
+            raise ValueError(f"no corruption record exists for {record_key!r}")
+        if row.caller_acknowledgement is None:
+            raise ValueError(
+                f"corruption record {record_key!r} is not yet acknowledged -- cannot mark "
+                "its capture-release transition complete before its first phase"
+            )
+        if row.capture_release_completed_at is None:
+            row.capture_release_completed_at = completed_at
+            db.commit()
+
+
+def is_native_dispatch_corruption_capture_release_completed(
+    worker_terminal_id: str, assignment_id: str
+) -> bool:
+    """True iff a durable corruption record exists for this EXACT
+    ``(worker_terminal_id, assignment_id)`` pair whose entire guarded
+    capture-release transition has already completed (correction-1042/
+    1044).
+
+    Scoped to the exact assignment, not merely the worker terminal, so an
+    unrelated, already-resolved incident on a REUSED ``worker_terminal_id``
+    (a terminal retired and later reassigned) can never suppress a
+    genuinely new incident's hold for the new assignment -- consulted by
+    ``register_persisted_assignments`` before arming, never by anything
+    that itself releases a barrier.
+    """
+    with SessionLocal() as db:
+        row = (
+            db.query(NativeDispatchCorruptionModel)
+            .filter(
+                NativeDispatchCorruptionModel.worker_terminal_id == worker_terminal_id,
+                NativeDispatchCorruptionModel.assignment_id == assignment_id,
+                NativeDispatchCorruptionModel.capture_release_completed_at.isnot(None),
+            )
+            .first()
+        )
+        return row is not None
 
 
 def list_reconcilable_assigned_worker_callbacks() -> List[AssignedWorkerCallback]:

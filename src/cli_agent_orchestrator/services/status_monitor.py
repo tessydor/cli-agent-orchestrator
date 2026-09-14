@@ -138,6 +138,36 @@ class StatusMonitor:
         # applied across that boundary would consume the arm and latch-block the new
         # turn's genuine PROCESSING.
         self._capture_generation: Dict[str, int] = {}
+        # Per-terminal native-acceptance fence (correction-984). Armed by
+        # notify_input_sent() whenever a dispatch is sent to a provider that
+        # does NOT assume_processing_on_dispatch (see providers/base.py):
+        # terminal_service's per-terminal lock (correction-971) already
+        # guarantees no two send_input() calls for the SAME terminal_id can
+        # physically write to the pane at once, but it says nothing about
+        # whether the terminal's own native process has actually registered
+        # a PRIOR dispatch by the time a SUBSEQUENT caller's turn to hold
+        # that lock arrives -- a too-early second paste could still land
+        # inside a composer the prior dispatch has not yet cleared. Released
+        # by _apply_detection_locked the moment a genuine transition away
+        # from IDLE is observed (proof the terminal registered SOMETHING) --
+        # EXCEPT UNKNOWN, which is "no signal" (see _apply_detection_locked's
+        # own UNKNOWN handling) and never counts as acceptance evidence
+        # (correction-994). Absence of an entry means "nothing pending" --
+        # safe to proceed immediately (see wait_for_native_acceptance).
+        #
+        # Value is (event, armed_at): armed_at is time.monotonic() at the
+        # moment THIS fence was armed, paired with _buffer_changed_at's own
+        # per-chunk timestamp at release time (correction-994) so a
+        # detection driven by a chunk that was already in flight BEFORE this
+        # arm -- delayed only by independent thread/asyncio scheduling, not
+        # reflecting anything about THIS dispatch -- cannot release it. This
+        # does not (and cannot, without plumbing real OS-level capture
+        # timestamps through the FIFO->EventBus pipeline, which carries none
+        # today) distinguish a genuinely fresh chunk whose rendered CONTENT
+        # happens to still visually echo a stale prior-turn frame; that is a
+        # deeper, acknowledged limitation of content-based detection, not
+        # something this timestamp guards against.
+        self._acceptance_pending: Dict[str, Tuple[threading.Event, float]] = {}
         # --- pyte rendered-screen detection state (only used when CAO_PYTE_STATUS
         # is on AND the provider opts in via supports_screen_detection) ---
         # Per-terminal pyte Screen+Stream that composites the raw byte stream
@@ -319,6 +349,47 @@ class StatusMonitor:
             self._allow_processing_revert[terminal_id] = False
         elif detected in _STICKY_READY_STATUSES and last not in _STICKY_READY_STATUSES:
             self._allow_processing_revert[terminal_id] = False
+
+        if detected not in (TerminalStatus.IDLE, TerminalStatus.UNKNOWN):
+            # A genuine, accepted transition away from IDLE is proof the
+            # terminal's native process registered SOMETHING (started
+            # processing, asked a question, finished, or errored) -- release
+            # any native-acceptance fence a prior notify_input_sent() armed
+            # for this terminal (correction-984). IDLE itself never releases
+            # it: that is exactly the ambiguous "did it actually accept the
+            # paste, or is the composer just showing stale/cleared text"
+            # state the fence exists to wait past. UNKNOWN never releases it
+            # either (correction-994): it is "no signal" (see this
+            # function's own UNKNOWN handling above), not evidence of
+            # anything -- a brand-new terminal's very first post-dispatch
+            # detection can legitimately be UNKNOWN before the pane
+            # stabilizes, and that alone must never count as acceptance.
+            pending = self._acceptance_pending.get(terminal_id)
+            if pending is not None:
+                event, armed_at = pending
+                # Correction-994/1001: only release for evidence that is
+                # PROVEN at least as recent as this fence's own arming.
+                # _buffer_changed_at is stamped by _process_chunk BEFORE it
+                # schedules the detection that leads here, so for any
+                # chunk-driven detection this closes the cross-thread race
+                # where a chunk already queued BEFORE notify_input_sent's
+                # arm has its actual processing (an independent thread/
+                # asyncio scheduling artifact, not reflecting this dispatch
+                # at all) delayed until after arm. Missing freshness evidence
+                # (no _buffer_changed_at entry at all -- a detection that
+                # reached this point some other way than the real chunk
+                # pipeline) fails CLOSED, exactly like UNKNOWN above: absence
+                # of proof is not proof of freshness, and this is the same
+                # fail-closed boundary that bars UNKNOWN from releasing.
+                # Direct/test-only callers that mean to simulate a genuine
+                # post-arm detection must supply real freshness evidence
+                # themselves (e.g. via a small, clearly-scoped test helper)
+                # rather than relying on this ever treating "no evidence" as
+                # "fresh enough" -- that would let an unproven repeated
+                # non-IDLE observation manufacture acceptance.
+                changed_at = self._buffer_changed_at.get(terminal_id)
+                if changed_at is not None and changed_at >= armed_at:
+                    event.set()
 
         return True
 
@@ -570,6 +641,15 @@ class StatusMonitor:
         cycle (terminal_service.send_input, provider.initialize warm-up
         and CLI-launch keystrokes). Without this, a previously-latched
         IDLE/COMPLETED would block the genuine PROCESSING transition.
+
+        When ``assume_processing`` is False, also arms the native-acceptance
+        fence (correction-984): this dispatch's acceptance is NOT assumed,
+        so any other send_input() call for this same terminal_id that
+        acquires the per-terminal lock next must wait for a real detected
+        transition away from IDLE before pasting (see
+        wait_for_native_acceptance). When True, PROCESSING is applied
+        synchronously below, which itself releases any such fence via the
+        normal _apply_detection_locked path -- no separate arm is needed.
         """
         with self._lock:
             self._allow_processing_revert[terminal_id] = True
@@ -582,8 +662,27 @@ class StatusMonitor:
             # stale verdict over the new turn (and consume the revert arm just set).
             self._pending_stale_capture.pop(terminal_id, None)
             self._capture_generation[terminal_id] = self._capture_generation.get(terminal_id, 0) + 1
+            if not assume_processing:
+                self._acceptance_pending[terminal_id] = (threading.Event(), time.monotonic())
         if assume_processing:
             self._apply_detection(terminal_id, TerminalStatus.PROCESSING)
+
+    def wait_for_native_acceptance(self, terminal_id: str, timeout: float = 8.0) -> bool:
+        """Block until a PRIOR dispatch to this terminal is confirmed accepted.
+
+        Returns True immediately if nothing is pending (no dispatch has been
+        sent yet, or the pending one was already confirmed/superseded).
+        Otherwise blocks up to ``timeout`` seconds for
+        _apply_detection_locked to observe a real transition away from IDLE,
+        returning False on timeout (correction-984) -- callers MUST treat
+        False as a fail-closed refusal to paste, never as permission to
+        proceed anyway; no timeout may silently release this fence.
+        """
+        pending = self._acceptance_pending.get(terminal_id)
+        if pending is None:
+            return True
+        event, _armed_at = pending
+        return event.wait(timeout=timeout)
 
     def clear_rolling_buffer(self, terminal_id: str, provider=None) -> None:
         """Clear ONLY the rolling byte buffer for a terminal — preserves
@@ -635,6 +734,12 @@ class StatusMonitor:
             self._pending_stale_capture.pop(terminal_id, None)
             self._capture_generation.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
+            # Release rather than leave any waiter blocked for up to its full
+            # timeout on a terminal that no longer exists -- deliberate, not
+            # the silent timeout-release wait_for_native_acceptance forbids.
+            pending = self._acceptance_pending.pop(terminal_id, None)
+            if pending is not None:
+                pending[0].set()
         self._cancel_quiesce_handle(handle)
 
     def reset_buffer(self, terminal_id: str) -> None:
@@ -659,6 +764,12 @@ class StatusMonitor:
             self._pending_stale_capture.pop(terminal_id, None)
             self._capture_generation.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
+            # The relaunched CLI mode's own dispatch will re-arm this if
+            # needed; a fence left over from the failed attempt must not
+            # block it or linger past the reset it is being reset for.
+            pending = self._acceptance_pending.pop(terminal_id, None)
+            if pending is not None:
+                pending[0].set()
         self._cancel_quiesce_handle(handle)
 
     def get_status(self, terminal_id: str) -> TerminalStatus:

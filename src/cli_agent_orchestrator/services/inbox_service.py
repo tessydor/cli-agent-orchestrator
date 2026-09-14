@@ -8,7 +8,6 @@ import logging
 import threading
 import uuid
 from itertools import groupby
-from typing import Dict
 
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.clients.database import (
@@ -31,6 +30,10 @@ from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.status_monitor import status_monitor
+from cli_agent_orchestrator.services.terminal_service import (
+    NativeAcceptanceTimeoutError,
+    TerminalCaptureNotDurableError,
+)
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
@@ -39,27 +42,37 @@ logger = logging.getLogger(__name__)
 class InboxService:
     """Delivers one pending message per terminal per IDLE cycle."""
 
-    def __init__(self) -> None:
-        # deliver_pending is read(PENDING) → status check → mark DELIVERED → send,
-        # with no atomic claim at the DB layer, so two concurrent calls for the
-        # SAME terminal can both read the same oldest row before either marks it
-        # and deliver one task twice. Concurrent callers are real: the status-event
-        # consumer and the immediate POST path both dispatch to worker threads, and
-        # the OpenCode poller and the reconcile sweep add more. Serialize the whole
-        # read→mark→send sequence per terminal; as a side effect this also keeps
-        # two pastes from ever interleaving in one pane. The lock map is tiny
-        # (one Lock per terminal id ever delivered to in this process) and is not
-        # reaped — terminal ids are bounded by session lifecycle.
-        self._delivery_locks_guard = threading.Lock()
-        self._delivery_locks: Dict[str, threading.Lock] = {}
+    def _delivery_lock(self, terminal_id: str) -> threading.RLock:
+        """Return the shared per-terminal lock guarding native-input delivery.
 
-    def _delivery_lock(self, terminal_id: str) -> threading.Lock:
-        with self._delivery_locks_guard:
-            lock = self._delivery_locks.get(terminal_id)
-            if lock is None:
-                lock = threading.Lock()
-                self._delivery_locks[terminal_id] = lock
-            return lock
+        deliver_pending is read(PENDING) → status check → capture-barrier wait
+        → mark DELIVERED → send, with no atomic claim at the DB layer, so two
+        concurrent calls for the SAME terminal can both read the same oldest
+        row before either marks it and deliver one task twice. Concurrent
+        callers are real: the status-event consumer and the immediate POST
+        path both dispatch to worker threads, and the OpenCode poller and the
+        reconcile sweep add more.
+
+        This used to be a private per-terminal Lock of InboxService's own,
+        which only ever serialized InboxService's OWN deliveries against each
+        other -- not against the other three send_input entry points
+        (agent_step's initial assignment dispatch, the raw
+        POST /terminals/{id}/input route, and agui's handoff-approval send).
+        A follow-up delivered here could therefore still physically interleave
+        its tmux paste with one of those (the proven correction-971 defect: a
+        follow-up landing inside an assignment's still-open first-user paste,
+        corrupting the dispatch-identity hash bind_completion_dispatch
+        records). Using terminal_service's shared lock instead -- and holding
+        it across wait_for_capture_before_input() too, not just around the
+        eventual send_input() call -- closes the specific gap where that wait
+        returns, the lock is momentarily not held, and a concurrent caller's
+        send_input slips in before this delivery's own send_input call:
+        extending the capture barrier's protection to every entry point
+        uniformly, not just the physical tmux write. Safe because
+        terminal_input_lock is an RLock and send_input (called from within
+        this same held lock, on the same thread) reacquires it reentrantly.
+        """
+        return terminal_service.terminal_input_lock(terminal_id)
 
     async def run(self, registry: PluginRegistry | None = None) -> None:
         queue = bus.subscribe("terminal.*.status")
@@ -101,14 +114,27 @@ class InboxService:
         Safe to call from any thread: the whole read→mark→send sequence is
         serialized per terminal (see __init__ for why that is load-bearing).
         """
+        # Plugin dispatch must never run while _delivery_lock (== terminal_
+        # input_lock) is held (correction-1007 item 3 / message 1004):
+        # send_input's own "dispatch after MY lock releases" (correction-994)
+        # is a no-op here, because send_input's lock acquisition is a
+        # REENTRANT re-acquire of the SAME RLock this method already holds --
+        # the lock is still held by THIS method's own `with` block while
+        # send_input's "after the lock" code runs. Collect deferred
+        # dispatches (in original per-batch order) and run them only after
+        # the lock below has genuinely, fully released.
+        deferred_dispatches: list = []
         with self._delivery_lock(terminal_id):
-            self._deliver_pending_locked(terminal_id, num_messages, registry)
+            self._deliver_pending_locked(terminal_id, num_messages, registry, deferred_dispatches)
+        for dispatch in deferred_dispatches:
+            dispatch()
 
     def _deliver_pending_locked(
         self,
         terminal_id: str,
         num_messages: int,
         registry: PluginRegistry | None,
+        deferred_dispatches: list,
     ) -> None:
         limit = num_messages if num_messages > 0 else 100
         messages = get_pending_messages(terminal_id, limit=limit)
@@ -132,23 +158,33 @@ class InboxService:
             if not eager_eligible:
                 return
 
-        if status == TerminalStatus.COMPLETED:
-            # Assigned workers must retain their just-finished output until the
-            # completion service has copied it into durable callback storage.
-            # Unknown/non-assigned terminals have no barrier and return
-            # immediately.  A timeout deliberately leaves every row PENDING for
-            # the next reconciliation pass instead of risking transcript loss.
-            from cli_agent_orchestrator.services.assigned_worker_completion_service import (
-                assigned_worker_completion_service,
-            )
+        # Consult the capture hold regardless of which eligible status got us
+        # here (correction-1038). This used to be gated on
+        # ``status == TerminalStatus.COMPLETED``, on the assumption that a
+        # hold can only matter while a worker is COMPLETED -- true for a
+        # live just-finished capture, but not for a hold reconstructed at
+        # startup (correction-1033) for an unresolved persisted assignment:
+        # its provider can legitimately report IDLE for an already-quiet
+        # composer, which used to skip this check entirely. Unknown/non-
+        # assigned/never-held terminals have no barrier and return
+        # immediately (the overwhelming majority of calls); a timeout
+        # deliberately leaves every row PENDING for the next reconciliation
+        # pass instead of risking transcript loss or racing an unresolved
+        # incident. ``send_input``'s own recheck below remains the true
+        # authoritative boundary (994/1038) -- this is only the pre-claim
+        # optimization that avoids claiming rows we already know aren't
+        # deliverable yet.
+        from cli_agent_orchestrator.services.assigned_worker_completion_service import (
+            assigned_worker_completion_service,
+        )
 
-            if not assigned_worker_completion_service.wait_for_capture_before_input(terminal_id):
-                logger.warning(
-                    "Deferred inbox delivery to completed assigned worker %s until its final "
-                    "report is durably captured",
-                    terminal_id,
-                )
-                return
+        if not assigned_worker_completion_service.wait_for_capture_before_input(terminal_id):
+            logger.warning(
+                "Deferred inbox delivery to worker %s until its unresolved capture "
+                "hold is durably captured or explicitly acknowledged",
+                terminal_id,
+            )
+            return
 
         # A stale read is harmless: every candidate must win a durable
         # PENDING -> DELIVERING compare-and-set before it may touch the pane.
@@ -189,6 +225,7 @@ class InboxService:
                         registry=registry,
                         sender_id=sender_id,
                         orchestration_type=OrchestrationType.SEND_MESSAGE,
+                        _defer_plugin_dispatch=deferred_dispatches,
                     )
             except TerminalNotFoundError as e:
                 # Pane not resolvable yet (e.g. a herdr pane that isn't mapped
@@ -198,6 +235,37 @@ class InboxService:
                     resolve_inbox_claim(message.id, claim_token, MessageStatus.PENDING)
                 logger.warning(
                     f"Pane not resolvable for terminal {terminal_id}; leaving "
+                    f"{len(batch)} message(s) pending for retry: {e}"
+                )
+            except NativeAcceptanceTimeoutError as e:
+                # A PRIOR dispatch to this terminal (from any send_input entry
+                # point) has not yet been confirmed accepted (correction-984).
+                # Transient by construction: the next IDLE/COMPLETED status
+                # event re-triggers deliver_pending, and by then the prior
+                # turn will either have been accepted (fence cleared) or the
+                # terminal genuinely never accepted it, which is not this
+                # delivery's failure to own. Never treat as FAILED.
+                for message in batch:
+                    resolve_inbox_claim(message.id, claim_token, MessageStatus.PENDING)
+                logger.warning(
+                    f"Prior dispatch to terminal {terminal_id} not yet confirmed accepted; "
+                    f"leaving {len(batch)} message(s) pending for retry: {e}"
+                )
+            except TerminalCaptureNotDurableError as e:
+                # send_input's own authoritative recheck (994/1038) found an
+                # unresolved capture hold -- either this terminal completed
+                # its turn WHILE send_input was blocked inside the acceptance
+                # wait (correction-994, this read's own earlier IDLE/COMPLETED
+                # check could not have seen that), or a hold reconstructed at
+                # startup (correction-1033) for an unresolved persisted
+                # assignment is still armed despite a live IDLE read
+                # (correction-1038). Transient either way: the next status
+                # event re-triggers delivery, and by then the hold will
+                # either be durable/released or the terminal has moved on.
+                for message in batch:
+                    resolve_inbox_claim(message.id, claim_token, MessageStatus.PENDING)
+                logger.warning(
+                    f"Terminal {terminal_id} has an unresolved capture hold; leaving "
                     f"{len(batch)} message(s) pending for retry: {e}"
                 )
             except Exception as e:

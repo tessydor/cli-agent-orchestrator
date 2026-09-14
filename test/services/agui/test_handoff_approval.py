@@ -477,17 +477,22 @@ class TestTerminalServiceAnswerDelivery:
         monkeypatch.setattr(
             terminal_service,
             "send_special_key",
-            lambda tid, key: events.append(("key", tid, key)) or True,
+            lambda tid, key, **kw: events.append(("key", tid, key, kw)) or True,
         )
         monkeypatch.setattr(
             terminal_service,
             "send_input",
-            lambda tid, text: events.append(("input", tid, text)) or True,
+            lambda tid, text: events.append(("input", tid, text, {})) or True,
         )
 
         TerminalServiceAnswerDelivery().send_input("t-9", "hello")
         # A line-clear (C-u) precedes the paste so a retry replaces, not appends.
-        assert events == [("key", "t-9", "C-u"), ("input", "t-9", "hello")]
+        # submits_turn=False (correction-994): C-u must not arm/wait on the
+        # native-acceptance fence the real paste checks.
+        assert events == [
+            ("key", "t-9", "C-u", {"submits_turn": False}),
+            ("input", "t-9", "hello", {}),
+        ]
 
     def test_send_input_delivers_even_if_clear_fails(self, monkeypatch):
         from cli_agent_orchestrator.services import terminal_service
@@ -497,7 +502,7 @@ class TestTerminalServiceAnswerDelivery:
 
         inputs: List[Tuple[str, str]] = []
 
-        def _clear_fails(tid, key):
+        def _clear_fails(tid, key, **kw):
             raise RuntimeError("clear failed")
 
         monkeypatch.setattr(terminal_service, "send_special_key", _clear_fails)

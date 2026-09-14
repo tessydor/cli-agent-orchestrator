@@ -153,6 +153,41 @@ def _reset_backend_registry():
 
 
 @pytest.fixture(autouse=True)
+def _reset_status_monitor_state():
+    """Prevent leaked per-terminal StatusMonitor state from crossing test
+    boundaries -- same precedent as ``_reset_backend_registry`` above,
+    applied to the OTHER process-wide singleton tests touch directly.
+
+    ``status_monitor`` is a module-level singleton imported independently
+    by several modules (terminal_service, inbox_service,
+    assigned_worker_completion_service, ...), so it cannot be replaced with
+    a fresh instance -- other modules already hold a reference to THIS
+    object. Re-running its own ``__init__`` in place resets every internal
+    dict/lock/set to a clean slate while preserving object identity.
+
+    This was a latent gap even before correction-1001: any test using a
+    generic terminal_id (``"t1"`` and friends) that armed the native-
+    acceptance fence (``notify_input_sent`` with ``assume_processing=
+    False``) without a matching release left that fence armed for every
+    later test reusing the same id. It was previously silently
+    self-healing, because a stale/no-evidence non-IDLE detection used to
+    fail OPEN and auto-release any lingering fence. Correction-1001
+    deliberately closed that fail-open gap in production code (see
+    status_monitor.py's _apply_detection_locked) -- fail-closed evidence
+    is the whole point of that fix -- so a leaked fence now stays armed
+    until explicitly cleared, causing an unrelated LATER test to hang for
+    the full NATIVE_ACCEPTANCE_TIMEOUT_S and fail. This fixture is the
+    corresponding test-suite-wide cleanup correction-1001 itself calls for
+    ("do not preserve unsafe production behavior for old tests").
+    """
+    from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+    status_monitor.__init__()
+    yield
+    status_monitor.__init__()
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_cao_env(monkeypatch, tmp_path):
     """Keep tests independent of CAO runtime identity and persisted settings.
 

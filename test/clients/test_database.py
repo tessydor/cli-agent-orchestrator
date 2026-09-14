@@ -19,6 +19,7 @@ from cli_agent_orchestrator.clients.database import (
     InboxModel,
     MemoryMetadataModel,
     TerminalModel,
+    claim_inbox_message,
     create_flow,
     create_inbox_message,
     create_terminal,
@@ -39,6 +40,8 @@ from cli_agent_orchestrator.clients.database import (
     list_siblings_by_group_prefix,
     list_terminals_by_session,
     list_terminals_in_sessions,
+    resolve_inbox_claim,
+    supersede_inbox_messages,
     update_flow_enabled,
     update_flow_run_times,
     update_last_active,
@@ -1309,6 +1312,242 @@ class TestInboxOperations:
         update_message_status(1, MessageStatus.DELIVERED)
 
         mock_session.commit.assert_called_once()
+
+
+class TestSupersedeInboxMessages:
+    """Correction-1038 Part B: the one supported sender-scoped, audited
+    supersession prerequisite. Searched first for an existing supported
+    operation -- none exists. Real, file-backed-equivalent (in-memory,
+    same engine/session pattern as ``test_create_inbox_message`` above)
+    SQLite throughout, since the CAS/transaction semantics are exactly
+    what is under test here, not something a mock can stand in for.
+    """
+
+    @staticmethod
+    def _seed_terminals(test_db, sender_id, receiver_id):
+        with test_db() as seed:
+            seed.add(
+                TerminalModel(
+                    id=sender_id,
+                    tmux_session="cao-session",
+                    tmux_window="sender",
+                    provider="mock_cli",
+                )
+            )
+            seed.add(
+                TerminalModel(
+                    id=receiver_id,
+                    tmux_session="cao-session",
+                    tmux_window="receiver",
+                    provider="mock_cli",
+                )
+            )
+            seed.commit()
+
+    def test_supersedes_exact_pending_targets(self, test_db):
+        self._seed_terminals(test_db, "sender-1038", "receiver-1038")
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            m877 = create_inbox_message("sender-1038", "receiver-1038", "877 content")
+            m880 = create_inbox_message("sender-1038", "receiver-1038", "880 content")
+            m885 = create_inbox_message("sender-1038", "receiver-1038", "885 content")
+            m948 = create_inbox_message("sender-1038", "receiver-1038", "948 content")
+
+            results = supersede_inbox_messages(
+                sender_id="sender-1038",
+                receiver_id="receiver-1038",
+                target_message_ids=[m877.id, m880.id, m885.id],
+                superseding_message_id=m948.id,
+            )
+            assert len(results) == 3
+            for r in results:
+                assert r.status == MessageStatus.SUPERSEDED
+                assert r.superseded_by_message_id == m948.id
+
+            # Original rows/content/ids/sender/receiver are preserved --
+            # never deleted, never rewritten beyond status/superseded_by.
+            remaining = get_inbox_messages("receiver-1038", limit=10)
+            by_id = {m.id: m for m in remaining}
+            assert by_id[m877.id].message == "877 content"
+            assert by_id[m877.id].sender_id == "sender-1038"
+            assert by_id[m885.id].status == MessageStatus.SUPERSEDED
+
+            # The delivery query (status == PENDING only) now yields ONLY 948.
+            pending = get_pending_messages("receiver-1038", limit=10)
+            assert [m.id for m in pending] == [m948.id]
+
+    def test_exact_replay_is_idempotent(self, test_db):
+        self._seed_terminals(test_db, "sender-1038", "receiver-1038")
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            m877 = create_inbox_message("sender-1038", "receiver-1038", "877 content")
+            m948 = create_inbox_message("sender-1038", "receiver-1038", "948 content")
+
+            first = supersede_inbox_messages(
+                sender_id="sender-1038",
+                receiver_id="receiver-1038",
+                target_message_ids=[m877.id],
+                superseding_message_id=m948.id,
+            )
+            second = supersede_inbox_messages(
+                sender_id="sender-1038",
+                receiver_id="receiver-1038",
+                target_message_ids=[m877.id],
+                superseding_message_id=m948.id,
+            )
+            assert first[0].status == second[0].status == MessageStatus.SUPERSEDED
+            assert second[0].superseded_by_message_id == m948.id
+
+    def test_exact_replay_succeeds_even_after_the_superseder_is_delivered(self, test_db):
+        """Correction-1042/1044 Part B.2: once EVERY target is already
+        superseded by exactly this superseder, a replay must succeed
+        regardless of the superseder's OWN current status -- the
+        ordinary InboxService delivery this supersession was meant to
+        unblock legitimately moves the superseder from PENDING to
+        DELIVERED, and a later idempotent replay of the SAME reconcile
+        call must not be turned into a hard failure by that.
+        """
+        self._seed_terminals(test_db, "sender-1038", "receiver-1038")
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            m877 = create_inbox_message("sender-1038", "receiver-1038", "877 content")
+            m948 = create_inbox_message("sender-1038", "receiver-1038", "948 content")
+
+            supersede_inbox_messages(
+                sender_id="sender-1038",
+                receiver_id="receiver-1038",
+                target_message_ids=[m877.id],
+                superseding_message_id=m948.id,
+            )
+            # The superseder is now legitimately delivered by the ordinary
+            # path this supersession existed to unblock.
+            claimed = claim_inbox_message(m948.id, "delivery-claim-1044")
+            assert claimed is not None
+            assert resolve_inbox_claim(m948.id, "delivery-claim-1044", MessageStatus.DELIVERED)
+
+            replay = supersede_inbox_messages(
+                sender_id="sender-1038",
+                receiver_id="receiver-1038",
+                target_message_ids=[m877.id],
+                superseding_message_id=m948.id,
+            )
+            assert replay[0].status == MessageStatus.SUPERSEDED
+            assert replay[0].superseded_by_message_id == m948.id
+            # Still refuses a genuinely NEW mutation against a superseder
+            # that is no longer pending.
+            m877_second = create_inbox_message("sender-1038", "receiver-1038", "877-b content")
+            with pytest.raises(ValueError, match="not pending"):
+                supersede_inbox_messages(
+                    sender_id="sender-1038",
+                    receiver_id="receiver-1038",
+                    target_message_ids=[m877_second.id],
+                    superseding_message_id=m948.id,
+                )
+
+    def test_refuses_a_different_superseder_for_an_already_superseded_row(self, test_db):
+        self._seed_terminals(test_db, "sender-1038", "receiver-1038")
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            m877 = create_inbox_message("sender-1038", "receiver-1038", "877 content")
+            m948 = create_inbox_message("sender-1038", "receiver-1038", "948 content")
+            m999 = create_inbox_message("sender-1038", "receiver-1038", "999 content")
+            supersede_inbox_messages(
+                sender_id="sender-1038",
+                receiver_id="receiver-1038",
+                target_message_ids=[m877.id],
+                superseding_message_id=m948.id,
+            )
+            with pytest.raises(ValueError, match="already superseded by a"):
+                supersede_inbox_messages(
+                    sender_id="sender-1038",
+                    receiver_id="receiver-1038",
+                    target_message_ids=[m877.id],
+                    superseding_message_id=m999.id,
+                )
+            # No partial effect: 877 is still superseded by the ORIGINAL 948.
+            row = get_inbox_messages("receiver-1038", limit=10)
+            assert next(m for m in row if m.id == m877.id).superseded_by_message_id == m948.id
+
+    def test_refuses_a_claimed_or_delivered_target(self, test_db):
+        self._seed_terminals(test_db, "sender-1038", "receiver-1038")
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            m877 = create_inbox_message("sender-1038", "receiver-1038", "877 content")
+            m948 = create_inbox_message("sender-1038", "receiver-1038", "948 content")
+            claimed = claim_inbox_message(m877.id, "claim-token-1038")
+            assert claimed is not None
+            with pytest.raises(ValueError, match="not pending"):
+                supersede_inbox_messages(
+                    sender_id="sender-1038",
+                    receiver_id="receiver-1038",
+                    target_message_ids=[m877.id],
+                    superseding_message_id=m948.id,
+                )
+            assert resolve_inbox_claim(m877.id, "claim-token-1038", MessageStatus.DELIVERED)
+            with pytest.raises(ValueError, match="not pending"):
+                supersede_inbox_messages(
+                    sender_id="sender-1038",
+                    receiver_id="receiver-1038",
+                    target_message_ids=[m877.id],
+                    superseding_message_id=m948.id,
+                )
+
+    def test_refuses_sender_or_receiver_mismatch(self, test_db):
+        self._seed_terminals(test_db, "sender-1038", "receiver-1038")
+        self._seed_terminals(test_db, "sender-other-1038", "receiver-other-1038")
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            m877 = create_inbox_message("sender-1038", "receiver-1038", "877 content")
+            m948_wrong_sender = create_inbox_message(
+                "sender-other-1038", "receiver-1038", "948 wrong sender"
+            )
+            with pytest.raises(ValueError, match="does not exist"):
+                supersede_inbox_messages(
+                    sender_id="sender-1038",
+                    receiver_id="receiver-1038",
+                    target_message_ids=[m877.id],
+                    superseding_message_id=m948_wrong_sender.id,
+                )
+
+            m948_ok = create_inbox_message("sender-1038", "receiver-1038", "948 ok")
+            m_other_receiver = create_inbox_message(
+                "sender-1038", "receiver-other-1038", "wrong receiver target"
+            )
+            with pytest.raises(ValueError, match="does not exist"):
+                supersede_inbox_messages(
+                    sender_id="sender-1038",
+                    receiver_id="receiver-1038",
+                    target_message_ids=[m_other_receiver.id],
+                    superseding_message_id=m948_ok.id,
+                )
+
+    def test_refuses_a_superseder_that_is_not_itself_pending(self, test_db):
+        self._seed_terminals(test_db, "sender-1038", "receiver-1038")
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            m877 = create_inbox_message("sender-1038", "receiver-1038", "877 content")
+            m948 = create_inbox_message("sender-1038", "receiver-1038", "948 content")
+            claimed = claim_inbox_message(m948.id, "claim-token-1038-b")
+            assert claimed is not None
+            with pytest.raises(ValueError, match="is not pending"):
+                supersede_inbox_messages(
+                    sender_id="sender-1038",
+                    receiver_id="receiver-1038",
+                    target_message_ids=[m877.id],
+                    superseding_message_id=m948.id,
+                )
+
+    def test_refuses_empty_targets_and_self_target(self, test_db):
+        self._seed_terminals(test_db, "sender-1038", "receiver-1038")
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            m948 = create_inbox_message("sender-1038", "receiver-1038", "948 content")
+            with pytest.raises(ValueError, match="non-empty"):
+                supersede_inbox_messages(
+                    sender_id="sender-1038",
+                    receiver_id="receiver-1038",
+                    target_message_ids=[],
+                    superseding_message_id=m948.id,
+                )
+            with pytest.raises(ValueError, match="its own target_message_ids"):
+                supersede_inbox_messages(
+                    sender_id="sender-1038",
+                    receiver_id="receiver-1038",
+                    target_message_ids=[m948.id],
+                    superseding_message_id=m948.id,
+                )
 
 
 class TestFlowOperations:
